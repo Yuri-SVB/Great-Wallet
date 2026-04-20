@@ -17,15 +17,19 @@ The ecosystem consists of seven repositories. Six are **libraries**
 one is the **app** that integrates everything. The naming blends
 Chinese cultural motifs with a phoenix sub-theme for inheritance.
 
-| # | Repo                        | Motif                      | Role                                      |
-|---|-----------------------------|----------------------------|-------------------------------------------|
-| 1 | **great-wall-core**         | The Wall                   | Fractal encoder engine (Rust + Python)    |
-| 2 | **tlp-core**                | (utility)                  | RSW time-lock puzzle library              |
-| 3 | **great-wall-ux**           | The Wall's appearance      | Rendering, palettes, interaction, effects |
-| 4 | **celestial-peace-nf-core** | Gate of Celestial Peace    | Spaced-repetition training logic (Anki)   |
-| 5 | **jade-clock**              | Imperial timekeeping       | LN marketplace client for TLP solving     |
-| 6 | **phoenix-scroll**          | Phoenix rebirth            | Inheritance protocol (LN + taproot)       |
-| 7 | **great-wallet**            | Wall + wallet (pun)        | Unified end-user app                      |
+| # | Repo                        | Motif                      | Role                                      | Status          |
+|---|-----------------------------|----------------------------|-------------------------------------------|-----------------|
+| 1 | **great-wall-core**         | The Wall                   | Fractal encoder engine (Rust + Python)    | Beta (public)   |
+| 2 | **tlp-core**                | (utility)                  | RSW time-lock puzzle library              | In development  |
+| 3 | **great-wall-ux**           | The Wall's appearance      | Rendering, palettes, interaction, effects | In development  |
+| 4 | **celestial-peace-nf-core** | Gate of Celestial Peace    | Spaced-repetition training logic (Anki)   | In development  |
+| 5 | **jade-clock**              | Imperial timekeeping       | LN marketplace client for TLP solving     | In development  |
+| 6 | **phoenix-scroll**          | Phoenix rebirth            | Inheritance protocol (LN + taproot)       | In development  |
+| 7 | **great-wallet**            | Wall + wallet (pun)        | Unified end-user app                      | In development  |
+
+Only `great-wall-core` is currently public. Everything marked
+*In development* is non-public work-in-progress and may change
+substantially before first release.
 
 ---
 
@@ -105,6 +109,8 @@ Which libraries does each library import from?
 
 ### 1. great-wall-core
 
+**Status:** Beta (public).
+
 **The fractal encoder engine.** Bijective mapping between BIP39 mnemonic
 seeds and Burning Ship fractal locations, with Argon2-based two-stage
 pipeline. All determinism-critical computation is in Rust (I4F60
@@ -127,6 +133,8 @@ encodings.
 
 ### 2. tlp-core
 
+**Status:** In development.
+
 **RSW time-lock puzzle library.** Pure cryptographic utility — no
 dependency on any other repo in the ecosystem.
 
@@ -144,6 +152,8 @@ existing key, while numerous Argon2 iterations impose time for
 deterministic key derivation.
 
 ### 3. great-wall-ux
+
+**Status:** In development.
 
 **Rendering, palettes, and interaction layer.** Separated from
 great-wall-core so that visual polish (color schemes, lighting effects,
@@ -165,6 +175,8 @@ for escape counts, encode/decode). Does NOT submodule great-wall-core —
 the consuming app provides both.
 
 ### 4. celestial-peace-nf-core
+
+**Status:** In development.
 
 **Spaced-repetition training logic.** Implements the "Celestial Peace:
 Never Forget" training system that helps users consolidate tacit memory
@@ -247,6 +259,8 @@ tlp-core (TLP encrypt/decrypt/solve).
 
 ### 5. jade-clock
 
+**Status:** In development.
+
 **Lightning Network marketplace client for anonymous TLP solving.**
 Allows users to outsource TLP computation to a marketplace of solvers,
 paying via Lightning Network for anonymity.
@@ -268,6 +282,8 @@ solution). The inheritance protocol's very different LN usage pattern
 phoenix-scroll.
 
 ### 6. phoenix-scroll
+
+**Status:** In development.
 
 **Inheritance protocol.** Dead-man's switch bequest mechanism using
 dedicated LN channels with TLP-gated lockscripts and recursive taproot
@@ -294,6 +310,8 @@ on great-wall-core — inheritance only needs keys and TLP primitives,
 which are derived/provided at the app layer.
 
 ### 7. great-wallet
+
+**Status:** In development.
 
 **The unified end-user application.** Integrates all six libraries
 into a single app with four modes that flow naturally:

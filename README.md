@@ -51,6 +51,15 @@ and can be added later.
 
 ---
 
+## Status
+
+The fractal encoder engine (`great-wall-core`) is public and in
+**beta**. The rest of the ecosystem — training, Lightning
+integration, inheritance protocol, and the unified app — is under
+active development and not yet public.
+
+---
+
 ## Learn more
 
 - **[ARCHITECTURE.md](./ARCHITECTURE.md)** — repository structure,
