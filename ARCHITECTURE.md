@@ -134,34 +134,89 @@ them.
 ### Stage 2 — perturbed fractal
 
 - **Fractal used:** a user-specific *perturbation* of the Burning
-  Ship fractal, parameterised by three stored numbers `o, p, q`. A
+  Ship fractal, parameterised by three numbers `(o, p, q)`. A
   different `(o, p, q)` produces a visually different landscape, so
   stage-2 is personal to each user.
+- **Where `(o, p, q)` comes from:** `(o, p, q) = Argon2(stage-1 bits)`.
+  The perturbation parameters are the deterministic output of a
+  heavy Argon2 pass keyed by stage-1 bits. They are not memorised,
+  and in regular operation are never shown to the user — they exist
+  only as ephemeral state inside the app during a rendering session.
+  Argon2's intentional slowness is what makes *rendering the stage-2
+  fractal at all* a gated operation.
 - **Input from the user:** tacit recall of the stage-2 locations the
-  user learned at setup, rendered on the perturbed fractal.
-- **Output:** *stage-2 bits*, which combined with stage-1 bits yield
-  the full seed.
-- **Requires stored data:** yes. Rendering the correct stage-2
-  fractal requires `(o, p, q)`, which must be available to the app.
-  These parameters are kept, together with the encoded stage-2
-  points and the SM-2 scheduler state, in the **vault** managed by
-  `celestial-peace-nf-core`.
+  user learned at setup, rendered on that perturbed fractal.
+- **Output:** *stage-2 bits*, which combined with stage-1 bits give
+  the full BIP39 entropy (see *Key Derivation* below).
 
 ### How the two stages lock together
 
-- The vault is encrypted under a key derived from stage-1 bits and
-  sealed with a TLP whose duration matches the next Anki-scheduled
-  review.
-- Without stage-1 recall, `(o, p, q)` cannot be obtained, so the
-  stage-2 fractal cannot even be rendered — let alone solved.
-- Therefore an attacker who steals the vault learns nothing: they
-  face both the stage-1 recall barrier (tacit, non-transmissible)
-  and, on top of it, the TLP delay.
-- Conversely, the legitimate user who remembers stage-1 can always
-  re-derive the full seed from memory alone via Argon2, even with
-  no vault at hand. The vault exists to allow A) instant setup of
-  B) user-defined delay, in which C) user can outsource the
-  compute for convenience without compromise of self-custody.
+- **Vault as TLP-gated shortcut, not a primary store.** Without
+  stage-1 recall, the Argon2 pre-image is unavailable, so
+  `(o, p, q)` cannot be computed and the stage-2 fractal cannot
+  even be rendered — let alone solved. `celestial-peace-nf-core`'s
+  **vault** holds the already-computed `(o, p, q)`, the encoded
+  stage-2 points, and the SM-2 scheduler state, encrypted under a
+  key derived from stage-1 bits and sealed with an RSW time-lock
+  puzzle (TLP). A legitimate user who has lost the vault can always
+  fall back to Argon2 re-derivation from memory; the vault is a
+  time-discounted shortcut for returning users, never the root of
+  trust.
+- **An attacker learns nothing from the vault.** They face both the
+  stage-1 recall barrier (tacit, non-transmissible) and, on top of
+  it, the TLP delay.
+
+Sealing the vault with an RSW TLP — as opposed to any coarser
+time-lock — buys four properties that are hard to replicate with any
+other primitive:
+
+1. **Per-session tunable security/convenience trade-off.** Each
+   time the user exits a practice session, they choose the TLP
+   duration for the *next* session: shorter if they expect to come
+   back soon, longer if they want more time-cost to stand between
+   an attacker and the vault until then. The trade-off is dialled
+   afresh at every session boundary.
+
+2. **Exact-fit spaced-repetition gating.** SM-2 dictates precise
+   review intervals (hours, days, weeks, months). Because RSW TLP
+   *setup* is O(1) in the chosen delay, the vault's seal can be
+   dialled to exactly match the next scheduled review — no
+   rounding down for crypto convenience, no bolted-on minimum
+   duration. The training phase therefore runs at the theoretical
+   maximum security SM-2 allows for.
+
+3. **Paid time-barrier resolution without loss of self-custody.**
+   RSW TLP solving is outsourceable: the `jade-clock` marketplace
+   can solve the puzzle on the user's behalf for a Lightning
+   payment. The TLP-gated ciphertext — the vault itself — never
+   leaves the user's device. What the marketplace receives is only
+   the TLP *setup*: the operand to be repeatedly squared and the
+   RSW modulus `N`. It returns the raw solution and learns nothing
+   about what that solution unlocks (or about the user's identity).
+   The user gets time back without giving up custody.
+
+4. **Integrity-checkable computation via milestones.** An RSW TLP
+   solution is a long chain of iterative modular squarings:
+   `x, x², x⁴, …, x^(2^t)`. At setup time — while φ(n) is still
+   known — the puzzle constructor can cheaply (O(1)) precompute a
+   digest of the intermediate value `x^(2^k)` at any chosen `k`.
+   These **milestones** are kept private to the client; they are
+   never shared with the solver. The client checks them offline
+   after the solver returns. If a milestone disagrees with the
+   delivered result, the client has self-contained evidence of the
+   discrepancy — the original request `(N, x, t)`, the expected
+   milestone digest, and the obtained result — which it presents
+   to an arbiter to adjudicate whether the solver cheated,
+   whether the client is repudiating honest work, or whether a
+   computation error occurred mid-solve. No party has to re-run
+   the full t-squaring to resolve the dispute.
+
+   In effect, `M` milestones slice a single t-squaring puzzle into
+   `M` sub-puzzles of `t/M` squarings each, diluting risk for both
+   sides: any dispute localises to one segment (only that segment
+   needs arbitration), and payments can be staged per milestone so
+   neither client nor solver is ever exposed for more than `1/M`
+   of the job at a time.
 
 ### Determinism guarantees
 
@@ -186,6 +241,88 @@ point.
   rounding modes, no denormals, and no NaNs; results depend only on
   the input bit patterns and the specified operation, which is
   exactly what the bijection requires.
+
+---
+
+## Key Derivation
+
+Every coercion-resistant secret in the Great Wall ecosystem —
+spending keys, inheritance channel keys, vault keys, fallback
+addresses, and any application-specific secret the user cares to
+protect — is derived from a single user-held root whose entropy
+is held only as tacit fractal recall.
+
+```mermaid
+flowchart TD
+    R1["tacit recall<br/>(stage-1 points on canonical fractal)"] --> S1["stage-1 bits"]
+    S1 --> A["Argon2<br/>(heavy, tunable)"]
+    A --> OPQ["(o, p, q)"]
+    OPQ --> F2["stage-2 fractal<br/>(user-specific perturbation)"]
+    F2 --> R2["tacit recall<br/>(stage-2 points on that fractal)"]
+    R2 --> S2["stage-2 bits"]
+    S1 --> C["concat<br/>stage-1 || stage-2"]
+    S2 --> C
+    C --> E["raw entropy<br/>(128 or 256 bits)"]
+    E --> B["BIP39 mnemonic<br/>(wire format for wallet<br/>interoperability; user<br/>never sees it)"]
+    E --> OTH["any other 128/256-bit<br/>representation"]
+    B --> P["PBKDF2-HMAC-SHA512<br/>(BIP39 stretching)"]
+    P --> M["GW master secret<br/>(512-bit BIP39 seed)"]
+    M --> X["BIP32 master xpriv"]
+    M --> HA["hash(master_secret || salt_A)"]
+    M --> HN["hash(master_secret || salt_N)"]
+    X --> SP["spending keys"]
+    X --> CH["channel keys<br/>(phoenix-scroll, per epoch)"]
+    X --> FB["fallback keys<br/>(opaque taproot leaves)"]
+    HA --> APA["app-specific secret A<br/>(e.g. password-manager<br/>master password)"]
+    HN --> APN["app-specific secret N<br/>(any other coercion-<br/>resistant credential)"]
+```
+
+### Notes on the representation
+
+- **BIP39 is a wire format, not the secret.** The mnemonic exists
+  so the result can be pasted into any standard BIP39 wallet
+  unchanged. It is the same entropy as the raw `stage-1 ||
+  stage-2` bits, just in a human-readable encoding. The user never
+  sees it either.
+- **Derivation of non-Bitcoin secrets is built in.** `great-wall-core`
+  already implements `hash(master_secret || salt)`-style derivation
+  so that additional coercion-resistant secrets — passwords,
+  signing keys, encryption keys for other systems — can be derived
+  from the same fractal recall without rotating the fractal.
+  Domain separation is by salt. A natural example is a master
+  password for an off-the-shelf password manager: a single salted
+  digest such as `hash(master_secret || "password-manager/v1")`
+  yields a high-entropy string the user can paste into the
+  manager's unlock field and never has to memorise — the manager
+  itself keeps per-site credentials, and the one string that gates
+  them inherits Great Wall's coercion-resistance for free.
+
+### Invariants
+
+- **The master secret is never shown to the user.** Raw entropy,
+  mnemonic, 512-bit seed, xpriv, and all derived keys exist only as
+  ephemeral state inside the app during a recall session.
+  Memorising any explicit part would turn that part into
+  verbalizable knowledge — coercible, and therefore outside TKBA's
+  protection.
+- **Setup is a write-only operation on the user's memory.** At
+  setup the app generates a fresh entropy root, encodes it onto
+  the user's fractal, then destroys the plaintext. The user leaves
+  setup with tacit recall only — there is no mnemonic backup to
+  write down, and none to lose.
+- **Every participant should be a full GW user.** Testator, heirs, 
+  and cascading heirs each can and should have their own independent
+  fractal and entropy root. This keeps every leaf of the inheritance
+  tree equally coercion-resistant: coercing any one party does not
+  weaken anyone else's custody, and a successful inheritance event
+  does not downgrade the security of the funds that pass through
+  it.
+- **All downstream keys are stateless.** Channel keys are derived
+  deterministically from `(master_secret, derivation path, epoch
+  number)`. Vault keys are derived from stage-1 bits.
+  Application-specific secrets are derived from
+  `(master_secret, salt)`. No derived key is ever stored long-term;
+  losing a device loses no secrets.
 
 ---
 
