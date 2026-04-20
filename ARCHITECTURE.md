@@ -166,11 +166,26 @@ them.
 ### Determinism guarantees
 
 All stage-1 and stage-2 encoding/decoding paths must be bit-exact
-across platforms, compilers, and releases. This is the reason
-`great-wall-core`'s determinism-critical code lives in Rust with
-I4F60 fixed-point arithmetic: any drift in the bisection algorithm,
-PRNG, contraction arithmetic, or BFS neighbor order breaks the
-bijection and invalidates existing encodings.
+across platforms, compilers, and releases. Any drift in the bisection
+algorithm, PRNG, contraction arithmetic, or BFS neighbor order breaks
+the bijection and invalidates existing encodings.
+
+This is why `great-wall-core`'s determinism-critical code lives in
+Rust and uses a custom **I4F60** fixed-point type instead of floating
+point.
+
+- **I4F60** is a 64-bit signed fixed-point format laid out as **1
+  sign bit + 3 integer bits + 60 fractional bits**.
+- It represents values in the half-open interval **[-8, +8)** with
+  uniform precision **2⁻⁶⁰** (≈ 8.67 × 10⁻¹⁹).
+- The tight range is deliberate: the Burning Ship fractal's
+  non-escape region fits well within this box, and the narrower
+  range buys more fractional bits — and therefore more precision —
+  than a wider signed type of the same width would.
+- Unlike IEEE-754 floats, I4F60 arithmetic has no platform-dependent
+  rounding modes, no denormals, and no NaNs; results depend only on
+  the input bit patterns and the specified operation, which is
+  exactly what the bijection requires.
 
 ---
 
