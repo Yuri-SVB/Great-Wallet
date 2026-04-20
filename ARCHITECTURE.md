@@ -218,6 +218,41 @@ other primitive:
    neither client nor solver is ever exposed for more than `1/M`
    of the job at a time.
 
+### Calibrating Argon2 duration
+
+Argon2's target runtime is a convenience-vs.-coercion-resistance
+knob, not a protocol constant. The longer it takes to derive
+`(o, p, q)` from stage-1 bits, the longer any attacker who has
+somehow obtained stage-1 bits must still wait before they can
+render the stage-2 fractal and complete decryption — but the longer
+the legitimate user also waits on any fallback re-derivation from
+memory.
+
+Two useful calibration points, benchmarked against the real-world
+physical-attack incidents compiled by Jameson Lopp in
+[jlopp/physical-bitcoin-attacks](https://github.com/jlopp/physical-bitcoin-attacks/):
+
+- **A few hours** is already enough to defeat common robbery and
+  flash kidnapping: an attacker who has to hold a victim captive
+  for the full Argon2 delay to complete a single derivation is
+  forced into a much longer — and more detectable — encounter than
+  those attack patterns support.
+- **About one week** defeats even the flashiest published wrench
+  attacks. For calibration, the ~2-day kidnapping of David Balland
+  in January 2025 — one of the most protracted attacks in Lopp's
+  compilation — would fall well inside a one-week Argon2 window,
+  and longer hostage situations become physically and operationally
+  untenable for most attackers.
+
+There is no protocol upper bound. The user picks a duration that
+matches their threat model and their tolerance for waiting on
+fallback re-derivation. The Argon2 target also sets the useful
+ceiling on training-vault TLP durations — a vault sealed with a TLP
+longer than Argon2 adds no protection, since anyone in possession
+of stage-1 bits could just re-derive via Argon2 in less time —
+while inheritance and acceleration use TLPs on their own independent
+schedules (see the *Inheritance Protocol* section).
+
 ### Determinism guarantees
 
 All stage-1 and stage-2 encoding/decoding paths must be bit-exact
