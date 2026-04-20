@@ -105,6 +105,75 @@ Which libraries does each library import from?
 
 ---
 
+## Two-Stage Pipeline
+
+Great Wall's fractal encoder operates in two sequential stages. The
+two-stage split is what gives the system its defense-in-depth
+properties and underlies the vocabulary (*stage-1 bits*, *stage-2
+fractal*, *o, p, q*) used throughout this document.
+
+### Stage 1 — canonical fractal
+
+- **Fractal used:** the canonical Burning Ship fractal. Its parameters
+  are fixed constants of the protocol; no stored state is needed to
+  render it.
+- **Input from the user:** tacit recall of the stage-1 locations the
+  user learned at setup.
+- **Output:** *stage-1 bits*, a user-derived share of entropy
+  extracted by decoding the user-identified points through the
+  bisection algorithm.
+- **Offline-reproducible:** yes. The user (and only the user) can
+  reconstruct stage-1 bits from memory alone, on any machine, without
+  any stored data.
+
+Because stage-1 uses the canonical fractal, stage-1 bits are the
+entry point: every downstream secret — the stage-2 fractal's
+perturbation parameters, vault keys, inheritance keys — is gated by
+them.
+
+### Stage 2 — perturbed fractal
+
+- **Fractal used:** a user-specific *perturbation* of the Burning
+  Ship fractal, parameterised by three stored numbers `o, p, q`. A
+  different `(o, p, q)` produces a visually different landscape, so
+  stage-2 is personal to each user.
+- **Input from the user:** tacit recall of the stage-2 locations the
+  user learned at setup, rendered on the perturbed fractal.
+- **Output:** *stage-2 bits*, which combined with stage-1 bits yield
+  the full seed.
+- **Requires stored data:** yes. Rendering the correct stage-2
+  fractal requires `(o, p, q)`, which must be available to the app.
+  These parameters are kept, together with the encoded stage-2
+  points and the SM-2 scheduler state, in the **vault** managed by
+  `celestial-peace-nf-core`.
+
+### How the two stages lock together
+
+- The vault is encrypted under a key derived from stage-1 bits and
+  sealed with a TLP whose duration matches the next Anki-scheduled
+  review.
+- Without stage-1 recall, `(o, p, q)` cannot be obtained, so the
+  stage-2 fractal cannot even be rendered — let alone solved.
+- Therefore an attacker who steals the vault learns nothing: they
+  face both the stage-1 recall barrier (tacit, non-transmissible)
+  and, on top of it, the TLP delay.
+- Conversely, the legitimate user who remembers stage-1 can always
+  re-derive the full seed from memory alone via Argon2, even with
+  no vault at hand. The vault exists to allow A) instant setup of
+  B) user-defined delay, in which C) user can outsource the
+  compute for convenience without compromise of self-custody.
+
+### Determinism guarantees
+
+All stage-1 and stage-2 encoding/decoding paths must be bit-exact
+across platforms, compilers, and releases. This is the reason
+`great-wall-core`'s determinism-critical code lives in Rust with
+I4F60 fixed-point arithmetic: any drift in the bisection algorithm,
+PRNG, contraction arithmetic, or BFS neighbor order breaks the
+bijection and invalidates existing encodings.
+
+---
+
 ## Repo Descriptions
 
 ### 1. great-wall-core
