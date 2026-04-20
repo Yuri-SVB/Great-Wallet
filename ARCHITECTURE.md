@@ -360,9 +360,29 @@ Great Wall provides four properties simultaneously:
 > the attacker is aware of that (3), and is nevertheless unable to rob
 > it (4).
 
-This is only possible because the secret knowledge is *tacit* (cannot
-be verbalized), and the interface for *deploying* it is
-cryptographically gated by an inescapably lengthy computation.
+### Tacit Knowledge-Based Authentication (TKBA)
+
+The four properties are logically coupled. A secret that is held only
+in the owner's head (1), held by nobody else (2), and known to an
+attacker to be there (3) can resist coercion (4) only if the secret
+is *not transmissible* — it cannot be articulated, written down, or
+extracted under duress, even by an attacker who fully understands the
+protocol. By definition, such knowledge is **tacit**.
+
+Great Wall is therefore an implementation of **Tacit Knowledge-Based
+Authentication (TKBA)**. This is the theoretical basis of the system,
+not an implementation detail: any design decision that replaces tacit
+recall with explicit, verbalizable knowledge undermines TKBA and
+weakens property 4. (For example, `great-wall-ux` gates bisection-area
+visualization behind debug mode because surfacing it in normal use
+would teach the user explicit facts whose memorization is coercible.)
+
+TKBA additionally requires that the *interface* for deploying the
+secret is cryptographically gated by an inescapably lengthy
+computation — otherwise an attacker could repeatedly prompt "try
+again" under duress until the secret leaks. In Great Wall this
+gating is Argon2 (primary derivation) and, optionally, RSW time-lock
+puzzles for instant setup of arbitrary, user-defined delay.
 
 ---
 

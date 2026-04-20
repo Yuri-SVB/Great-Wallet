@@ -29,6 +29,12 @@ Great Wallet gives you four guarantees at the same time:
    be verbalized on demand) and the mechanism that deploys it is
    gated by an inescapably lengthy computation.
 
+This combination — a tacit secret plus a computationally-gated
+interface for deploying it — is called **Tacit Knowledge-Based
+Authentication (TKBA)**. It is the only class of authentication that
+can provide all four properties at once, and it is the theoretical
+basis of Great Wallet.
+
 ---
 
 ## How you use it
