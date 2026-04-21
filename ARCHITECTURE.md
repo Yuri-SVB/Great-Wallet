@@ -65,14 +65,15 @@ celestial-peace-nf-core  (no submodules)
 jade-clock               (no submodules)
 phoenix-scroll           (no submodules)
 
-great-wallet             (six submodules, flat — the only repo with submodules)
-  great-wall-core/
-  tlp-core/
-  great-wall-ux/
-  celestial-peace-nf-core/
-  jade-clock/
-  phoenix-scroll/
-  app/
+great-wallet             (six submodules, flat, plus its own app/ source tree —
+                          the only repo with submodules)
+  great-wall-core/          <- submodule
+  tlp-core/                 <- submodule
+  great-wall-ux/            <- submodule
+  celestial-peace-nf-core/  <- submodule
+  jade-clock/               <- submodule
+  phoenix-scroll/           <- submodule
+  app/                      (not a submodule: great-wallet's own UI / orchestration)
 ```
 
 ### Submodule Rules
@@ -603,7 +604,7 @@ great-wallet/
   celestial-peace-nf-core/    <- submodule
   jade-clock/                 <- submodule
   phoenix-scroll/             <- submodule
-  app/                        Unified UI and orchestration
+  app/                        Unified UI and orchestration (not a submodule)
 ```
 
 ---
