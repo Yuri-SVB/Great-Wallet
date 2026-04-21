@@ -848,6 +848,18 @@ on-chain, RSW TLP + symmetric encryption + MuSig2 aggregation
 off-chain, bound together by the heir's need for *both* shares
 to sign.
 
+**Post-quantum escape hatch.** If RSW factoring becomes tractable
+within an inheritance horizon (e.g. a sufficiently large quantum
+computer materialises), the protocol can be migrated to a purely
+on-chain time-gate without changing anything else: replace the
+TLP-encrypted hand-off with a CSV branch on the heir's path that
+counts the intended delay in blocks. The testator then delivers
+`s_i` in plaintext at rotation, and the time-gating moves from
+off-chain decryption to on-chain maturation between commitment
+broadcast and heir spending. The dead-man's-switch and MuSig2
+composition semantics are preserved; the cost is a slightly larger
+commitment script footprint per epoch.
+
 ### Rotation (Dead-Man's Switch)
 
 An inheritance channel is opened on-chain once, between testator and
