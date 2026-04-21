@@ -577,8 +577,11 @@ into a single app with four modes that flow naturally:
    (celestial-peace-nf-core + tlp-core + great-wall-ux)
 3. **Accelerate** — outsource TLP solving via Lightning Network
    (jade-clock + tlp-core)
-4. **Inherit** — configure and maintain inheritance channels
-   (phoenix-scroll + tlp-core)
+4. **Inherit** — configure and maintain inheritance channels as
+   testator *or* act as heir (receive rotation payloads, solve
+   TLPs once rotation ceases, maintain the opaque taproot
+   fallback for cascading inheritance)
+   (phoenix-scroll + tlp-core + jade-clock)
 
 This is the only repo with submodules (all six libraries, flat).
 
@@ -651,6 +654,9 @@ puzzles for instant setup of arbitrary, user-defined delay.
 |                               | cannot be materialized before derivation or TLP (if present)  |
 | Owner death/incapacitation    | Inheritance protocol: TLP-gated channel stops rotating,       |
 |                               | heir claims after epoch + grace period                        |
+| Kill-testator-then-rob-heir   | Heir-branch spending key is MuSig2(s_i·G, H): requires both   |
+|                               | the TLP-gated hand-off share and the heir's own share, which  |
+|                               | by default is also TKBA-protected (see *Heir Participation*)  |
 | Cascading deaths              | Opaque fallback addresses propagate inheritance recursively   |
 | Malicious LN counterparty     | Long `to_self_delay` aligned to TLP epoch; heir monitors      |
 | LN infrastructure disappears  | TLP blobs are self-contained; fallback transport possible     |
@@ -686,6 +692,70 @@ The only genuinely new obligation is **liveness**: a process must
 broadcast periodically. The knowledge required to do so is still all
 in the testator's head.
 
+### Heir Participation
+
+The heir is not a passive recipient. To fulfil their role they need
+an app that provides four features:
+
+1. **Heir-side private LN channel management** — receive and
+   acknowledge rotations, sign commitments, track channel state.
+2. **Local TLP solver** — the RSW squaring engine, run when
+   rotation ceases.
+3. **TLP client** — optional outsourcing of the squaring to
+   `jade-clock` to shorten the claim delay.
+4. **Opaque-fallback construction** — each epoch the heir hands
+   the testator a fresh taproot fallback address encoding the
+   heir's own estate plan, which requires running
+   `phoenix-scroll`'s fallback-tree constructor on the heir side
+   as well.
+
+All four pieces live inside `great-wallet`'s **Inherit** mode, in
+its heir-role configuration.
+
+#### Should the heir also be a GW user?
+
+**Yes — heir GW usage is a protocol prerequisite of the default
+inheritance flow.** The heir-branch spending key is an aggregation
+`P_i = MuSig2(s_i·G, H)`, where `s_i` is the testator's TLP-gated
+hand-off share and `H = h·G` is the heir's long-lived channel
+identity public key, deterministically derived from the heir's own
+GW master secret (see *TLP Enforcement*). Without `h`, the heir
+cannot sign the commitment — even with a fully-solved TLP.
+
+This is what keeps every leaf of the inheritance tree equally
+coercion-resistant, without appealing to social discipline:
+
+- The regular wrench-attack path targets the testator directly
+  and runs into TKBA + Argon2 (see
+  *Calibrating Argon2 duration*), which forces a custody duration
+  longer than any published physical attack.
+- The alternate path — kill testator (no lengthy custody), then
+  rob heir of `(N_i, x_i, t_i, C_i)` — now additionally requires
+  extracting `h` from the heir, which itself runs into the heir's
+  own TKBA + Argon2. The custody-duration barrier is restored on
+  every path, at the protocol level.
+
+**The two-share protocol and TKBA protection on `h` are
+orthogonal.** The MuSig2 composition guarantees that both shares
+are required to spend — that is a property of the commitment
+script, not of how the heir generates or stores `h`. Whether the
+heir's share is protected through a full GW stack (fractal +
+Argon2 + BIP32 derivation) or through a trivial setup (for
+example, a standard BIP39 seed held on a hardware wallet) is a
+key-management choice the heir makes in their own app. The
+channel and the testator cannot tell the difference: `H = h·G`
+has the same wire representation either way.
+
+The default is the full stack, because only that restores the
+custody-duration barrier on the kill-then-rob-heir path. An
+atypically protected heir (a heavily defended individual in a
+low-risk environment, or a case where the testator explicitly
+accepts the residual risk) can instead derive `h` from a trivial
+setup and still plug into `phoenix-scroll` unchanged —
+statelessness, per-epoch derivations, and MuSig2 aggregation all
+still hold; what changes is only how hard it is for an attacker
+to coerce `h` out of the heir directly.
+
 ### Dedicated Inheritance Channels
 
 Inheritance uses **dedicated, private LN channels** that are not part
@@ -712,55 +782,71 @@ inheritance bureaucracy routinely takes longer.
 Bitcoin script has no native time-lock-puzzle opcode, and Great Wall
 does not attempt to add one. The on-chain script of every
 inheritance commitment is ordinary LN-style: a 2-of-2 funding
-output, a commitment that pays to one party's key (plus
-`to_self_delay`) or to a fallback branch gated by a conventional
-`OP_CHECKSEQUENCEVERIFY` relative timelock, with standard LN
-revocation paths.
+output, a commitment whose heir-branch pays to a single aggregated
+public key (plus `to_self_delay`) or to a fallback branch gated by
+a conventional `OP_CHECKSEQUENCEVERIFY` relative timelock, with
+standard LN revocation paths.
 
-The TLP lives **one layer above the script**, wrapping the heir's
-per-commitment spending material. Concretely, each epoch the
+The TLP lives **one layer above the script**, wrapping one of *two*
+shares that together compose the heir-branch spending key. The
+heir's own long-lived channel share is derived from the heir's GW
+master secret and is never transmitted; the testator's per-epoch
+hand-off share is what gets TLP-gated. Concretely, each epoch the
 testator:
 
-1. Derives the epoch's inheritance key `k_i` deterministically
-   from their own GW master secret, along with the canonical
-   derivation path for this channel and the epoch number `i`.
-   This preserves the testator's statelessness — no fresh
-   randomness to store — while still giving a distinct `k_i` per
-   epoch. Embeds the matching public key `P_i = k_i · G` in the
-   commitment's heir-branch.
-2. Constructs an RSW puzzle `(N_i, x_i, t_i)` and, using
+1. Derives an epoch-specific **hand-off scalar** `s_i` deterministically
+   from their own GW master secret, the channel's derivation path,
+   and the epoch index `i`. This preserves the testator's
+   statelessness — no fresh randomness to store — while still
+   giving a distinct `s_i` per epoch.
+2. Looks up the heir's long-lived **channel identity public key**
+   `H = h·G`, which the heir derived deterministically from their
+   own GW master secret and exchanged once at channel open.
+3. Computes the aggregated heir-branch public key
+   `P_i = MuSig2(s_i·G, H)` and embeds it in the new commitment's
+   heir-branch.
+4. Constructs an RSW puzzle `(N_i, x_i, t_i)` and, using
    `φ(N_i)`, computes its solution `y_i = x_i^(2^(t_i)) mod N_i`
    instantly.
-3. Symmetrically encrypts `k_i` under a key derived from `y_i`
+5. Symmetrically encrypts `s_i` under a key derived from `y_i`
    (e.g. AES under `H(y_i)`), producing ciphertext `C_i`.
-4. Sends the heir `(N_i, x_i, t_i, C_i)`.
+6. Sends the heir `(N_i, x_i, t_i, C_i)`.
 
-The heir can recover `k_i` only by first performing `t_i`
-sequential modular squarings to obtain `y_i`, then decrypting
-`C_i`. Until then the inheritance key is unavailable — present in
-the heir's hands as ciphertext, but unreachable without the
-time-gated computation.
+To spend the heir-branch, the heir must produce a MuSig2 signature
+under `P_i`, which requires **both** scalars:
 
-**Why encrypt `k_i` rather than derive it from `y_i` directly?**
+- `s_i` — recoverable only by solving the TLP (`t_i` sequential
+  modular squarings) to obtain `y_i` and then decrypting `C_i`; and
+- `h` — recoverable only from the heir's own tacit fractal recall
+  through their GW stack (TKBA → Argon2 → BIP32 derivation).
+
+Neither share alone suffices. The TLP ciphertext is pure data and
+can be stolen, cached, or even fed to a paid solver; `h` is tacit
+and non-transmissible. Together they force *every* attack path —
+direct on the testator or kill-then-rob-the-heir — back through the
+same TKBA + Argon2 barrier.
+
+**Why encrypt `s_i` rather than derive it from `y_i` directly?**
 A scheme that turned the TLP solution itself into the signing
 scalar (for instance by reducing `y_i` modulo the secp256k1 group
 order) would be conceivable but is neither necessary nor
-preferable. Encrypting a freshly generated `k_i` under `H(y_i)`
-lets the heir *outsource* the sequential squaring to the
-`jade-clock` marketplace without giving up custody. A paid solver
+preferable. Encrypting a deterministically-derived `s_i` under
+`H(y_i)` lets the heir *outsource* the sequential squaring to the
+`jade-clock` marketplace without giving up custody: a paid solver
 only ever receives `(N_i, x_i, t_i)` and returns the raw `y_i`;
-the ciphertext `C_i` stays on the heir's device, so the solver —
-even after learning `y_i` — cannot decrypt `k_i`. This is the same
-outsourcing posture the training vault relies on (see
+the ciphertext `C_i` stays on the heir's device, and even a solver
+who decrypted `C_i` would still lack `h` and could not sign. This
+is the same outsourcing posture the training vault relies on (see
 [*How the two stages lock together*](#how-the-two-stages-lock-together),
 point 3), reused on the inheritance path.
 
 Because the gating sits at the key-material layer, no Bitcoin
 validator ever has to interpret the TLP, and no soft-fork,
 covenant, or new opcode is required. It is a pure composition of
-existing primitives: standard pubkey Bitcoin script on-chain, RSW
-TLP plus symmetric encryption off-chain, bound together by the
-heir's need for `k_i` to sign.
+existing primitives: standard pubkey / taproot Bitcoin script
+on-chain, RSW TLP + symmetric encryption + MuSig2 aggregation
+off-chain, bound together by the heir's need for *both* shares
+to sign.
 
 ### Rotation (Dead-Man's Switch)
 
@@ -865,19 +951,22 @@ The on-chain script is deliberately standard — no TLP opcodes (see
 spending path:
 
 ```
-Path 1: Heir's branch — spent with an ordinary signature from
-         the heir's per-commitment key. The testator derived this
-         key at construction time; the heir obtains it only by
-         solving the epoch's RSW TLP delivered off-chain.
+Path 1: Heir's branch — spent with an ordinary (taproot / MuSig2)
+         signature under the aggregated pubkey
+         P_i = MuSig2(s_i·G, H). The heir recovers s_i by solving
+         the epoch's RSW TLP and decrypting the testator's
+         ciphertext C_i, and derives h from their own GW master
+         secret. Both shares are required to sign.
 Path 2: After grace period G (enforced by OP_CHECKSEQUENCEVERIFY),
          funds go to heir_fallback_addr — an opaque taproot
          address the heir provided at rotation time, encoding
          *their* own estate plan.
 ```
 
-Path 1 is the normal case: the heir is alive and, once the TLP is
-solved, holds the key that signs. Path 2 handles cascading death
-via a standard CSV-based relative timelock and the opaque fallback
+Path 1 is the normal case: the heir is alive; once the TLP is
+solved they hold both shares (`s_i` from decryption, `h` from their
+GW stack) required to sign. Path 2 handles cascading death via a
+standard CSV-based relative timelock and the opaque fallback
 mechanism described below.
 
 ### Stateless Key Derivation
