@@ -800,6 +800,17 @@ is invalidated by the next rotation. Starting only after observed
 silence costs one TLP duration of computation — or the price of
 outsourcing that duration to `jade-clock`.
 
+**Transport is an app concern, not a protocol one.** Both parties
+commit to opening the app at least once per epoch — the testator
+to confirm the rotation and release the hand-off, the heir to
+receive and store it. The specific delivery channel (LN custom
+TLVs in channel messages, BOLT-12-style onion messages, an
+out-of-band mirror, or a hybrid) is an implementation choice made
+by `phoenix-scroll`; the architecture only requires that each
+epoch's `(N_i, x_i, t_i, C_i)` plus the heir's opaque fallback
+address reaches the other side before the current epoch closes,
+signed by the sender's long-lived channel identity key.
+
 ### Stash Adjustment
 
 The testator can change the inheritance amount at any time via standard
