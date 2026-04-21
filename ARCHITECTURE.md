@@ -708,26 +708,97 @@ time to detect and respond to fraudulent closure — even a completely
 passive heir checking the chain once a month catches fraud. Traditional
 inheritance bureaucracy routinely takes longer.
 
+### TLP Enforcement (Off-Chain Key-Wrapping)
+
+Bitcoin script has no native time-lock-puzzle opcode, and Great Wall
+does not attempt to add one. The on-chain script of every
+inheritance commitment is ordinary LN-style: a 2-of-2 funding
+output, a commitment that pays to one party's key (plus
+`to_self_delay`) or to a fallback branch gated by a conventional
+`OP_CHECKSEQUENCEVERIFY` relative timelock, with standard LN
+revocation paths.
+
+The TLP lives **one layer above the script**, wrapping the heir's
+per-commitment spending material. Concretely, each epoch the
+testator:
+
+1. Derives the epoch's inheritance key `k_i` deterministically
+   from their own GW master secret, along with the canonical
+   derivation path for this channel and the epoch number `i`.
+   This preserves the testator's statelessness — no fresh
+   randomness to store — while still giving a distinct `k_i` per
+   epoch. Embeds the matching public key `P_i = k_i · G` in the
+   commitment's heir-branch.
+2. Constructs an RSW puzzle `(N_i, x_i, t_i)` and, using
+   `φ(N_i)`, computes its solution `y_i = x_i^(2^(t_i)) mod N_i`
+   instantly.
+3. Symmetrically encrypts `k_i` under a key derived from `y_i`
+   (e.g. AES under `H(y_i)`), producing ciphertext `C_i`.
+4. Sends the heir `(N_i, x_i, t_i, C_i)`.
+
+The heir can recover `k_i` only by first performing `t_i`
+sequential modular squarings to obtain `y_i`, then decrypting
+`C_i`. Until then the inheritance key is unavailable — present in
+the heir's hands as ciphertext, but unreachable without the
+time-gated computation.
+
+**Why encrypt `k_i` rather than derive it from `y_i` directly?**
+A scheme that turned the TLP solution itself into the signing
+scalar (for instance by reducing `y_i` modulo the secp256k1 group
+order) would be conceivable but is neither necessary nor
+preferable. Encrypting a freshly generated `k_i` under `H(y_i)`
+lets the heir *outsource* the sequential squaring to the
+`jade-clock` marketplace without giving up custody. A paid solver
+only ever receives `(N_i, x_i, t_i)` and returns the raw `y_i`;
+the ciphertext `C_i` stays on the heir's device, so the solver —
+even after learning `y_i` — cannot decrypt `k_i`. This is the same
+outsourcing posture the training vault relies on (see
+[*How the two stages lock together*](#how-the-two-stages-lock-together),
+point 3), reused on the inheritance path.
+
+Because the gating sits at the key-material layer, no Bitcoin
+validator ever has to interpret the TLP, and no soft-fork,
+covenant, or new opcode is required. It is a pure composition of
+existing primitives: standard pubkey Bitcoin script on-chain, RSW
+TLP plus symmetric encryption off-chain, bound together by the
+heir's need for `k_i` to sign.
+
 ### Rotation (Dead-Man's Switch)
 
-Each epoch (e.g., one month), the testator:
+An inheritance channel is opened on-chain once, between testator and
+heir. From that point on, rotation is entirely off-chain. Each
+epoch (typically ~1 month) the testator:
 
-1. Moves the inheritance stash to a new address (rotation).
-2. Constructs a new commitment transaction in the channel with the heir.
-3. Revokes the previous epoch's commitment (standard LN revocation).
-4. The new commitment includes a TLP-gated spending path for the heir.
+1. Updates the channel to a new commitment state (standard LN
+   commitment-update flow).
+2. Revokes the previous commitment by sharing its per-commitment
+   revocation secret (standard LN revocation).
+3. Sends the heir the TLP-wrapped key material for the new
+   commitment — a puzzle `(N_i, x_i, t_i)` whose solution is the
+   spending key for the heir's branch of the new commitment output.
 
-When the testator dies or becomes incapacitated, rotation stops. The
-heir notices the silence (no new rotation arrived), begins solving the
-most recent epoch's TLP, and claims the funds via channel closure after
-the computation completes.
+The TLP duration `t_i` is set to **several times the rotation
+period** (e.g. 3–6 months for a ~1-month rotation). This is a
+critical safety margin: if the heir starts solving a given epoch's
+TLP, a still-living testator's next rotation revokes that
+commitment before the heir finishes, so the heir's eventual
+solution is useless for spending. The heir therefore cannot front-
+run a healthy testator; they can only claim after rotations have
+visibly ceased for at least one TLP duration — hard evidence that
+the testator has really stopped.
 
-The heir **can** solve the current TLP at any time but **doesn't have
-to**. While the testator is alive and well, the presumed likelihood of
-death in a given epoch is low, so the heir continuously solving TLP in
-the background 'just in case' might not be worth it. If the heir
-starts solving when rotation stops, the cost is one full epoch of
-computation before the inheritance is accessible.
+When the testator dies, is incapacitated, or loses access to their
+Great Wall setup, rotation stops. The heir notices the silence,
+begins solving the most recent epoch's TLP, obtains the spending
+key after `t_i` sequential squarings, broadcasts the commitment,
+and claims the funds via standard unilateral channel closure after
+`to_self_delay`.
+
+The heir **can** start solving the current TLP at any time, but has
+no incentive to while the testator is alive: any in-progress solve
+is invalidated by the next rotation. Starting only after observed
+silence costs one TLP duration of computation — or the price of
+outsourcing that duration to `jade-clock`.
 
 ### Stash Adjustment
 
@@ -758,16 +829,25 @@ independently.
 
 ### Channel Lockscript Structure
 
-Each commitment transaction includes a tiered spending path:
+The on-chain script is deliberately standard — no TLP opcodes (see
+*TLP Enforcement* above). Each commitment output has a tiered
+spending path:
 
 ```
-Path 1: Heir claims with TLP_heir solution + heir_key
-         (normal inheritance — heir is alive)
-Path 2: After grace period G, funds go to heir_fallback_addr
-         (heir is also dead — cascade to heir's heirs)
+Path 1: Heir's branch — spent with an ordinary signature from
+         the heir's per-commitment key. The testator derived this
+         key at construction time; the heir obtains it only by
+         solving the epoch's RSW TLP delivered off-chain.
+Path 2: After grace period G (enforced by OP_CHECKSEQUENCEVERIFY),
+         funds go to heir_fallback_addr — an opaque taproot
+         address the heir provided at rotation time, encoding
+         *their* own estate plan.
 ```
 
-Path 1 is the normal case. Path 2 handles cascading death (see below).
+Path 1 is the normal case: the heir is alive and, once the TLP is
+solved, holds the key that signs. Path 2 handles cascading death
+via a standard CSV-based relative timelock and the opaque fallback
+mechanism described below.
 
 ### Stateless Key Derivation
 
