@@ -692,6 +692,19 @@ The only genuinely new obligation is **liveness**: a process must
 broadcast periodically. The knowledge required to do so is still all
 in the testator's head.
 
+**Memory loss before death is backed up by the same dead-man's
+switch.** If the testator loses tacit recall (cognitive decline,
+stroke, injury) before dying, their own access is gone, but the
+inheritance path is not: rotation will simply stop being
+performed, and once one TLP duration has elapsed the heir claims
+exactly as they would after a death. One caveat: in this scenario
+the kill-testator-then-rob-heir concern (see
+[*Heir Participation*](#heir-participation)) generalises to
+*incapacitate*-testator-then-rob-heir, since cognitive incapacity
+is functionally equivalent to death for the dead-man's switch.
+The same mitigation applies — the composed-key design forces the
+alternate attack path through the heir's own coercion barrier.
+
 ### Heir Participation
 
 The heir is not a passive recipient. To fulfil their role they need
