@@ -554,7 +554,6 @@ Responsibilities:
 - Taproot fallback tree construction (opaque addresses, recursive
   cascading inheritance)
 - Heir-side monitoring and claim orchestration
-- Channel watchtower (fraud detection during long punishment windows)
 - Will parameter management (heirs, proportions, updates)
 - Fee management at claim time (CPFP via anchor outputs,
   SIGHASH_ANYONECANPAY)
@@ -810,6 +809,27 @@ by `phoenix-scroll`; the architecture only requires that each
 epoch's `(N_i, x_i, t_i, C_i)` plus the heir's opaque fallback
 address reaches the other side before the current epoch closes,
 signed by the sender's long-lived channel identity key.
+
+### Monitoring and Watchtowers
+
+The unilateral inheritance flow does not require a third-party
+watchtower. The honest-but-busy model is sufficient: both testator
+and heir already open the app at least once per epoch for rotation,
+and during that session the app scans the chain for unexpected
+channel activity. With `to_self_delay` set to match the epoch
+length, monthly checking catches any fraudulent broadcast well
+inside the punishment window.
+
+An optional watchtower — third-party or self-hosted — can be
+layered on by the app for users who want stronger assurance or who
+cannot guarantee monthly app use. The protocol itself does not
+assume one exists.
+
+**Adversarial-agent scenarios are out of scope for this version.**
+Threat models in which testator and heir actively distrust each
+other, or in which third parties maliciously interfere with
+rotation, require stronger monitoring and dispute machinery than
+this release provides. They may be addressed in future iterations.
 
 ### Stash Adjustment
 
