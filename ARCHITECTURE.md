@@ -532,6 +532,16 @@ Imports from tlp-core (TLP format, serialization, verification). Does
 NOT depend on great-wall-core — it only needs to understand TLP
 puzzles as opaque payloads, not fractal encoding.
 
+Economics (sketch). Jade Clock runs as an anonymous marketplace in
+which the marketplace operator also functions as reputation
+authority (scoring pseudonymous solvers) and dispute arbiter (see
+*How the two stages lock together*, milestone-based dispute
+resolution). The default client mode auto-selects a solver by a
+lexical ordering over published metrics — price, reputation, ping,
+uptime — while advanced modes let the user hand-pick. Full fee
+structure, dispute protocol, and reputation-decay details are
+deferred.
+
 Note: jade-clock's LN usage is transactional (submit job, pay, get
 solution). The inheritance protocol's very different LN usage pattern
 (decades-long dedicated channels with custom lockscripts) lives in
