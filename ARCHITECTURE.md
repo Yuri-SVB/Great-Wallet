@@ -705,6 +705,15 @@ is functionally equivalent to death for the dead-man's switch.
 The same mitigation applies — the composed-key design forces the
 alternate attack path through the heir's own coercion barrier.
 
+**Without inheritance set up, total tacit-recall loss is
+terminal.** A user who loses their GW recall (memory failure,
+death) *and* has not configured a phoenix-scroll channel has no
+recovery path: the funds on that seed are unreachable by anyone,
+for the same reasons coercion is ineffective. This is a direct
+consequence of the self-custody / no-backup design — setting up
+inheritance is the only way to make the funds recoverable
+post-loss.
+
 ### Heir Participation
 
 The heir is not a passive recipient. To fulfil their role they need
