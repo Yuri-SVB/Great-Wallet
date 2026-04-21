@@ -423,8 +423,8 @@ Responsibilities:
   explicit knowledge whose memorization undermines TKBA) 
 - Point markers and crosshairs
 - Input handling (mouse, keyboard)
-- Platform abstraction for portability (pygame today, potentially
-  web/mobile in the future)
+- Platform abstraction for portability — **desktop first** (pygame
+  today), **mobile next**; web further ahead
 
 Imports from great-wall-core at the API level (calls the Rust engine
 for escape counts, encode/decode). Does NOT submodule great-wall-core —
