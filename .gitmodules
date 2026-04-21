@@ -1,0 +1,3 @@
+[submodule "great-wall-core"]
+	path = great-wall-core
+	url = git@github.com:Yuri-SVB/great-wall-core.git
