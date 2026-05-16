@@ -74,6 +74,27 @@ active development and not yet public.
 
 ---
 
+## Lineage & acknowledgements
+
+Great Wallet is the current iteration of a project with a longer
+history. It builds on the work of earlier contributors and codebases,
+which remain public:
+
+- **[Great-Wall-Reference](https://github.com/Yuri-SVB/Great-Wall-Reference)**
+  — the Rust reference implementation of the Great Wall protocol,
+  predecessor of `great-wall-core`.
+- **[T3-InfoSec](https://github.com/T3-InfoSec)** — the organization
+  hosting the prior Dart/Flutter generation of the project
+  (`great-wall-dart`, `t3-vault`, and related libraries).
+
+We thank everyone who contributed to those earlier iterations; the
+current design carries their work forward. See
+[ARCHITECTURE.md](./ARCHITECTURE.md#predecessor-repositories) for the
+detailed mapping from predecessor repositories to the current
+ecosystem.
+
+---
+
 ## License
 
 Great Wallet is dual-licensed under either of:

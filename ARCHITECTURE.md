@@ -33,6 +33,37 @@ substantially before first release.
 
 ---
 
+## Predecessor Repositories
+
+The current seven-repo ecosystem is a re-architecture of several
+earlier iterations of the Great Wall protocol. Those earlier codebases
+remain public and are credited here for two reasons: so that former
+collaborators continue to receive recognition for the work the current
+repos build on, and so that prospective collaborators and auditors can
+trace the lineage of every design decision.
+
+- **Great-Wall-Reference** — <https://github.com/Yuri-SVB/Great-Wall-Reference>
+  Reference implementation of the Great Wall protocol (Rust). Direct
+  predecessor of `great-wall-core`; the bit-exact encoder semantics
+  preserved here originate there.
+- **T3-InfoSec** — <https://github.com/T3-InfoSec>
+  The organization under which the prior Dart/Flutter generation of
+  the project was developed. Notable predecessors include
+  `great-wall-dart` (protocol), `t3-vault` and `t3-vault-server` (the
+  earlier end-user app, predecessor of `great-wallet`),
+  `t3-formosa-dart`, `t3-fractals-dart`, and `t3-crypto-objects-dart`
+  (mnemonic / fractal / typed-crypto layers feeding `great-wall-core`
+  and `great-wall-ux`), `TLP` and `TLP-plugin` (predecessors of
+  `tlp-core`), `tlp-solver` (predecessor of `jade-clock`), and
+  `t3-memassist` (spaced-repetition predecessor of
+  `celestial-peace-nf-core`).
+
+These repositories are historical: they are not submodules or runtime
+dependencies of any repo in this ecosystem, and are listed for
+attribution and continuity only.
+
+---
+
 ## Naming Conventions
 
 - **Great Wall** — the core cryptographic system. Coercion-resistant
