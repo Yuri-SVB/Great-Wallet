@@ -311,6 +311,108 @@ point.
 
 ---
 
+## Bisection Algorithm
+
+The bisection algorithm is the bijection between a bit array and a
+location on the fractal. It recursively partitions the visible area:
+at each step it divides the current area into two *valid* halves and
+one discarded area, and one entropy bit selects which of the two valid
+halves the algorithm descends into. The recursion bottoms out at a
+*leaf area* — the region a given bit array decodes to, and the region
+the user must be able to recognise and return to from tacit memory
+alone.
+
+A useful piece of vocabulary first. The fractal landscape is uneven:
+some regions are dense with sharp, *easily identifiable — though
+hardly describable —* structure, while others are large,
+near-featureless expanses. (Identifiability without describability is
+deliberate: it is precisely the TKBA property that makes recall
+non-verbalizable and therefore non-coercible.) We call a reference
+point that is distinctive enough to anchor recall a **good island**,
+and a region poor in such reference points a **void**. The whole point
+of the bisection algorithm is to make sure leaf areas land among good
+islands and not inside voids.
+
+To that end the algorithm applies two deterministic heuristics, which
+together produce two desirable effects.
+
+### The two deterministic heuristics
+
+1. **Weighted median-placement.** At each non-leaf area, the split
+   into two halves is *not* placed at the geometric midpoint. Instead
+   the dividing line — the *weighted median* — is positioned according
+   to the sample distribution of the good islands found within that
+   area. The division therefore tracks where the usable reference
+   points actually are rather than carving the area blindly in two.
+   This generally yields one larger and one smaller half.
+
+2. **Contraction of the larger half.** The contraction applies only
+   to the larger of the two halves. The span between the weighted
+   median and that half's opposing edge is shortened by an amount
+   proportional to how much larger this half is than the smaller one;
+   the larger and emptier it is, the more aggressively its outer
+   reaches are pulled in. This is the step that produces the threefold
+   division: the smaller half is left untouched, the larger half is
+   contracted into a valid region, and the slice trimmed off the
+   larger half's far end becomes the **discarded area**. Both valid
+   halves remain in play for the entropy bit to choose between; the
+   discarded area is never descended into and is what gives rise to
+   the checksum-like effect described below.
+
+### The combined effect
+
+The two heuristics reinforce each other and yield two properties.
+
+1. **Leaf areas stay navigable at every zoom scale.** Median-placement
+   keeps each split aligned with the good islands, and contraction
+   trims the empty far end off the larger half into the discarded
+   area, so the recursion is continually steered toward reference-rich
+   regions and away from the bulk of the voids. The practical consequence is that a
+   valid leaf area tends to be surrounded by easily identifiable
+   reference points at *every* scale, from fully zoomed out down to a
+   zoom proportional to the leaf area's own size — so any bit array
+   resolves to a location a user can reach by navigating up, down,
+   left, right, and zooming in and out, using fractal structure as
+   landmarks the whole way. One informal way to put it: a user in
+   manual mode may deliberately keep steering toward detail-poor
+   regions (large voids) at any zoom scale; the two heuristics
+   together keep "pushing focus back" toward detail-rich regions and
+   excluding the bulk of the voids.
+
+   This is stated as an observed property, not a proven one. As of
+   this writing it rests on sustained dog-fooding — extended hands-on
+   use during which no "bad" leaf area (one stranded in a void) has
+   turned up — rather than on a formal guarantee. The honest claim is
+   the weaker one: *no counterexample has been found yet*, not *no
+   counterexample exists*. The space of bit arrays is far too large to
+   have been exhausted, and a critical reader would be right to reject
+   any stronger phrasing. Sounder verification can be conceived and
+   has simply not been carried out yet — for example, running a large
+   sample of bit arrays past a calibrated visual language model that
+   scores how identifiable each resulting leaf area is, or formalising
+   the objects the heuristics manipulate into a statistical model that
+   would support a bound of the form *"the probability that the
+   bisection algorithm yields, at any point along the descent, a leaf
+   area with fewer than n reference points within a bounded ratio of
+   the current bisecting area's size is below ε."* Until that
+   formalisation is done, the property should be read as a strong
+   empirical regularity, not a theorem.
+
+2. **A checksum-like effect on mistaken locations.** A large fraction
+   of the possible set of coordinates ends up inside the discarded
+   areas accumulated down the recursion — the slices the second
+   heuristic trims off the larger half at every step and never
+   descends into. In other words, a point chosen at random is,
+   more likely than not, *not* inside any valid leaf area. This works
+   the way BIP39's checksum bits do: just as an arbitrary sequence of
+   words drawn from the 2048-word list has a high probability of being
+   an invalid mnemonic — so a transcription or recollection error is
+   likely to be flagged as such — a Great Wall location selected by
+   mistake likewise has a high probability of being flagged as
+   incorrect rather than silently accepted.
+
+---
+
 ## Key Derivation
 
 Every coercion-resistant secret in the Great Wall ecosystem —
