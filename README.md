@@ -12,6 +12,27 @@ steal, nothing to seize, nothing to lose in a fire.
 
 ---
 
+## Documentation and Dependencies
+
+The authoritative specification, invariants, and development guide live in
+the vendored `great-wall-docs` submodule (repo:
+[`yuri-svb/great-wall-docs`](https://github.com/yuri-svb/great-wall-docs)):
+
+- [`great-wall-docs/great-wallet/ARCHITECTURE.md`](great-wall-docs/great-wallet/ARCHITECTURE.md)
+  — ecosystem-wide context
+- [`great-wall-docs/great-wallet/THREAT_MODEL.md`](great-wall-docs/great-wallet/THREAT_MODEL.md)
+  — technical description of the threat model the protocol aims at defending against
+- [`great-wall-docs/justification-and-economics/JUSTIFICATION.{tex/pdf}`](great-wall-docs/justification-and-economics/JUSTIFICATION.pdf)
+  — in-depth, quantitative analysis on the economics of problem and proposed solution
+
+Clone with submodules:
+
+```
+git clone --recursive <url>
+# or, to avoid redundant recursion of great-wall-docs:
+git submodule update --init # without the flag --recursive
+```
+
 ## The four properties
 
 Great Wallet gives you four guarantees at the same time:

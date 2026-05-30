@@ -4,3 +4,6 @@
 [submodule "tlp-core"]
 	path = tlp-core
 	url = git@github.com:Yuri-SVB/tlp-core.git
+[submodule "great-wall-docs"]
+	path = great-wall-docs
+	url = git@github.com-yuri-svb:yuri-svb/great-wall-docs.git
