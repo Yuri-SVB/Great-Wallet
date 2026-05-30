@@ -7,3 +7,6 @@
 [submodule "great-wall-docs"]
 	path = great-wall-docs
 	url = git@github.com-yuri-svb:yuri-svb/great-wall-docs.git
+[submodule "great-wall-ux"]
+	path = great-wall-ux
+	url = git@github.com-yuri-svb:yuri-svb/great-wall-ux.git
