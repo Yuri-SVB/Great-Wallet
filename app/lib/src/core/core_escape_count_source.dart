@@ -54,9 +54,12 @@ class CoreEscapeCountSource implements EscapeCountSource {
     final int shortPx = w < h ? w : h;
     final double u = (2.0 * vp.halfExtent) / shortPx;
 
-    // Top-left sample point. The engine samples pixel (cx, cy) at
-    // (originRe + cx*u, originIm + cy*u); pairing this origin with a vertical
-    // row flip (below) reproduces ViewportMath's pixel<->coord mapping exactly.
+    // The engine samples pixel (cx, cy) at (originRe + cx*u, originIm + cy*u),
+    // writing row cy in increasing-imaginary order. We return the buffer in
+    // that natural order (no flip); combined with the Flutter image sampler's
+    // vertical origin and great-wall-ux's ViewportMath (imaginary axis up),
+    // this displays the Burning Ship upright with overlays aligned. See
+    // escapeCountsFromPixels for the orientation note.
     final double originRe = vp.centreRe + (0.5 - w / 2.0) * u;
     final double originIm = vp.centreIm + (0.5 - h / 2.0) * u;
 
@@ -121,11 +124,12 @@ class CoreEscapeCountSource implements EscapeCountSource {
 ///   - `0`          -> `maxIterations`   (inside / non-escaping)
 ///   - `v` (1..255) -> `v - 1`           (the true escape count)
 ///
-/// No row flip: the engine samples pixel `(cx, cy)` at `originIm + cy*step`
-/// (imaginary axis increasing downward), and `ViewportMath` now uses the same
-/// downward convention, so engine row `y` maps directly to UX row `y`. This
-/// keeps the displayed raster aligned pixel-for-pixel with the coordinate a
-/// tap decodes.
+/// No row flip: the buffer is returned in the engine's natural row order
+/// (`counts[y]` = `originIm + y*step`). Empirically, the Flutter image-sampler
+/// pipeline plus great-wall-ux's `ViewportMath` (imaginary axis up) render this
+/// upright with overlays, pan, and zoom-to-cursor all aligned. (If a rendering
+/// backend ever shows the fractal vertically mirrored, this is the single place
+/// to flip rows — `counts[(h-1-y)*w + x]`.)
 ///
 /// Pure and dependency-free so it is unit-testable without Flutter or FFI.
 Uint32List escapeCountsFromPixels(

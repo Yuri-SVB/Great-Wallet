@@ -13,8 +13,8 @@ void main() {
     });
 
     test('no row flip: engine row y maps directly to UX row y', () {
-      // The engine and ViewportMath now share the downward imaginary-axis
-      // convention, so rows are preserved (only the u8 -> count remap applies).
+      // Rows are returned in the engine's natural order (only the u8 -> count
+      // remap applies); orientation is handled by the display pipeline.
       final Uint8List pixels = Uint8List.fromList(<int>[
         11, 12, // row 0
         21, 22, // row 1
