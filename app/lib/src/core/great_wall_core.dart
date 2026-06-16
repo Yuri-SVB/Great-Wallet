@@ -117,8 +117,11 @@ class GreatWallCore {
     final int total = iterations < 1 ? 1 : iterations;
 
     if (iterations == 0) {
+      // Identity case: data.ljust(32, 0)[:32] (argon2_pipeline.py). The input
+      // is the natural-length stage-1 bytes (not padded to 8).
       final Uint8List input = Entropy.stage1Argon2Input(stage1Bits);
-      final Uint8List digest = Uint8List(32)..setRange(0, 8, input);
+      final int n = input.length < 32 ? input.length : 32;
+      final Uint8List digest = Uint8List(32)..setRange(0, n, input);
       onProgress?.call(1, total);
       final Stage2Reservoirs r = Stage2Reservoirs.fromArgon2Digest(digest);
       digest.fillRange(0, digest.length, 0);

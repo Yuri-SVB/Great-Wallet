@@ -23,12 +23,15 @@ void main() {
   });
 
   group('Entropy.stage1Argon2Input', () {
-    test('always returns 8 bytes (right-padded)', () {
-      final List<int> shortBits = List<int>.filled(32, 1); // 4 bytes
-      final Uint8List input = Entropy.stage1Argon2Input(shortBits);
-      expect(input.length, 8);
-      expect(input.sublist(0, 4), <int>[0xFF, 0xFF, 0xFF, 0xFF]);
-      expect(input.sublist(4), <int>[0, 0, 0, 0]);
+    test('returns the natural byte length (no padding/truncation)', () {
+      // Matches great-wall-core: data = bits_to_bytes(stage1_bits).
+      expect(Entropy.stage1Argon2Input(List<int>.filled(32, 1)).length, 4);
+      expect(Entropy.stage1Argon2Input(List<int>.filled(64, 1)).length, 8);
+      expect(Entropy.stage1Argon2Input(List<int>.filled(128, 1)).length, 16);
+      expect(
+        Entropy.stage1Argon2Input(List<int>.filled(32, 1)),
+        <int>[0xFF, 0xFF, 0xFF, 0xFF],
+      );
     });
   });
 

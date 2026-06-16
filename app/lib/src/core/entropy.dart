@@ -40,19 +40,17 @@ class Entropy {
     return bits;
   }
 
-  /// The 8-byte Argon2 input derived from stage-1 bits.
+  /// The Argon2 input derived from stage-1 bits.
   ///
-  /// great-wall-core feeds Argon2 exactly `ARGON2_INPUT_BYTES = 8` bytes
-  /// (constants.py). `bits_to_bytes(stage1_bits)` is right-padded with zero
-  /// bytes to 8 — the same `data.ljust(8, 0)` shape the reference uses for the
-  /// identity (zero-iteration) case.
-  static Uint8List stage1Argon2Input(List<int> stage1Bits) {
-    final Uint8List packed = bitsToBytes(stage1Bits);
-    if (packed.length == 8) return packed;
-    final Uint8List out = Uint8List(8);
-    out.setRange(0, min(packed.length, 8), packed);
-    return out;
-  }
+  /// This is `bits_to_bytes(stage1_bits)` at its **natural length** — 4 bytes
+  /// for the mini preset, 8 for default, 16 for large — exactly what
+  /// great-wall-core's `run_argon2_iterative` feeds
+  /// (argon2_pipeline.py: `data = bits_to_bytes(stage1_bits)`). No padding or
+  /// truncation: the engine's Argon2 accepts any input length, and padding to a
+  /// fixed 8 bytes would change the digest (hence `(o, p, q)` and the stage-2
+  /// fractal) for any preset other than default.
+  static Uint8List stage1Argon2Input(List<int> stage1Bits) =>
+      bitsToBytes(stage1Bits);
 
   /// Generate `bitCount` cryptographically-random bits using a secure RNG.
   ///
