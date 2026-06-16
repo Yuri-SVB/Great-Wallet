@@ -78,6 +78,35 @@ and can be added later.
 
 ---
 
+## Running the app
+
+The unified app lives in [`app/`](./app) — great-wallet's own UI and
+orchestration. This iteration implements the **Setup** mode by integrating
+`great-wall-core` (the fractal encoder engine) with `great-wall-ux` (rendering
+and interaction).
+
+```bash
+# from the repository root
+git submodule update --init great-wall-core great-wall-ux great-wall-docs
+
+# 1. Build the engine the app's FFI layer loads
+app/native/build_core.sh
+
+# 2. Run the app (desktop-first; needs the Flutter SDK 3.22+)
+cd app
+flutter pub get
+flutter create --platforms=linux .   # one-time: generate the platform runner
+flutter run -d linux                 # or macos / windows
+
+# Tests
+flutter test
+```
+
+See [`app/README.md`](./app/README.md) for the full integration map, the
+build prerequisites per platform, and how the two-stage pipeline is wired.
+
+---
+
 ## Status
 
 The fractal encoder engine (`great-wall-core`) is public and in
