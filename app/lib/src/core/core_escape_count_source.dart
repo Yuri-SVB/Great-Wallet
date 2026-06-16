@@ -60,39 +60,32 @@ class CoreEscapeCountSource implements EscapeCountSource {
     final double originRe = vp.centreRe + (0.5 - w / 2.0) * u;
     final double originIm = vp.centreIm + (0.5 - h / 2.0) * u;
 
+    // Both stages render through the *perturbed* engine path. This is
+    // load-bearing, not an optimisation: `bs_encode` always encodes through
+    // `escape_count_generic` (great-wall-core/discovery.rs), and at (0,0,0)
+    // that formula still applies p's +1/8 baseline. The canonical
+    // `bs_render_viewport` (pure z0=0, no shift) draws a *different* fractal,
+    // so stage-1 points — chosen on the baseline fractal — would appear to
+    // fall in the canonical "hole". Rendering stage 1 as generic(0,0,0) makes
+    // the displayed fractal the same one the points were encoded on.
+    final int o = request.stage == Stage.stage2 ? _requireReservoirs().o : 0;
+    final int p = request.stage == Stage.stage2 ? _requireReservoirs().p : 0;
+    final int q = request.stage == Stage.stage2 ? _requireReservoirs().q : 0;
+
     final Pointer<Uint8> out = ffi.calloc<Uint8>(w * h);
     try {
-      if (request.stage == Stage.stage2) {
-        final Stage2Reservoirs? r = stage2Reservoirs;
-        if (r == null) {
-          throw StateError(
-            'Stage-2 render requested before (o, p, q) were derived. '
-            'Set CoreEscapeCountSource.stage2Reservoirs after Argon2 completes.',
-          );
-        }
-        _core.renderViewportGeneric(
-          originRe: originRe,
-          originIm: originIm,
-          step: u,
-          width: w,
-          height: h,
-          maxIter: maxIter,
-          o: r.o,
-          p: r.p,
-          q: r.q,
-          out: out,
-        );
-      } else {
-        _core.renderViewport(
-          originRe: originRe,
-          originIm: originIm,
-          step: u,
-          width: w,
-          height: h,
-          maxIter: maxIter,
-          out: out,
-        );
-      }
+      _core.renderViewportGeneric(
+        originRe: originRe,
+        originIm: originIm,
+        step: u,
+        width: w,
+        height: h,
+        maxIter: maxIter,
+        o: o,
+        p: p,
+        q: q,
+        out: out,
+      );
       final Uint8List pixels = Uint8List.fromList(out.asTypedList(w * h));
       final Uint32List counts = escapeCountsFromPixels(pixels, w, h, maxIter);
       return EscapeCountRaster(
@@ -105,24 +98,34 @@ class CoreEscapeCountSource implements EscapeCountSource {
       ffi.calloc.free(out);
     }
   }
+
+  Stage2Reservoirs _requireReservoirs() {
+    final Stage2Reservoirs? r = stage2Reservoirs;
+    if (r == null) {
+      throw StateError(
+        'Stage-2 render requested before (o, p, q) were derived. '
+        'Set CoreEscapeCountSource.stage2Reservoirs after Argon2 completes.',
+      );
+    }
+    return r;
+  }
 }
 
 /// Convert great-wall-core's `u8` escape-count buffer into the [Uint32List]
-/// great-wall-ux expects, applying the coordinate-convention row flip.
+/// great-wall-ux expects.
 ///
 /// Engine encoding (ffi.rs): `0` for non-escaping ("inside the set") pixels,
 /// `(escape_count % 255) + 1` otherwise. great-wall-ux's shader expects raw
 /// escape counts with non-escaping == `maxIterations` (its demo source fills
 /// the inside disk with `maxIter`), so:
-///   - `0`        -> `maxIterations`   (inside / non-escaping)
-///   - `v` (1..255) -> `v - 1`         (the true escape count)
+///   - `0`          -> `maxIterations`   (inside / non-escaping)
+///   - `v` (1..255) -> `v - 1`           (the true escape count)
 ///
-/// Row flip: the engine's imaginary axis increases downward (`originIm + cy*u`),
-/// whereas great-wall-ux's ViewportMath has imaginary increasing upward. Row
-/// `y` of the UX raster therefore reads engine row `h - 1 - y`. Pairing this
-/// flip with the top-left origin makes the displayed raster line up pixel-for-
-/// pixel with the coordinate a tap decodes — without which a selected point
-/// would not match what the user sees.
+/// No row flip: the engine samples pixel `(cx, cy)` at `originIm + cy*step`
+/// (imaginary axis increasing downward), and `ViewportMath` now uses the same
+/// downward convention, so engine row `y` maps directly to UX row `y`. This
+/// keeps the displayed raster aligned pixel-for-pixel with the coordinate a
+/// tap decodes.
 ///
 /// Pure and dependency-free so it is unit-testable without Flutter or FFI.
 Uint32List escapeCountsFromPixels(
@@ -132,13 +135,9 @@ Uint32List escapeCountsFromPixels(
   int maxIterations,
 ) {
   final Uint32List counts = Uint32List(width * height);
-  for (int y = 0; y < height; y++) {
-    final int srcRow = (height - 1 - y) * width;
-    final int dstRow = y * width;
-    for (int x = 0; x < width; x++) {
-      final int v = pixels[srcRow + x];
-      counts[dstRow + x] = v == 0 ? maxIterations : (v - 1);
-    }
+  for (int i = 0; i < width * height; i++) {
+    final int v = pixels[i];
+    counts[i] = v == 0 ? maxIterations : (v - 1);
   }
   return counts;
 }

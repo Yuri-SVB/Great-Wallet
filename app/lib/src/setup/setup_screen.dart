@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:great_wall_ux/great_wall_ux.dart';
 
 import '../core/encoding_constants.dart';
@@ -45,6 +46,10 @@ class _SetupScreenState extends State<SetupScreen> {
   Argon2Profile _profile = Argon2Profile.basic;
   int _iterations = 1;
 
+  /// Select mode: when on, tapping the canvas decodes the point under the
+  /// cursor instead of panning. Toggled by the panel button or the `S` key.
+  bool _selectMode = false;
+
   @override
   void initState() {
     super.initState();
@@ -75,19 +80,39 @@ class _SetupScreenState extends State<SetupScreen> {
   @override
   Widget build(BuildContext context) {
     final bool hasResult = _setup.phase == SetupPhase.memorise;
-    return Row(
-      children: <Widget>[
-        Expanded(
-          child: Stack(
-            children: <Widget>[
-              Positioned.fill(child: _canvas(hasResult)),
-              if (_busy) Positioned.fill(child: _progressOverlay()),
-            ],
+    return Focus(
+      autofocus: true,
+      onKeyEvent: _onKey,
+      child: Row(
+        children: <Widget>[
+          Expanded(
+            child: Stack(
+              children: <Widget>[
+                Positioned.fill(child: _canvas(hasResult)),
+                if (_busy) Positioned.fill(child: _progressOverlay()),
+                if (hasResult && _selectMode)
+                  const Positioned(
+                    top: 12,
+                    left: 12,
+                    child: _Badge('Select mode — click a point (S to exit)'),
+                  ),
+              ],
+            ),
           ),
-        ),
-        SizedBox(width: 260, child: _controlPanel(hasResult)),
-      ],
+          SizedBox(width: 260, child: _controlPanel(hasResult)),
+        ],
+      ),
     );
+  }
+
+  KeyEventResult _onKey(FocusNode node, KeyEvent event) {
+    if (event is KeyDownEvent &&
+        event.logicalKey == LogicalKeyboardKey.keyS &&
+        _setup.phase == SetupPhase.memorise) {
+      setState(() => _selectMode = !_selectMode);
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
   }
 
   Widget _canvas(bool hasResult) {
@@ -102,8 +127,22 @@ class _SetupScreenState extends State<SetupScreen> {
       maxIterations: EncodingConstants.guiParams.maxIter,
       overlays: hasResult ? _setup.overlaysForDisplayStage() : CanvasOverlays.empty,
       semanticLabel: 'Fractal canvas',
-      // No onSelect during Setup: the points are generated and shown for the
-      // user to memorise, not clicked. Selection is a Train-mode concern.
+      // Selection is enabled only once points exist and the user turns on
+      // select mode (button or `S`). Otherwise taps do nothing and the canvas
+      // is pan/zoom only.
+      onSelect: (hasResult && _selectMode) ? _onCanvasSelect : null,
+    );
+  }
+
+  void _onCanvasSelect(FractalSelection sel) {
+    final bool valid = _setup.probeSelection(sel);
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        duration: const Duration(milliseconds: 900),
+        content: Text(valid
+            ? 'Hit a valid encodable leaf.'
+            : 'No encodable leaf at that point — zoom in and try again.'),
+      ),
     );
   }
 
@@ -120,16 +159,23 @@ class _SetupScreenState extends State<SetupScreen> {
       default:
         label = 'Working…';
     }
+    final bool deriving = _setup.phase == SetupPhase.derivingParams;
+    final double? progress = deriving && _setup.argon2Total > 0
+        ? _setup.argon2Done / _setup.argon2Total
+        : null; // indeterminate for the quick encode phases
     return ColoredBox(
       color: Colors.black54,
       child: Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: <Widget>[
-            const CircularProgressIndicator(),
+            SizedBox(
+              width: 260,
+              child: LinearProgressIndicator(value: progress),
+            ),
             const SizedBox(height: 16),
             Text(label, style: const TextStyle(color: Colors.white)),
-            if (_setup.phase == SetupPhase.derivingParams) ...<Widget>[
+            if (deriving) ...<Widget>[
               const SizedBox(height: 12),
               TextButton(
                 onPressed: _setup.requestStop,
@@ -265,6 +311,14 @@ class _SetupScreenState extends State<SetupScreen> {
         onSelectionChanged: (Set<Stage> s) => _setup.showStage(s.first),
       ),
       const SizedBox(height: 16),
+      SwitchListTile(
+        contentPadding: EdgeInsets.zero,
+        title: const Text('Select mode'),
+        subtitle: const Text('Click a point to test recall (or press S)'),
+        value: _selectMode,
+        onChanged: (bool v) => setState(() => _selectMode = v),
+      ),
+      const SizedBox(height: 8),
       Text(
         'Study the marked locations on each stage until you can find them '
         'from memory. When you are confident, finish — the seed is then held '
@@ -281,10 +335,32 @@ class _SetupScreenState extends State<SetupScreen> {
 
   Future<void> _start() async {
     _brightness.reset();
+    setState(() => _selectMode = false);
     await _setup.begin(
       preset: _preset,
       argon2Iterations: _iterations,
       profile: _profile,
+    );
+  }
+}
+
+/// Small translucent label shown over the canvas (e.g. the select-mode hint).
+class _Badge extends StatelessWidget {
+  const _Badge(this.text);
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: const Color(0x99000000),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        child: Text(text, style: const TextStyle(color: Colors.white)),
+      ),
     );
   }
 }

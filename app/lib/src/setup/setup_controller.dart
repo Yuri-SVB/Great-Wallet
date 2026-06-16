@@ -174,6 +174,26 @@ class SetupController extends ChangeNotifier {
     _stopRequested = true;
   }
 
+  /// Decode the point under a select-mode tap and report whether it landed on
+  /// a valid encodable leaf. Uses the currently displayed stage's `(o, p, q)`:
+  /// `(0,0,0)` for stage 1, the session reservoirs for stage 2 — the same
+  /// formula the points were encoded with.
+  ///
+  /// The boolean is all that surfaces; the decoded bits and coordinates stay
+  /// inside the engine call and are never logged (SCOPE.md invariants).
+  bool probeSelection(FractalSelection selection) {
+    final Stage2Reservoirs? r = _core.source.stage2Reservoirs;
+    final bool s2 = _displayStage == Stage.stage2;
+    final CoreDecodeResult result = _core.decodePoint(
+      reRaw: fixedFromDouble(selection.re),
+      imRaw: fixedFromDouble(selection.im),
+      o: s2 ? (r?.o ?? 0) : EncodingConstants.stage1O,
+      p: s2 ? (r?.p ?? 0) : EncodingConstants.stage1P,
+      q: s2 ? (r?.q ?? 0) : EncodingConstants.stage1Q,
+    );
+    return result.valid;
+  }
+
   /// Switch the displayed stage during memorisation.
   void showStage(Stage stage) {
     if (stage == _displayStage) return;

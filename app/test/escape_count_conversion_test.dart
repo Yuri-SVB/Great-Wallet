@@ -12,19 +12,19 @@ void main() {
       expect(counts, <int>[64, 0, 9]);
     });
 
-    test('flips rows: UX row y reads engine row (h-1-y)', () {
-      // 2 wide, 3 tall. Engine rows top->bottom = [A, B, C]; the UX raster must
-      // come out bottom->top = [C, B, A] because the imaginary axis is flipped.
+    test('no row flip: engine row y maps directly to UX row y', () {
+      // The engine and ViewportMath now share the downward imaginary-axis
+      // convention, so rows are preserved (only the u8 -> count remap applies).
       final Uint8List pixels = Uint8List.fromList(<int>[
-        11, 12, // engine row 0
-        21, 22, // engine row 1
-        31, 32, // engine row 2
+        11, 12, // row 0
+        21, 22, // row 1
+        31, 32, // row 2
       ]);
       final Uint32List counts = escapeCountsFromPixels(pixels, 2, 3, 64);
       expect(counts, <int>[
-        30, 31, // (31-1, 32-1)  -> engine row 2
-        20, 21, // engine row 1
-        10, 11, // engine row 0
+        10, 11, // row 0  (v-1)
+        20, 21, // row 1
+        30, 31, // row 2
       ]);
     });
 

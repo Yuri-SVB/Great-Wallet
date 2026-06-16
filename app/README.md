@@ -22,7 +22,7 @@ supplies the production implementation of that seam and the Setup orchestration:
 | C ABI binding to the Rust engine | `lib/src/ffi/core_bindings.dart` | Dart port of the Python `ctypes` bridge (`burning_ship_engine.py`): render, encode, `decode_full`, `argon2_single`. |
 | Library discovery | `lib/src/ffi/library_loader.dart` | Finds `libburning_ship_engine` next to the exe or in the submodule's cargo output. |
 | I4F60 fixed-point | `lib/src/ffi/fixed.dart` | Coordinates cross the FFI as raw `i64`, never floats (determinism). |
-| **The UX seam** | `lib/src/core/core_escape_count_source.dart` | `EscapeCountSource` → engine. Maps the viewport to the raster call, converts the engine's `u8` buffer to the UX `Uint32List`, and applies the coordinate-convention **row flip**. |
+| **The UX seam** | `lib/src/core/core_escape_count_source.dart` | `EscapeCountSource` → engine. Maps the viewport to the raster call and converts the engine's `u8` buffer to the UX `Uint32List`. Renders **both** stages through the perturbed path (`escape_count_generic`) — stage 1 as `(0,0,0)` — because that is the formula `bs_encode` uses (it applies p's +1/8 baseline even at `(0,0,0)`); the pure-canonical `bs_render_viewport` would draw a different fractal and the points would appear to fall in the canonical hole. |
 | `(o,p,q)` derivation | `lib/src/core/stage2_params.dart` | `sha256(argon2_digest)` split into three `u64` reservoirs — port of `derive_stage2_params`. |
 | Encode / decode / Argon2 facade | `lib/src/core/great_wall_core.dart` | One engine instance, shared `EscapeCountSource`. |
 | Setup state machine | `lib/src/setup/setup_controller.dart` | Generate entropy → encode stage 1 → Argon2 → encode stage 2 → memorise → wipe. |

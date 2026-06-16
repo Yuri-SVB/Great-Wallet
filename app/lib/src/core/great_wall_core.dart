@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import '../ffi/core_bindings.dart';
@@ -94,10 +95,12 @@ class GreatWallCore {
   /// [onProgress] reports completed passes; [shouldStop] is polled between
   /// passes for cancellation (the in-flight Rust call is not interruptible).
   ///
-  /// NOTE: each pass is a blocking FFI call. This yields to the event loop
-  /// between passes for progress/cancellation, but a production build should
-  /// move the call onto a worker isolate (TECH_STACK.md §"Threading model:
-  /// two-tier") so the UI isolate never stalls on a heavy profile.
+  /// Each pass runs in a worker isolate via [Isolate.run] (which opens its own
+  /// engine binding — FFI handles cannot cross isolates), so the heavy,
+  /// blocking Argon2 call never stalls the UI isolate. This is the two-tier
+  /// threading model from TECH_STACK.md §"Threading model": the UI isolate
+  /// dispatches work units and awaits results instead of blocking, which is
+  /// what keeps the OS from raising an "application not responding" dialog.
   Future<Stage2Reservoirs> deriveStage2Reservoirs(
     List<int> stage1Bits, {
     required int iterations,
@@ -112,15 +115,14 @@ class GreatWallCore {
       digest = Uint8List(32)..setRange(0, 8, input);
       onProgress?.call(1, total);
     } else {
-      Uint8List input = Entropy.stage1Argon2Input(stage1Bits);
-      digest = bindings.argon2Single(input, profile);
+      final Uint8List input = Entropy.stage1Argon2Input(stage1Bits);
+      digest = await _argon2PassInIsolate(input, profile);
       onProgress?.call(1, total);
       for (int i = 1; i < iterations; i++) {
         if (shouldStop?.call() ?? false) {
           throw const Argon2Cancelled();
         }
-        await Future<void>.delayed(Duration.zero);
-        digest = bindings.argon2Single(digest, profile);
+        digest = await _argon2PassInIsolate(digest, profile);
         onProgress?.call(i + 1, total);
       }
     }
@@ -129,6 +131,19 @@ class GreatWallCore {
     digest.fillRange(0, digest.length, 0);
     return reservoirs;
   }
+}
+
+/// Run one Argon2d pass on a worker isolate.
+///
+/// The closure captures only sendable values (a copy of [input] and the
+/// [profile] enum) and opens a fresh engine binding inside the isolate, since a
+/// [DynamicLibrary]/FFI handle from the parent isolate cannot be sent across.
+Future<Uint8List> _argon2PassInIsolate(Uint8List input, Argon2Profile profile) {
+  final Uint8List inputCopy = Uint8List.fromList(input);
+  return Isolate.run<Uint8List>(() {
+    final GreatWallCoreBindings bindings = GreatWallCoreBindings.open();
+    return bindings.argon2Single(inputCopy, profile);
+  });
 }
 
 /// An encoded fractal point in raw I4F60 coordinates.
