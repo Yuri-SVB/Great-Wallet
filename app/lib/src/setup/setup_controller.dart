@@ -2,6 +2,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart' show Color;
 import 'package:great_wall_ux/great_wall_ux.dart';
 
+import '../core/bip39.dart';
 import '../core/encoding_constants.dart';
 import '../core/entropy.dart';
 import '../core/great_wall_core.dart';
@@ -106,6 +107,30 @@ class SetupController extends ChangeNotifier {
 
   /// True once both stages have been selected back and the seed reconstructed.
   bool get isRecallComplete => _recalledEntropyBits != null;
+
+  /// The reconstructed seed as a BIP39 mnemonic, for an explicit
+  /// user-initiated **blind** export (copy → paste into another wallet's
+  /// import wizard without reading it). Returns null until recall is complete.
+  ///
+  /// "The user never sees the seed" holds in the blind-copy sense: this string
+  /// is handed to the clipboard, never rendered on screen (ARCHITECTURE.md
+  /// §"Stage 0" / §"Invariants"). It is computed on demand and not retained.
+  String? exportMnemonic() {
+    final List<int>? bits = _recalledEntropyBits;
+    if (bits == null) return null;
+    return Bip39.entropyBitsToMnemonic(bits);
+  }
+
+  /// `SHA-512(seed-phrase + salt)` as hex, for target apps that accept a
+  /// non-BIP39 high-entropy seed. The descriptive [salt] domain-separates one
+  /// setup from another, and the 128-hex-char digest is far harder to memorise
+  /// from a stray glance than the word list. Returns null until recall is
+  /// complete. Mirrors great-wall-core's standalone "Salt & SHA512" button.
+  String? exportSaltedDigest(String salt) {
+    final String? mnemonic = exportMnemonic();
+    if (mnemonic == null) return null;
+    return Bip39.saltedDigestHex(mnemonic, salt);
+  }
 
   /// The point markers to overlay for the currently displayed stage. These are
   /// the locations the user must learn to recognise — the only thing they leave

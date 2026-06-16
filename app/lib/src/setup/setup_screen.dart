@@ -31,6 +31,10 @@ class _SetupScreenState extends State<SetupScreen> {
       PanZoomController(initial: _initialViewport);
   final BrightnessController _brightness = BrightnessController();
 
+  /// Descriptive salt for the SHA-512 export at recall (e.g. "main wallet").
+  /// Domain-separates one setup from another — see ARCHITECTURE.md §"Stage 0".
+  final TextEditingController _salt = TextEditingController();
+
   HueOffset _hue = HueOffset.red;
   SizePreset _preset = SizePreset.defaultPreset;
   Argon2Profile _profile = Argon2Profile.basic;
@@ -59,6 +63,7 @@ class _SetupScreenState extends State<SetupScreen> {
     _setup.dispose();
     _viewport.dispose();
     _brightness.dispose();
+    _salt.dispose();
     super.dispose();
   }
 
@@ -387,12 +392,68 @@ class _SetupScreenState extends State<SetupScreen> {
       const SizedBox(height: 8),
       Text(
         'Both stages were selected back and the seed was reconstructed from '
-        'your points. The seed itself is never shown.',
+        'your points. It is never shown on screen — the buttons below copy it '
+        'straight to the clipboard so you can paste it blind into another '
+        "wallet's import wizard and continue without ever reading it.",
         style: Theme.of(context).textTheme.bodySmall,
       ),
       const SizedBox(height: 16),
+      OutlinedButton.icon(
+        onPressed: _copyMnemonic,
+        icon: const Icon(Icons.content_copy),
+        label: const Text('Copy seed phrase (BIP39)'),
+      ),
+      const SizedBox(height: 16),
+      Text(
+        'Or, for an app that accepts a non-BIP39 seed, copy '
+        'SHA-512(seed + salt). The salt labels this setup (e.g. "main '
+        'wallet") and keeps it distinct from your others; the long hex '
+        'string is also far harder to memorise by accident.',
+        style: Theme.of(context).textTheme.bodySmall,
+      ),
+      const SizedBox(height: 8),
+      TextField(
+        controller: _salt,
+        decoration: const InputDecoration(
+          isDense: true,
+          border: OutlineInputBorder(),
+          labelText: 'Descriptive salt',
+          hintText: 'e.g. main wallet',
+        ),
+      ),
+      const SizedBox(height: 8),
+      OutlinedButton.icon(
+        onPressed: _copySaltedDigest,
+        icon: const Icon(Icons.content_copy),
+        label: const Text('Copy SHA-512(seed + salt)'),
+      ),
+      const SizedBox(height: 24),
       FilledButton(onPressed: _reset, child: const Text('Done')),
     ];
+  }
+
+  Future<void> _copyMnemonic() async {
+    final String? mnemonic = _setup.exportMnemonic();
+    if (mnemonic == null) return;
+    await Clipboard.setData(ClipboardData(text: mnemonic));
+    if (!mounted) return;
+    // Confirmation never echoes the secret itself.
+    _toast('Seed phrase copied — paste it into your wallet, then clear the '
+        'clipboard.');
+  }
+
+  Future<void> _copySaltedDigest() async {
+    final String? digest = _setup.exportSaltedDigest(_salt.text);
+    if (digest == null) return;
+    await Clipboard.setData(ClipboardData(text: digest));
+    if (!mounted) return;
+    _toast('SHA-512 digest copied — paste it, then clear the clipboard.');
+  }
+
+  void _toast(String msg) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(duration: const Duration(milliseconds: 1400), content: Text(msg)),
+    );
   }
 
   Future<void> _start() async {
