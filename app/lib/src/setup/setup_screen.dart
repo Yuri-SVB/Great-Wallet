@@ -27,18 +27,8 @@ class SetupScreen extends StatefulWidget {
 class _SetupScreenState extends State<SetupScreen> {
   late final SetupController _setup = SetupController(widget.core);
 
-  // Canonical default viewport (constants.py: DEFAULT_CENTER_*, VIEWPORT_BASE_SPAN
-  // = 4.0 -> halfExtent 2.0).
-  final PanZoomController _viewport = PanZoomController(
-    initial: const FractalViewport(
-      centreRe: -0.5,
-      centreIm: -0.5,
-      halfExtent: 2.0,
-      widthPx: 1,
-      heightPx: 1,
-      devicePixelRatio: 1.0,
-    ),
-  );
+  final PanZoomController _viewport =
+      PanZoomController(initial: _initialViewport);
   final BrightnessController _brightness = BrightnessController();
 
   HueOffset _hue = HueOffset.red;
@@ -90,7 +80,7 @@ class _SetupScreenState extends State<SetupScreen> {
               children: <Widget>[
                 Positioned.fill(child: _canvas(hasResult)),
                 if (_busy) Positioned.fill(child: _progressOverlay()),
-                if (hasResult && _selectMode)
+                if (_selectMode)
                   const Positioned(
                     top: 12,
                     left: 12,
@@ -107,8 +97,7 @@ class _SetupScreenState extends State<SetupScreen> {
 
   KeyEventResult _onKey(FocusNode node, KeyEvent event) {
     if (event is KeyDownEvent &&
-        event.logicalKey == LogicalKeyboardKey.keyS &&
-        _setup.phase == SetupPhase.memorise) {
+        event.logicalKey == LogicalKeyboardKey.keyS) {
       setState(() => _selectMode = !_selectMode);
       return KeyEventResult.handled;
     }
@@ -130,7 +119,7 @@ class _SetupScreenState extends State<SetupScreen> {
       // Selection is enabled only once points exist and the user turns on
       // select mode (button or `S`). Otherwise taps do nothing and the canvas
       // is pan/zoom only.
-      onSelect: (hasResult && _selectMode) ? _onCanvasSelect : null,
+      onSelect: _selectMode ? _onCanvasSelect : null,
     );
   }
 
@@ -203,6 +192,23 @@ class _SetupScreenState extends State<SetupScreen> {
           const Divider(height: 32),
 
           if (!hasResult) ..._configControls() else ..._memoriseControls(),
+
+          const Divider(height: 32),
+          // Always available: selection works on whatever fractal is shown
+          // (stage 1 from app start, stage 2 after derivation), and Reset
+          // returns to the configuration screen without restarting the app.
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Select mode'),
+            subtitle: const Text('Click a point to test recall (or press S)'),
+            value: _selectMode,
+            onChanged: (bool v) => setState(() => _selectMode = v),
+          ),
+          OutlinedButton.icon(
+            onPressed: _busy ? null : _reset,
+            icon: const Icon(Icons.refresh),
+            label: const Text('Reset'),
+          ),
 
           const Divider(height: 32),
           const Text('Palette'),
@@ -311,14 +317,6 @@ class _SetupScreenState extends State<SetupScreen> {
         onSelectionChanged: (Set<Stage> s) => _setup.showStage(s.first),
       ),
       const SizedBox(height: 16),
-      SwitchListTile(
-        contentPadding: EdgeInsets.zero,
-        title: const Text('Select mode'),
-        subtitle: const Text('Click a point to test recall (or press S)'),
-        value: _selectMode,
-        onChanged: (bool v) => setState(() => _selectMode = v),
-      ),
-      const SizedBox(height: 8),
       Text(
         'Study the marked locations on each stage until you can find them '
         'from memory. When you are confident, finish — the seed is then held '
@@ -342,7 +340,25 @@ class _SetupScreenState extends State<SetupScreen> {
       profile: _profile,
     );
   }
+
+  void _reset() {
+    _setup.reset();
+    _brightness.reset();
+    _viewport.viewport = _initialViewport;
+    setState(() => _selectMode = false);
+  }
 }
+
+/// Canonical default viewport (constants.py: DEFAULT_CENTER_*, VIEWPORT_BASE_SPAN
+/// = 4.0 -> halfExtent 2.0).
+const FractalViewport _initialViewport = FractalViewport(
+  centreRe: -0.5,
+  centreIm: -0.5,
+  halfExtent: 2.0,
+  widthPx: 1,
+  heightPx: 1,
+  devicePixelRatio: 1.0,
+);
 
 /// Small translucent label shown over the canvas (e.g. the select-mode hint).
 class _Badge extends StatelessWidget {

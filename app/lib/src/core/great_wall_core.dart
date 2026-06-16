@@ -92,58 +92,103 @@ class GreatWallCore {
   /// `iterations == 0` is the identity case: the 8-byte stage-1 input
   /// right-padded to the 32-byte digest, no Argon2 (used for fast dev runs).
   ///
-  /// [onProgress] reports completed passes; [shouldStop] is polled between
-  /// passes for cancellation (the in-flight Rust call is not interruptible).
+  /// Start deriving `(o, p, q)` from stage-1 bits by running `iterations`
+  /// Argon2d passes (each digest fed back as the next input — the iterative
+  /// scheme of `run_argon2_iterative`, argon2_pipeline.py).
   ///
-  /// Each pass runs in a worker isolate via [Isolate.run] (which opens its own
-  /// engine binding — FFI handles cannot cross isolates), so the heavy,
-  /// blocking Argon2 call never stalls the UI isolate. This is the two-tier
-  /// threading model from TECH_STACK.md §"Threading model": the UI isolate
-  /// dispatches work units and awaits results instead of blocking, which is
-  /// what keeps the OS from raising an "application not responding" dialog.
-  Future<Stage2Reservoirs> deriveStage2Reservoirs(
+  /// `iterations == 0` is the identity case (8-byte input zero-padded to the
+  /// 32-byte digest, no Argon2) used for fast dev runs.
+  ///
+  /// The whole loop runs in a **single dedicated worker isolate** (which opens
+  /// its own engine binding — FFI handles cannot cross isolates), so the heavy,
+  /// blocking Argon2 calls never stall the UI isolate (TECH_STACK.md
+  /// §"Threading model: two-tier"). The returned [Argon2Job] exposes progress
+  /// via [onProgress], the [Argon2Job.result] future, and [Argon2Job.cancel],
+  /// which **kills** the isolate — so Stop returns control immediately instead
+  /// of waiting out the run. (A single in-flight native pass cannot be
+  /// preempted mid-call, but cancel stops listening and tears the isolate down
+  /// at once; granularity is one pass, as in the reference.)
+  Future<Argon2Job> startStage2Derivation(
     List<int> stage1Bits, {
     required int iterations,
     Argon2Profile profile = Argon2Profile.basic,
     void Function(int completed, int total)? onProgress,
-    bool Function()? shouldStop,
   }) async {
     final int total = iterations < 1 ? 1 : iterations;
-    Uint8List digest;
+
     if (iterations == 0) {
       final Uint8List input = Entropy.stage1Argon2Input(stage1Bits);
-      digest = Uint8List(32)..setRange(0, 8, input);
+      final Uint8List digest = Uint8List(32)..setRange(0, 8, input);
       onProgress?.call(1, total);
-    } else {
-      final Uint8List input = Entropy.stage1Argon2Input(stage1Bits);
-      digest = await _argon2PassInIsolate(input, profile);
-      onProgress?.call(1, total);
-      for (int i = 1; i < iterations; i++) {
-        if (shouldStop?.call() ?? false) {
-          throw const Argon2Cancelled();
-        }
-        digest = await _argon2PassInIsolate(digest, profile);
-        onProgress?.call(i + 1, total);
-      }
+      final Stage2Reservoirs r = Stage2Reservoirs.fromArgon2Digest(digest);
+      digest.fillRange(0, digest.length, 0);
+      return Argon2Job(Future<Stage2Reservoirs>.value(r), () {});
     }
-    final Stage2Reservoirs reservoirs = Stage2Reservoirs.fromArgon2Digest(digest);
-    // Wipe the digest copy; reservoirs are the only thing the session keeps.
-    digest.fillRange(0, digest.length, 0);
-    return reservoirs;
+
+    final Uint8List input = Entropy.stage1Argon2Input(stage1Bits);
+    final ReceivePort port = ReceivePort();
+    final Completer<Stage2Reservoirs> completer = Completer<Stage2Reservoirs>();
+    final Isolate isolate = await Isolate.spawn<(SendPort, Uint8List, int, int)>(
+      _argon2IsolateEntry,
+      (port.sendPort, input, iterations, profile.value),
+      onError: port.sendPort,
+      errorsAreFatal: true,
+    );
+
+    void cleanup() => port.close();
+
+    port.listen((dynamic msg) {
+      if (msg is int) {
+        onProgress?.call(msg, total);
+      } else if (msg is Uint8List) {
+        final Stage2Reservoirs r = Stage2Reservoirs.fromArgon2Digest(msg);
+        msg.fillRange(0, msg.length, 0);
+        if (!completer.isCompleted) completer.complete(r);
+        cleanup();
+      } else {
+        // Error payload (from the isolate body or onError): [message, stack].
+        if (!completer.isCompleted) {
+          completer.completeError(StateError('Argon2 isolate failed'));
+        }
+        cleanup();
+      }
+    });
+
+    void cancel() {
+      if (completer.isCompleted) return;
+      isolate.kill(priority: Isolate.immediate);
+      cleanup();
+      completer.completeError(const Argon2Cancelled());
+    }
+
+    return Argon2Job(completer.future, cancel);
   }
 }
 
-/// Run one Argon2d pass on a worker isolate.
-///
-/// The closure captures only sendable values (a copy of [input] and the
-/// [profile] enum) and opens a fresh engine binding inside the isolate, since a
-/// [DynamicLibrary]/FFI handle from the parent isolate cannot be sent across.
-Future<Uint8List> _argon2PassInIsolate(Uint8List input, Argon2Profile profile) {
-  final Uint8List inputCopy = Uint8List.fromList(input);
-  return Isolate.run<Uint8List>(() {
-    final GreatWallCoreBindings bindings = GreatWallCoreBindings.open();
-    return bindings.argon2Single(inputCopy, profile);
-  });
+/// Worker-isolate entry: open the engine, run the Argon2 loop, stream progress
+/// (`int` after each pass) and finally the 32-byte digest (`Uint8List`).
+void _argon2IsolateEntry((SendPort, Uint8List, int, int) args) {
+  final (SendPort send, Uint8List input, int iterations, int profileValue) = args;
+  final Argon2Profile profile = Argon2Profile.values[profileValue];
+  final GreatWallCoreBindings bindings = GreatWallCoreBindings.open();
+  Uint8List digest = bindings.argon2Single(input, profile);
+  send.send(1);
+  for (int i = 1; i < iterations; i++) {
+    digest = bindings.argon2Single(digest, profile);
+    send.send(i + 1);
+  }
+  send.send(digest);
+}
+
+/// A running stage-2 derivation: its [result], and a [cancel] that kills the
+/// worker isolate and fails [result] with [Argon2Cancelled].
+class Argon2Job {
+  Argon2Job(this.result, this._cancel);
+
+  final Future<Stage2Reservoirs> result;
+  final void Function() _cancel;
+
+  void cancel() => _cancel();
 }
 
 /// An encoded fractal point in raw I4F60 coordinates.
@@ -158,7 +203,8 @@ class EncodedPoint {
   String toString() => 'EncodedPoint(<redacted>)';
 }
 
-/// Thrown by [GreatWallCore.deriveStage2Reservoirs] when cancelled.
+/// Completes [Argon2Job.result] when the derivation is cancelled via
+/// [Argon2Job.cancel].
 class Argon2Cancelled implements Exception {
   const Argon2Cancelled();
   @override

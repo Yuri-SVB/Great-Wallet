@@ -95,7 +95,9 @@ app/native/build_core.sh
 # 2. Run the app (desktop-first; needs the Flutter SDK 3.22+)
 cd app
 flutter pub get
-flutter create --platforms=linux .   # one-time: generate the platform runner
+# one-time: generate the platform runner. --org sets the application id so it
+# is not the Flutter default "com.example.*".
+flutter create --platforms=linux --org org.greatwall --project-name great_wallet .
 flutter run -d linux                 # or macos / windows
 
 # Tests

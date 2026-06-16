@@ -63,13 +63,18 @@ app/native/build_core.sh
 # 2. Run the app (desktop-first, per TECH_STACK.md)
 cd app
 flutter pub get
-flutter create --platforms=linux .   # one-time: generate the platform runner
+# one-time: generate the platform runner. Pass --org so the application id is
+# not the Flutter default "com.example.*" (that id shows up in OS dialogs and
+# window classes).
+flutter create --platforms=linux --org org.greatwall --project-name great_wallet .
 flutter run -d linux                 # or macos / windows
 ```
 
 Only the Dart sources and project metadata are committed; the generated
 platform runners (`linux/`, `macos/`, `windows/`, `build/`, `.dart_tool/`) are
-produced by `flutter create` / `flutter pub get` and are git-ignored.
+produced by `flutter create` / `flutter pub get` and are git-ignored. The
+`--org` flag above sets the application id (e.g. `org.greatwall.great_wallet`);
+without it the runner is scaffolded as `com.example.great_wallet`.
 
 If the engine library is missing, the app shows an actionable screen instead of
 crashing.

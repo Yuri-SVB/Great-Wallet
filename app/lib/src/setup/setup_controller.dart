@@ -64,7 +64,7 @@ class SetupController extends ChangeNotifier {
   /// CoreEscapeCountSource.stage2Reservoirs.
   StageParameters? get stage2Params => _stage2Params;
 
-  bool _stopRequested = false;
+  Argon2Job? _argon2Job;
 
   /// The point markers to overlay for the currently displayed stage. These are
   /// the locations the user must learn to recognise — the only thing they leave
@@ -82,7 +82,9 @@ class SetupController extends ChangeNotifier {
             radiusPx: 6,
           ),
       ],
-      crosshairs: true,
+      // No crosshairs: a centre cross adds nothing here and reads as a stray
+      // marker over the fractal.
+      crosshairs: false,
     );
   }
 
@@ -99,7 +101,6 @@ class SetupController extends ChangeNotifier {
       return; // a run is already in progress
     }
     _preset = preset;
-    _stopRequested = false;
     _errorMessage = null;
     try {
       // 1. Fresh entropy root (write-only on memory).
@@ -124,7 +125,7 @@ class SetupController extends ChangeNotifier {
       _setPhase(SetupPhase.derivingParams);
       _argon2Total = argon2Iterations < 1 ? 1 : argon2Iterations;
       _argon2Done = 0;
-      final Stage2Reservoirs reservoirs = await _core.deriveStage2Reservoirs(
+      final Argon2Job job = await _core.startStage2Derivation(
         stage1Bits,
         iterations: argon2Iterations,
         profile: profile,
@@ -133,8 +134,10 @@ class SetupController extends ChangeNotifier {
           _argon2Total = total;
           notifyListeners();
         },
-        shouldStop: () => _stopRequested,
       );
+      _argon2Job = job;
+      final Stage2Reservoirs reservoirs = await job.result;
+      _argon2Job = null;
       // Hand the authoritative reservoirs to the render source and build the
       // UX-facing display surrogate.
       _core.source.stage2Reservoirs = reservoirs;
@@ -169,9 +172,23 @@ class SetupController extends ChangeNotifier {
     }
   }
 
-  /// Cancel an in-progress Argon2 derivation (polled between passes).
+  /// Cancel an in-progress Argon2 derivation. Kills the worker isolate and
+  /// fails the derivation with [Argon2Cancelled], returning the UI to idle.
   void requestStop() {
-    _stopRequested = true;
+    _argon2Job?.cancel();
+    _argon2Job = null;
+  }
+
+  /// Discard the current session and return to the configuration screen,
+  /// wiping any in-memory secrets. Safe to call at any time.
+  void reset() {
+    _argon2Job?.cancel();
+    _argon2Job = null;
+    _resetSecrets();
+    _errorMessage = null;
+    _displayStage = Stage.stage1;
+    _argon2Done = 0;
+    _setPhase(SetupPhase.idle);
   }
 
   /// Decode the point under a select-mode tap and report whether it landed on
