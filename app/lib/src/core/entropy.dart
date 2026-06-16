@@ -1,0 +1,78 @@
+import 'dart:math';
+import 'dart:typed_data';
+
+/// Bit/byte helpers for the entropy that flows between the user's fractal
+/// recall and the wallet seed.
+///
+/// The full key-derivation chain (raw entropy -> BIP39 mnemonic ->
+/// PBKDF2 seed -> BIP32 xpriv) is great-wall-core's responsibility and is NOT
+/// re-implemented here (SCOPE.md: "Key derivation, BIP39, BIP32 ... never
+/// handled in the UX layer"; it belongs to the engine/app boundary, surfaced
+/// over FFI in a later pass). This file covers only the bit plumbing the Setup
+/// orchestration needs to assemble `stage-1 || stage-2` and hand the engine
+/// 8-byte chunks for Argon2.
+class Entropy {
+  Entropy._();
+
+  /// Pack a list of 0/1 ints MSB-first into bytes. Trailing bits in a final
+  /// partial byte are left-aligned (shifted up), matching `bits_to_bytes` in
+  /// great-wall-core/burning_ship/encoding.py.
+  static Uint8List bitsToBytes(List<int> bits) {
+    final int nBytes = (bits.length + 7) ~/ 8;
+    final Uint8List out = Uint8List(nBytes);
+    for (int i = 0; i < bits.length; i++) {
+      if (bits[i] != 0) {
+        out[i >> 3] |= 1 << (7 - (i & 7));
+      }
+    }
+    return out;
+  }
+
+  /// Expand bytes to a list of 0/1 ints, MSB-first. Inverse of [bitsToBytes]
+  /// for whole-byte inputs.
+  static List<int> bytesToBits(Uint8List bytes) {
+    final List<int> bits = List<int>.filled(bytes.length * 8, 0);
+    for (int i = 0; i < bytes.length; i++) {
+      for (int j = 0; j < 8; j++) {
+        bits[i * 8 + j] = (bytes[i] >> (7 - j)) & 1;
+      }
+    }
+    return bits;
+  }
+
+  /// The 8-byte Argon2 input derived from stage-1 bits.
+  ///
+  /// great-wall-core feeds Argon2 exactly `ARGON2_INPUT_BYTES = 8` bytes
+  /// (constants.py). `bits_to_bytes(stage1_bits)` is right-padded with zero
+  /// bytes to 8 — the same `data.ljust(8, 0)` shape the reference uses for the
+  /// identity (zero-iteration) case.
+  static Uint8List stage1Argon2Input(List<int> stage1Bits) {
+    final Uint8List packed = bitsToBytes(stage1Bits);
+    if (packed.length == 8) return packed;
+    final Uint8List out = Uint8List(8);
+    out.setRange(0, min(packed.length, 8), packed);
+    return out;
+  }
+
+  /// Generate `bitCount` cryptographically-random bits using a secure RNG.
+  ///
+  /// Setup is a "write-only operation on the user's memory" (ARCHITECTURE.md
+  /// §"Invariants"): a fresh root is generated here, encoded onto the fractal,
+  /// and the plaintext destroyed. `bitCount` must be a multiple of 8.
+  static List<int> randomBits(int bitCount, {Random? random}) {
+    assert(bitCount % 8 == 0, 'bitCount must be a whole number of bytes');
+    final Random rng = random ?? Random.secure();
+    final Uint8List bytes = Uint8List(bitCount ~/ 8);
+    for (int i = 0; i < bytes.length; i++) {
+      bytes[i] = rng.nextInt(256);
+    }
+    return bytesToBits(bytes);
+  }
+
+  /// Overwrite a bit list with zeros once it is no longer needed.
+  static void wipe(List<int> bits) {
+    for (int i = 0; i < bits.length; i++) {
+      bits[i] = 0;
+    }
+  }
+}

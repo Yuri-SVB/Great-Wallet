@@ -1,0 +1,45 @@
+name: great_wallet_app
+description: >-
+  Great Wallet — the unified end-user application. This package is the
+  app-level orchestration layer that wires the ecosystem libraries together.
+  It currently implements the Setup mode by integrating great-wall-ux
+  (rendering / interaction) with great-wall-core (the fractal encoder engine)
+  over the engine's C ABI. See great-wall-docs/great-wallet/ARCHITECTURE.md.
+publish_to: none
+version: 0.0.1
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+  flutter: ">=3.22.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+
+  # The visual and interaction layer. Provided by the consuming app as a
+  # flat submodule of great-wallet (great-wall-docs ARCHITECTURE.md §"Submodule
+  # Rules": only the app repo carries submodules, one level deep). great-wall-ux
+  # itself submodules nothing — this app pins it.
+  great_wall_ux:
+    path: ../great-wall-ux
+
+  # Foreign-function interface helpers (calloc / free for the per-frame
+  # escape-count pixel buffer). The raw dart:ffi binding to the Rust core's
+  # C ABI lives in lib/src/ffi (TECH_STACK.md §"FFI: hybrid" — raw dart:ffi on
+  # the hot pixel-buffer path).
+  ffi: ^2.1.0
+
+  # SHA-256 for the (o, p, q) derivation from the Argon2 digest. Mirrors
+  # great-wall-core/burning_ship/argon2_pipeline.py: derive_stage2_params().
+  crypto: ^3.0.3
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  generate: false
+  uses-material-design: true
