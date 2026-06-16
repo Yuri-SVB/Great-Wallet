@@ -21,7 +21,30 @@ enum SetupPhase {
   encodingStage2,
   memorise, // user studies stage-1 then stage-2 points
   complete,
+  recallComplete, // both stages selected back; seed reconstructed
   error,
+}
+
+/// Outcome of a select-mode click.
+enum SelectionOutcome {
+  /// The click did not land on an encodable leaf.
+  invalid,
+
+  /// A point was added to the current stage's selection.
+  added,
+
+  /// The click decoded to a point already selected this stage.
+  duplicate,
+
+  /// Stage 1's points are all selected; `(o, p, q)` was derived and stage 2
+  /// is now displayed.
+  advancedToStage2,
+
+  /// Both stages selected; the seed has been reconstructed.
+  complete,
+
+  /// A derivation is in progress; the click was ignored.
+  busy,
 }
 
 /// Drives the Setup mode and owns the integration between great-wall-core
@@ -66,6 +89,24 @@ class SetupController extends ChangeNotifier {
 
   Argon2Job? _argon2Job;
 
+  // --- Select-mode recall state ---
+  // Marks (canvas coords) of points selected this stage, and their decoded
+  // 32-bit chunks. Coercion-relevant: held only for the session, wiped on reset.
+  final List<({double re, double im})> _selectedMarks =
+      <({double re, double im})>[];
+  final List<List<int>> _selectedChunks = <List<int>>[];
+  List<int> _recalledStage1Bits = const <int>[];
+  List<int>? _recalledEntropyBits;
+
+  /// Points selected so far in the current stage.
+  int get selectedCount => _selectedMarks.length;
+
+  /// Points required per stage for the active size preset.
+  int get requiredPerStage => _preset.pointsPerStage;
+
+  /// True once both stages have been selected back and the seed reconstructed.
+  bool get isRecallComplete => _recalledEntropyBits != null;
+
   /// The point markers to overlay for the currently displayed stage. These are
   /// the locations the user must learn to recognise — the only thing they leave
   /// Setup with (as tacit recall, never written down).
@@ -74,12 +115,21 @@ class SetupController extends ChangeNotifier {
         _displayStage == Stage.stage1 ? _stage1Points : _stage2Points;
     return CanvasOverlays(
       points: <PointMarker>[
+        // Generated points to memorise (white).
         for (final EncodedPoint pt in pts)
           PointMarker(
             re: fixedToDouble(pt.reRaw),
             im: fixedToDouble(pt.imRaw),
             colour: const Color(0xFFFFFFFF),
             radiusPx: 6,
+          ),
+        // Points selected this stage in select mode (green).
+        for (final ({double re, double im}) m in _selectedMarks)
+          PointMarker(
+            re: m.re,
+            im: m.im,
+            colour: const Color(0xFF00E676),
+            radiusPx: 7,
           ),
       ],
       // No crosshairs: a centre cross adds nothing here and reads as a stray
@@ -102,6 +152,7 @@ class SetupController extends ChangeNotifier {
     }
     _preset = preset;
     _errorMessage = null;
+    _clearSelection();
     try {
       // 1. Fresh entropy root (write-only on memory).
       final List<int> bits = Entropy.randomBits(preset.entropyBits);
@@ -191,24 +242,122 @@ class SetupController extends ChangeNotifier {
     _setPhase(SetupPhase.idle);
   }
 
-  /// Decode the point under a select-mode tap and report whether it landed on
-  /// a valid encodable leaf. Uses the currently displayed stage's `(o, p, q)`:
-  /// `(0,0,0)` for stage 1, the session reservoirs for stage 2 — the same
-  /// formula the points were encoded with.
+  /// Handle a select-mode click: decode the point under the cursor, add it to
+  /// the current stage's selection, and advance when the stage is complete.
   ///
-  /// The boolean is all that surfaces; the decoded bits and coordinates stay
-  /// inside the engine call and are never logged (SCOPE.md invariants).
-  bool probeSelection(FractalSelection selection) {
+  /// This is the click-to-decode recall workflow (SCOPE.md §"Interaction"):
+  ///  - Stage 1 points decode on the canonical fractal `(0,0,0)`.
+  ///  - When `requiredPerStage` stage-1 points are selected, their bits are run
+  ///    through Argon2 to derive `(o, p, q)`; the perturbed stage-2 fractal is
+  ///    then displayed and selection resets.
+  ///  - Stage 2 points decode under those reservoirs; once complete, the full
+  ///    entropy (`stage1 || stage2`) is reconstructed.
+  ///
+  /// Decoded bits and coordinates stay inside the session and are never logged
+  /// (SCOPE.md invariants).
+  Future<SelectionOutcome> selectPoint(
+    FractalSelection selection, {
+    required SizePreset preset,
+    required int argon2Iterations,
+    Argon2Profile profile = Argon2Profile.basic,
+  }) async {
+    if (_phase == SetupPhase.derivingParams ||
+        _phase == SetupPhase.recallComplete) {
+      return SelectionOutcome.busy;
+    }
+    _preset = preset;
     final Stage2Reservoirs? r = _core.source.stage2Reservoirs;
     final bool s2 = _displayStage == Stage.stage2;
+    if (s2 && r == null) return SelectionOutcome.busy;
+
     final CoreDecodeResult result = _core.decodePoint(
       reRaw: fixedFromDouble(selection.re),
       imRaw: fixedFromDouble(selection.im),
-      o: s2 ? (r?.o ?? 0) : EncodingConstants.stage1O,
-      p: s2 ? (r?.p ?? 0) : EncodingConstants.stage1P,
-      q: s2 ? (r?.q ?? 0) : EncodingConstants.stage1Q,
+      o: s2 ? r!.o : EncodingConstants.stage1O,
+      p: s2 ? r!.p : EncodingConstants.stage1P,
+      q: s2 ? r!.q : EncodingConstants.stage1Q,
     );
-    return result.valid;
+    if (!result.valid) return SelectionOutcome.invalid;
+
+    // Clicking the same leaf again should not double-count it.
+    for (final List<int> chunk in _selectedChunks) {
+      if (_sameBits(chunk, result.bits)) return SelectionOutcome.duplicate;
+    }
+
+    _selectedMarks.add((re: selection.re, im: selection.im));
+    _selectedChunks.add(result.bits);
+    notifyListeners();
+
+    if (_selectedMarks.length < requiredPerStage) {
+      return SelectionOutcome.added;
+    }
+
+    // Stage complete: assemble this stage's bits in selection order.
+    final List<int> stageBits = <int>[
+      for (final List<int> chunk in _selectedChunks) ...chunk,
+    ];
+
+    if (!s2) {
+      // Stage 1 done: derive (o, p, q) and reveal stage 2.
+      _recalledStage1Bits = stageBits;
+      try {
+        _setPhase(SetupPhase.derivingParams);
+        _argon2Total = argon2Iterations < 1 ? 1 : argon2Iterations;
+        _argon2Done = 0;
+        final Argon2Job job = await _core.startStage2Derivation(
+          stageBits,
+          iterations: argon2Iterations,
+          profile: profile,
+          onProgress: (int done, int total) {
+            _argon2Done = done;
+            _argon2Total = total;
+            notifyListeners();
+          },
+        );
+        _argon2Job = job;
+        final Stage2Reservoirs reservoirs = await job.result;
+        _argon2Job = null;
+        _core.source.stage2Reservoirs = reservoirs;
+        final ({double o, double p, double q}) key = reservoirs.displayKey;
+        _stage2Params = StageParameters(o: key.o, p: key.p, q: key.q);
+        _displayStage = Stage.stage2;
+        _clearSelection();
+        _setPhase(SetupPhase.memorise);
+        return SelectionOutcome.advancedToStage2;
+      } on Argon2Cancelled {
+        _setPhase(SetupPhase.memorise);
+        return SelectionOutcome.busy;
+      }
+    }
+
+    // Stage 2 done: reconstruct full entropy.
+    _recalledEntropyBits = <int>[..._recalledStage1Bits, ...stageBits];
+    _clearSelection();
+    _setPhase(SetupPhase.recallComplete);
+    return SelectionOutcome.complete;
+  }
+
+  /// Clear the current stage's selection (markers + decoded chunks).
+  void clearSelection() {
+    if (_selectedMarks.isEmpty) return;
+    _clearSelection();
+    notifyListeners();
+  }
+
+  void _clearSelection() {
+    for (final List<int> chunk in _selectedChunks) {
+      Entropy.wipe(chunk);
+    }
+    _selectedMarks.clear();
+    _selectedChunks.clear();
+  }
+
+  static bool _sameBits(List<int> a, List<int> b) {
+    if (a.length != b.length) return false;
+    for (int i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
   }
 
   /// Switch the displayed stage during memorisation.
@@ -235,6 +384,12 @@ class SetupController extends ChangeNotifier {
     _stage2Params = null;
     _core.source.stage2Reservoirs?.clear();
     _core.source.stage2Reservoirs = null;
+    _clearSelection();
+    if (_recalledStage1Bits.isNotEmpty) Entropy.wipe(_recalledStage1Bits);
+    _recalledStage1Bits = const <int>[];
+    final List<int>? rec = _recalledEntropyBits;
+    if (rec != null) Entropy.wipe(rec);
+    _recalledEntropyBits = null;
   }
 
   void _setPhase(SetupPhase p) {

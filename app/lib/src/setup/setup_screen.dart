@@ -78,7 +78,7 @@ class _SetupScreenState extends State<SetupScreen> {
           Expanded(
             child: Stack(
               children: <Widget>[
-                Positioned.fill(child: _canvas(hasResult)),
+                Positioned.fill(child: _canvas()),
                 if (_busy) Positioned.fill(child: _progressOverlay()),
                 if (_selectMode)
                   const Positioned(
@@ -104,7 +104,7 @@ class _SetupScreenState extends State<SetupScreen> {
     return KeyEventResult.ignored;
   }
 
-  Widget _canvas(bool hasResult) {
+  Widget _canvas() {
     final Stage stage = _setup.displayStage;
     return FractalCanvas(
       source: widget.core.source,
@@ -114,24 +114,47 @@ class _SetupScreenState extends State<SetupScreen> {
       stage: stage,
       stageParameters: stage == Stage.stage2 ? _setup.stage2Params : null,
       maxIterations: EncodingConstants.guiParams.maxIter,
-      overlays: hasResult ? _setup.overlaysForDisplayStage() : CanvasOverlays.empty,
+      // Generated points (white, after Generate) plus selected points (green,
+      // in select mode). Empty until there is something to show.
+      overlays: _setup.overlaysForDisplayStage(),
       semanticLabel: 'Fractal canvas',
       // Selection is enabled only once points exist and the user turns on
       // select mode (button or `S`). Otherwise taps do nothing and the canvas
       // is pan/zoom only.
-      onSelect: _selectMode ? _onCanvasSelect : null,
+      onSelect: _selectMode
+          ? (FractalSelection sel) {
+              _onCanvasSelect(sel);
+            }
+          : null,
     );
   }
 
-  void _onCanvasSelect(FractalSelection sel) {
-    final bool valid = _setup.probeSelection(sel);
+  Future<void> _onCanvasSelect(FractalSelection sel) async {
+    final SelectionOutcome outcome = await _setup.selectPoint(
+      sel,
+      preset: _preset,
+      argon2Iterations: _iterations,
+      profile: _profile,
+    );
+    if (!mounted) return;
+    final String? msg;
+    switch (outcome) {
+      case SelectionOutcome.invalid:
+        msg = 'No encodable leaf there — zoom in and click closer.';
+      case SelectionOutcome.duplicate:
+        msg = 'That point is already selected.';
+      case SelectionOutcome.added:
+        msg = 'Selected ${_setup.selectedCount}/${_setup.requiredPerStage}.';
+      case SelectionOutcome.advancedToStage2:
+        msg = 'Stage 1 recalled → stage 2.';
+      case SelectionOutcome.complete:
+        msg = 'Recall complete — seed reconstructed.';
+      case SelectionOutcome.busy:
+        msg = null;
+    }
+    if (msg == null) return;
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        duration: const Duration(milliseconds: 900),
-        content: Text(valid
-            ? 'Hit a valid encodable leaf.'
-            : 'No encodable leaf at that point — zoom in and try again.'),
-      ),
+      SnackBar(duration: const Duration(milliseconds: 900), content: Text(msg)),
     );
   }
 
@@ -191,7 +214,12 @@ class _SetupScreenState extends State<SetupScreen> {
           ),
           const Divider(height: 32),
 
-          if (!hasResult) ..._configControls() else ..._memoriseControls(),
+          if (_setup.phase == SetupPhase.recallComplete)
+            ..._recallCompleteControls()
+          else if (!hasResult)
+            ..._configControls()
+          else
+            ..._memoriseControls(),
 
           const Divider(height: 32),
           // Always available: selection works on whatever fractal is shown
@@ -200,10 +228,21 @@ class _SetupScreenState extends State<SetupScreen> {
           SwitchListTile(
             contentPadding: EdgeInsets.zero,
             title: const Text('Select mode'),
-            subtitle: const Text('Click a point to test recall (or press S)'),
+            subtitle: const Text('Click your points to recall (or press S)'),
             value: _selectMode,
             onChanged: (bool v) => setState(() => _selectMode = v),
           ),
+          if (_selectMode && _setup.phase != SetupPhase.recallComplete) ...<Widget>[
+            Text(
+              '${_setup.displayStage == Stage.stage2 ? "Stage 2" : "Stage 1"}: '
+              'selected ${_setup.selectedCount}/${_preset.pointsPerStage}',
+            ),
+            TextButton(
+              onPressed:
+                  _setup.selectedCount == 0 ? null : _setup.clearSelection,
+              child: const Text('Clear selection'),
+            ),
+          ],
           OutlinedButton.icon(
             onPressed: _busy ? null : _reset,
             icon: const Icon(Icons.refresh),
@@ -328,6 +367,31 @@ class _SetupScreenState extends State<SetupScreen> {
         onPressed: _setup.finish,
         child: const Text('I have memorised them'),
       ),
+    ];
+  }
+
+  List<Widget> _recallCompleteControls() {
+    return <Widget>[
+      Row(
+        children: <Widget>[
+          const Icon(Icons.verified, color: Color(0xFF00E676)),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              'Recall complete',
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+          ),
+        ],
+      ),
+      const SizedBox(height: 8),
+      Text(
+        'Both stages were selected back and the seed was reconstructed from '
+        'your points. The seed itself is never shown.',
+        style: Theme.of(context).textTheme.bodySmall,
+      ),
+      const SizedBox(height: 16),
+      FilledButton(onPressed: _reset, child: const Text('Done')),
     ];
   }
 
