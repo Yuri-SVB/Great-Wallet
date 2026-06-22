@@ -82,9 +82,10 @@ class _SetupScreenState extends State<SetupScreen> {
   Argon2Profile _profile = Argon2Profile.basic;
   int _iterations = 1;
 
-  /// Configuration source: generate a fresh random seed, or import an existing
-  /// (possibly sub-standard) BIP39 phrase and encode it onto the fractals.
-  bool _importMode = false;
+  /// Configuration source: generate a fresh random seed, import an existing
+  /// (possibly sub-standard) BIP39 phrase, or recall an existing setup from its
+  /// salt (cold-start recall — no encode, the points come back from clicks).
+  _SourceMode _source = _SourceMode.fresh;
 
   /// Select mode: when on, tapping the canvas decodes the point under the
   /// cursor instead of panning. Toggled by the panel button or the `S` key.
@@ -382,6 +383,8 @@ class _SetupScreenState extends State<SetupScreen> {
 
           if (_setup.phase == SetupPhase.recallComplete)
             ..._recallCompleteControls()
+          else if (_setup.isRecallSession && hasResult)
+            ..._recallControls()
           else if (!hasResult)
             ..._configControls()
           else
@@ -468,21 +471,36 @@ class _SetupScreenState extends State<SetupScreen> {
     return <Widget>[
       const Text('Source'),
       const SizedBox(height: 4),
-      SegmentedButton<bool>(
-        segments: const <ButtonSegment<bool>>[
-          ButtonSegment<bool>(value: false, label: Text('New seed')),
-          ButtonSegment<bool>(value: true, label: Text('Import')),
+      SegmentedButton<_SourceMode>(
+        segments: const <ButtonSegment<_SourceMode>>[
+          ButtonSegment<_SourceMode>(
+              value: _SourceMode.fresh, label: Text('New seed')),
+          ButtonSegment<_SourceMode>(
+              value: _SourceMode.import, label: Text('Import')),
+          ButtonSegment<_SourceMode>(
+              value: _SourceMode.recall, label: Text('Recall')),
         ],
-        selected: <bool>{_importMode},
+        selected: <_SourceMode>{_source},
         onSelectionChanged: _busy
             ? null
-            : (Set<bool> s) {
+            : (Set<_SourceMode> s) {
                 _sounds.play(UiSound.click);
-                setState(() => _importMode = s.first);
+                setState(() => _source = s.first);
               },
       ),
       const SizedBox(height: 16),
-      if (!_importMode) ...<Widget>[
+      if (_source == _SourceMode.import)
+        ..._mnemonicInput()
+      else ...<Widget>[
+        if (_source == _SourceMode.recall) ...<Widget>[
+          Text(
+            'Recall an existing setup: enter the same salt, size and Argon2 '
+            'settings you used, then click your memorised point on each stage. '
+            'Nothing is encoded — the seed is rebuilt from your clicks.',
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+          const SizedBox(height: 8),
+        ],
         const Text('Size'),
         DropdownButton<SizePreset>(
           isExpanded: true,
@@ -502,8 +520,7 @@ class _SetupScreenState extends State<SetupScreen> {
               ),
           ],
         ),
-      ] else
-        ..._mnemonicInput(),
+      ],
       const SizedBox(height: 16),
       ..._stage0Input(),
       const SizedBox(height: 16),
@@ -545,12 +562,21 @@ class _SetupScreenState extends State<SetupScreen> {
             : (double v) => setState(() => _iterations = v.round()),
       ),
       const SizedBox(height: 16),
-      FilledButton(
-        onPressed: (_busy || (_importMode && _mnemonic.text.trim().isEmpty))
-            ? null
-            : _start,
-        child: Text(_importMode ? 'Encode phrase' : 'Generate'),
-      ),
+      if (_source == _SourceMode.recall)
+        FilledButton(
+          onPressed: _busy ? null : _beginRecall,
+          child: const Text('Begin recall'),
+        )
+      else
+        FilledButton(
+          onPressed: (_busy ||
+                  (_source == _SourceMode.import &&
+                      _mnemonic.text.trim().isEmpty))
+              ? null
+              : _start,
+          child: Text(
+              _source == _SourceMode.import ? 'Encode phrase' : 'Generate'),
+        ),
       if (_setup.phase == SetupPhase.error && _setup.errorMessage != null) ...<Widget>[
         const SizedBox(height: 12),
         Text(
@@ -680,6 +706,22 @@ class _SetupScreenState extends State<SetupScreen> {
             ],
           ),
         ),
+    ];
+  }
+
+  /// Controls shown during a cold-start recall walk (select mode on). The
+  /// select-mode switch, the per-stage recall hint, the blind-copy export and
+  /// Reset all live in the always-shown section below.
+  List<Widget> _recallControls() {
+    return <Widget>[
+      const Text('Recall your points'),
+      const SizedBox(height: 8),
+      Text(
+        'Select mode is on. Click your memorised point on each stage in turn; '
+        'each correct point derives the next fractal (the same Argon2 cost as '
+        'setup). Nothing is shown — the seed is rebuilt only from your clicks.',
+        style: Theme.of(context).textTheme.bodySmall,
+      ),
     ];
   }
 
@@ -841,7 +883,7 @@ class _SetupScreenState extends State<SetupScreen> {
     _brightness.reset();
     setState(() => _selectMode = false);
     final String text = _stage0.text;
-    if (_importMode) {
+    if (_source == _SourceMode.import) {
       await _setup.beginFromMnemonic(
         _mnemonic.text,
         text: text,
@@ -870,6 +912,29 @@ class _SetupScreenState extends State<SetupScreen> {
     }
   }
 
+  /// Start a cold-start recall from the entered salt: derive Stage 1, then drop
+  /// straight into select mode so the user can click their first point.
+  Future<void> _beginRecall() async {
+    _sounds.play(UiSound.click);
+    _brightness.reset();
+    await _setup.beginRecall(
+      preset: _preset,
+      text: _stage0.text,
+      argon2Iterations: _iterations,
+      profile: _profile,
+    );
+    if (!mounted) return;
+    if (_setup.phase == SetupPhase.error) {
+      _sounds.play(UiSound.deny);
+      return;
+    }
+    // The salt now lives in the controller for the in-session walk; clear the
+    // field so it is not left on screen.
+    _stage0.clear();
+    setState(() => _selectMode = true);
+    _sounds.play(UiSound.confirm);
+  }
+
   void _reset() {
     _sounds.play(UiSound.click);
     _setup.reset();
@@ -883,6 +948,11 @@ class _SetupScreenState extends State<SetupScreen> {
     });
   }
 }
+
+/// Where the Setup session's root comes from: a freshly generated seed, an
+/// imported BIP39 phrase, or a cold-start recall of an existing setup (derive
+/// from the salt and reconstruct the seed from the user's clicks).
+enum _SourceMode { fresh, import, recall }
 
 /// Constrains the Stage-0 salt/pepper to a safe, reproducible ASCII subset:
 /// uppercase letters, digits and hyphens. Lowercase is upper-cased; anything

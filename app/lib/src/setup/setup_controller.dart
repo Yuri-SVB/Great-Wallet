@@ -75,6 +75,12 @@ class SetupController extends ChangeNotifier {
   SetupPhase _phase = SetupPhase.idle;
   SetupPhase get phase => _phase;
 
+  /// True when the active session is a **cold-start recall** (the salt was
+  /// entered and the points are being re-derived link by link), as opposed to
+  /// a fresh/imported setup. Drives the recall-specific control copy.
+  bool _isRecallSession = false;
+  bool get isRecallSession => _isRecallSession;
+
   String? _errorMessage;
   String? get errorMessage => _errorMessage;
 
@@ -314,6 +320,7 @@ class SetupController extends ChangeNotifier {
     }
     _errorMessage = null;
     _clearRecall();
+    _isRecallSession = false;
     final int pointStages = bits.length ~/ EncodingConstants.bitsPerPoint;
     _stageCount = pointStages + 1; // + the Stage-0 text stage
     // Canonicalise through the engine so the stored/displayed text is exactly
@@ -403,6 +410,71 @@ class SetupController extends ChangeNotifier {
     _displayStageIndex = 0;
     _argon2Done = 0;
     _setPhase(SetupPhase.idle);
+  }
+
+  /// Begin a **cold-start recall**: no setup ran this session. Derives the
+  /// Stage-1 fractal from the salt/pepper [text] alone (the first chain link,
+  /// `chainInput(text, [])`), then enters the select walk so the user clicks
+  /// their memorised point on each stage in turn — exactly as [selectPoint]
+  /// continues the chain.
+  ///
+  /// [preset] fixes how many point stages the seed has (so the walk knows when
+  /// it is complete); [argon2Iterations] and [profile] MUST match the original
+  /// setup or every derived fractal will differ and no point will decode.
+  /// Nothing is encoded and no target markers are shown — recall reconstructs
+  /// the seed purely from the user's clicks. Secrets stay in-session and are
+  /// never logged (SCOPE.md invariants).
+  Future<void> beginRecall({
+    required SizePreset preset,
+    required String text,
+    required int argon2Iterations,
+    Argon2Profile profile = Argon2Profile.basic,
+  }) async {
+    if (_phase == SetupPhase.deriving ||
+        _phase == SetupPhase.recallComplete) {
+      return;
+    }
+    // Start from a clean session; no encoded points exist in a recall.
+    _resetSecrets();
+    _errorMessage = null;
+    _preset = preset;
+    _stageCount = preset.nStages + 1; // Stage-0 text + one per point stage
+    _chainText = _core.canonicalizeSaltPepper(text);
+    _points = List<EncodedPoint?>.filled(_stageCount, null);
+    _reservoirs = List<StageReservoirs?>.filled(_stageCount, null);
+    try {
+      _workingStageIndex = 1;
+      _setPhase(SetupPhase.deriving);
+      _argon2Total = argon2Iterations < 1 ? 1 : argon2Iterations;
+      _argon2Done = 0;
+      final Uint8List input = _core.chainInput(_chainText, const <int>[]);
+      final Argon2Job job = await _core.startStageDerivation(
+        input,
+        iterations: argon2Iterations,
+        profile: profile,
+        onProgress: (int done, int total) {
+          _argon2Done = done;
+          _argon2Total = total;
+          notifyListeners();
+        },
+      );
+      _argon2Job = job;
+      final StageReservoirs reservoirs = await job.result;
+      _argon2Job = null;
+      // Land on Stage 1, ready for the first select-mode click.
+      _recallReservoirs = reservoirs;
+      _applyReservoirs(1, reservoirs);
+      _selectedMark = null;
+      _isRecallSession = true;
+      _setPhase(SetupPhase.memorise);
+    } on Argon2Cancelled {
+      _resetSecrets();
+      _setPhase(SetupPhase.idle);
+    } catch (e) {
+      _resetSecrets();
+      _errorMessage = 'Recall failed: ${e.runtimeType}';
+      _setPhase(SetupPhase.error);
+    }
   }
 
   /// Snap the canvas to the fractal stage the recall walk is on. Called when the
@@ -622,6 +694,7 @@ class SetupController extends ChangeNotifier {
     _displayParams = null;
     _stageCount = 0;
     _chainText = '';
+    _isRecallSession = false;
     _core.source.reservoirs?.clear();
     _core.source.reservoirs = null;
     _clearRecall();
