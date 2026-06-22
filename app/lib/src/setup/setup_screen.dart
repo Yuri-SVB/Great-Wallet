@@ -31,6 +31,11 @@ class _SetupScreenState extends State<SetupScreen> {
       PanZoomController(initial: _initialViewport);
   final BrightnessController _brightness = BrightnessController();
 
+  /// UI sound cues. The canvas plays the tap "click"; the selection-outcome
+  /// cues (select / confirm / deny) are dispatched from [_onCanvasSelect],
+  /// where the decode result is known.
+  final SoundBoard _sounds = SoundBoard();
+
   /// Focus node for the canvas/hotkey handler, so we can return keyboard focus
   /// to it after the user has been typing in a text field.
   final FocusNode _hotkeys = FocusNode(debugLabel: 'setup-hotkeys');
@@ -104,6 +109,7 @@ class _SetupScreenState extends State<SetupScreen> {
     _setup.dispose();
     _viewport.dispose();
     _brightness.dispose();
+    _sounds.dispose();
     _salt.dispose();
     _mnemonic.dispose();
     _stage0.dispose();
@@ -168,6 +174,7 @@ class _SetupScreenState extends State<SetupScreen> {
       return KeyEventResult.handled;
     }
     if (event.logicalKey == LogicalKeyboardKey.keyT) {
+      _sounds.play(UiSound.select);
       _setup.cycleStage();
       return KeyEventResult.handled;
     }
@@ -188,6 +195,7 @@ class _SetupScreenState extends State<SetupScreen> {
   /// brightness offset, without touching the session or the encoded points.
   /// Bound to `R` — a quick "I'm lost, take me home" after panning/zooming far.
   void _resetView() {
+    _sounds.play(UiSound.click);
     _viewport.viewport = _initialViewport;
     _brightness.reset();
     setState(() {});
@@ -196,6 +204,7 @@ class _SetupScreenState extends State<SetupScreen> {
   /// Toggle select (recall) mode. Entering it snaps the canvas to the stage the
   /// recall walk is on, so clicks land on the right fractal in chain order.
   void _setSelectMode(bool v) {
+    _sounds.play(v ? UiSound.select : UiSound.click);
     setState(() => _selectMode = v);
     if (v) _setup.showRecallStage();
   }
@@ -207,6 +216,7 @@ class _SetupScreenState extends State<SetupScreen> {
       controller: _viewport,
       palette: Palette.classicWithHue(_hue),
       brightness: _brightness,
+      sounds: _sounds,
       stage: stage,
       stageParameters:
           stage == Stage.stage2 ? _setup.displayStageParams : null,
@@ -296,11 +306,14 @@ class _SetupScreenState extends State<SetupScreen> {
     final String? msg;
     switch (outcome) {
       case SelectionOutcome.invalid:
+        _sounds.play(UiSound.deny);
         msg = 'No encodable leaf there — zoom in and click closer.';
       case SelectionOutcome.advancedStage:
+        _sounds.play(UiSound.select);
         msg = 'Recalled — now on Stage '
             '${_setup.displayStageIndex}/${_setup.nStages - 1}.';
       case SelectionOutcome.complete:
+        _sounds.play(UiSound.confirm);
         msg = 'Recall complete — seed reconstructed.';
       case SelectionOutcome.busy:
         msg = null;
@@ -427,7 +440,10 @@ class _SetupScreenState extends State<SetupScreen> {
           Center(
             child: HueWheel(
               value: _hue,
-              onChanged: (HueOffset h) => setState(() => _hue = h),
+              onChanged: (HueOffset h) {
+                _sounds.play(UiSound.click);
+                setState(() => _hue = h);
+              },
             ),
           ),
           const SizedBox(height: 16),
@@ -460,7 +476,10 @@ class _SetupScreenState extends State<SetupScreen> {
         selected: <bool>{_importMode},
         onSelectionChanged: _busy
             ? null
-            : (Set<bool> s) => setState(() => _importMode = s.first),
+            : (Set<bool> s) {
+                _sounds.play(UiSound.click);
+                setState(() => _importMode = s.first);
+              },
       ),
       const SizedBox(height: 16),
       if (!_importMode) ...<Widget>[
@@ -470,7 +489,10 @@ class _SetupScreenState extends State<SetupScreen> {
           value: _preset,
           onChanged: _busy
               ? null
-              : (SizePreset? v) => setState(() => _preset = v ?? _preset),
+              : (SizePreset? v) {
+                  _sounds.play(UiSound.click);
+                  setState(() => _preset = v ?? _preset);
+                },
           items: <DropdownMenuItem<SizePreset>>[
             for (final SizePreset p in SizePreset.values)
               DropdownMenuItem<SizePreset>(
@@ -491,7 +513,10 @@ class _SetupScreenState extends State<SetupScreen> {
         value: _profile,
         onChanged: _busy
             ? null
-            : (Argon2Profile? v) => setState(() => _profile = v ?? _profile),
+            : (Argon2Profile? v) {
+                _sounds.play(UiSound.click);
+                setState(() => _profile = v ?? _profile);
+              },
         items: const <DropdownMenuItem<Argon2Profile>>[
           DropdownMenuItem<Argon2Profile>(
             value: Argon2Profile.basic,
@@ -580,7 +605,10 @@ class _SetupScreenState extends State<SetupScreen> {
                 setState(() => _mnemonicHidden = !_mnemonicHidden),
           ),
         ),
-        onChanged: (_) => setState(() {}),
+        onChanged: (_) {
+          _sounds.play(UiSound.click);
+          setState(() {});
+        },
       ),
     ];
   }
@@ -623,7 +651,10 @@ class _SetupScreenState extends State<SetupScreen> {
           fontFamily: GreatWallTypography.fontFamily,
           fontFamilyFallback: <String>['monospace'],
         ),
-        onChanged: (_) => setState(() {}),
+        onChanged: (_) {
+          _sounds.play(UiSound.click);
+          setState(() {});
+        },
       ),
       if (_stage0Restricted)
         Padding(
@@ -665,7 +696,12 @@ class _SetupScreenState extends State<SetupScreen> {
         children: <Widget>[
           IconButton(
             tooltip: 'Previous stage',
-            onPressed: idx > 0 ? () => _setup.showStage(idx - 1) : null,
+            onPressed: idx > 0
+                ? () {
+                    _sounds.play(UiSound.select);
+                    _setup.showStage(idx - 1);
+                  }
+                : null,
             icon: const Icon(Icons.chevron_left),
           ),
           Text(idx == 0
@@ -673,7 +709,12 @@ class _SetupScreenState extends State<SetupScreen> {
               : 'Stage $idx / ${n - 1}'),
           IconButton(
             tooltip: 'Next stage',
-            onPressed: idx < n - 1 ? () => _setup.showStage(idx + 1) : null,
+            onPressed: idx < n - 1
+                ? () {
+                    _sounds.play(UiSound.select);
+                    _setup.showStage(idx + 1);
+                  }
+                : null,
             icon: const Icon(Icons.chevron_right),
           ),
         ],
@@ -688,7 +729,10 @@ class _SetupScreenState extends State<SetupScreen> {
       ),
       const SizedBox(height: 16),
       FilledButton(
-        onPressed: _setup.finish,
+        onPressed: () {
+          _sounds.play(UiSound.confirm);
+          _setup.finish();
+        },
         child: const Text('I have memorised them'),
       ),
     ];
@@ -762,9 +806,13 @@ class _SetupScreenState extends State<SetupScreen> {
 
   Future<void> _copyMnemonic() async {
     final String? mnemonic = _setup.exportMnemonic();
-    if (mnemonic == null) return;
+    if (mnemonic == null) {
+      _sounds.play(UiSound.deny);
+      return;
+    }
     await Clipboard.setData(ClipboardData(text: mnemonic));
     if (!mounted) return;
+    _sounds.play(UiSound.confirm);
     // Confirmation never echoes the secret itself.
     _toast('Seed phrase copied — paste it into your wallet, then clear the '
         'clipboard.');
@@ -772,9 +820,13 @@ class _SetupScreenState extends State<SetupScreen> {
 
   Future<void> _copySaltedDigest() async {
     final String? digest = _setup.exportSaltedDigest(_salt.text);
-    if (digest == null) return;
+    if (digest == null) {
+      _sounds.play(UiSound.deny);
+      return;
+    }
     await Clipboard.setData(ClipboardData(text: digest));
     if (!mounted) return;
+    _sounds.play(UiSound.confirm);
     _toast('SHA-512 digest copied — paste it, then clear the clipboard.');
   }
 
@@ -785,6 +837,7 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   Future<void> _start() async {
+    _sounds.play(UiSound.click);
     _brightness.reset();
     setState(() => _selectMode = false);
     final String text = _stage0.text;
@@ -810,9 +863,15 @@ class _SetupScreenState extends State<SetupScreen> {
     // The salt/pepper now lives in the chain; clear the input field on success
     // (the controller keeps its own copy for the in-session recall).
     if (_setup.phase != SetupPhase.error) _stage0.clear();
+    if (mounted) {
+      _sounds.play(
+        _setup.phase == SetupPhase.error ? UiSound.deny : UiSound.confirm,
+      );
+    }
   }
 
   void _reset() {
+    _sounds.play(UiSound.click);
     _setup.reset();
     _brightness.reset();
     _viewport.viewport = _initialViewport;
