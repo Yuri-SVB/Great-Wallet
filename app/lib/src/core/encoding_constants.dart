@@ -27,10 +27,25 @@ class EncodingConstants {
   static FixedRect encodeArea() =>
       FixedRect.fromDoubles(-2.5, 1.5, -2.0, 1.5);
 
+  /// Escape-iteration cap for ENCODE/DECODE island discovery (constants.py:
+  /// `ENCODE_MAX_ITER`). Intentionally decoupled from — and much larger than —
+  /// the render cap (64): as the bisection tree zooms toward the Burning Ship
+  /// set boundary, escape counts climb toward the cap, and a low cap (64) makes
+  /// almost every sample read as "non-escaping", starving island discovery —
+  /// deep levels then burn 100k+ samples and the encode effectively stalls
+  /// (the default vanity phrase + "MAIN-STASH" + N=1 freeze at Stage 2). 1024
+  /// (the engine's own DiscoveryParams default) keeps boundary-adjacent points
+  /// escaping so discovery stays fast at every level; escape_count
+  /// short-circuits on escape, so the higher cap only costs extra work for the
+  /// rare genuinely-non-escaping samples. Requires engine ENGINE_VERSION >=
+  /// 0.2.0 (output-changing change; encode and decode share the cap so the
+  /// bijection is preserved).
+  static const int encodeMaxIter = 1024;
+
   /// GUI discovery params (constants.py: `GUI_PARAMS`) — the presets the
   /// reference viewer encodes with.
   static const CoreDiscoveryParams guiParams = CoreDiscoveryParams(
-    maxIter: 64,
+    maxIter: encodeMaxIter,
     targetGood: 32,
     maxFloodPoints: 256,
     minGridCells: 1024 * 1024,
