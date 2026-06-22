@@ -28,9 +28,6 @@ import 'entropy.dart';
 class Bip39 {
   Bip39._();
 
-  /// Entropy bit-lengths BIP39 accepts here (mini / default / large presets).
-  static const Set<int> _validEntropyBits = <int>{64, 128, 256};
-
   /// Encode raw entropy bits (no checksum) into a BIP39 mnemonic.
   ///
   /// Port of `bits_to_mnemonic` (great-wall-core/burning_ship/bip39.py) for the
@@ -39,14 +36,20 @@ class Bip39 {
   /// `entropy + checksum` stream is split into 11-bit groups, each indexing the
   /// canonical wordlist.
   ///
-  /// [entropyBits] must contain exactly 64, 128, or 256 bits.
+  /// [entropyBits] must contain a positive multiple of 32 bits. The full-seed
+  /// presets are 64 / 128 / 256, but the chained protocol also exports the seed
+  /// *partially* during recall (one 32-bit point per stage), so any `32·m` bits
+  /// is accepted. Such partial seeds are well-formed — `32·m` entropy + `m`
+  /// checksum = `33·m` bits = `3·m` words — but, below the final stage, are a
+  /// non-standard (shorter, weaker) length. That is expected: the export is a
+  /// blind convenience, and the holder chooses when the seed is "enough".
   static String entropyBitsToMnemonic(List<int> entropyBits) {
     final int n = entropyBits.length;
-    if (!_validEntropyBits.contains(n)) {
+    if (n == 0 || n % 32 != 0) {
       throw ArgumentError.value(
         n,
         'entropyBits.length',
-        'expected one of $_validEntropyBits entropy bits',
+        'expected a positive multiple of 32 entropy bits',
       );
     }
 

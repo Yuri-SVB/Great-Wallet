@@ -246,6 +246,28 @@ class _SetupScreenState extends State<SetupScreen> {
               'Recalling stage ${_setup.displayStageIndex + 1}/${_setup.nStages}'
               ' — click your one point to advance the chain.',
             ),
+
+          // Blind export of the seed recalled so far — available at every stage
+          // once a point has been recalled, not only at the end. Before the
+          // final stage it is a partial, shorter-than-standard seed.
+          if (_setup.canExport &&
+              _setup.phase != SetupPhase.recallComplete) ...<Widget>[
+            const Divider(height: 32),
+            Text(
+              'Blind copy — partial seed',
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+            const SizedBox(height: 4),
+            Text(
+              '${_setup.recalledStageCount}/${_setup.nStages} stages recalled '
+              '(${_setup.recalledBitCount} bits). Until the final stage this is '
+              'a non-standard, shorter — therefore weaker — seed.',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+            const SizedBox(height: 12),
+            ..._exportControls(),
+          ],
+
           OutlinedButton.icon(
             onPressed: _busy ? null : _reset,
             icon: const Icon(Icons.refresh),
@@ -408,6 +430,17 @@ class _SetupScreenState extends State<SetupScreen> {
         style: Theme.of(context).textTheme.bodySmall,
       ),
       const SizedBox(height: 16),
+      ..._exportControls(),
+      const SizedBox(height: 24),
+      FilledButton(onPressed: _reset, child: const Text('Done')),
+    ];
+  }
+
+  /// The blind-copy affordances (BIP39 phrase + SHA-512(seed + salt)). Shared by
+  /// the per-stage partial export and the recall-complete panel; both operate on
+  /// whatever has been recalled so far via [SetupController.exportMnemonic].
+  List<Widget> _exportControls() {
+    return <Widget>[
       OutlinedButton.icon(
         onPressed: _copyMnemonic,
         icon: const Icon(Icons.content_copy),
@@ -437,8 +470,6 @@ class _SetupScreenState extends State<SetupScreen> {
         icon: const Icon(Icons.content_copy),
         label: const Text('Copy SHA-512(seed + salt)'),
       ),
-      const SizedBox(height: 24),
-      FilledButton(onPressed: _reset, child: const Text('Done')),
     ];
   }
 

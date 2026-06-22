@@ -149,17 +149,38 @@ class SetupController extends ChangeNotifier {
   /// True once every stage has been selected back and the seed reconstructed.
   bool get isRecallComplete => _recalledEntropyBits != null;
 
-  /// The reconstructed seed as a BIP39 mnemonic, for an explicit
+  /// Stages recalled (decoded back) so far — equivalently, the number of
+  /// 32-bit points making up the seed available for blind export right now.
+  int get recalledStageCount => _recalledChunks.length;
+
+  /// Bits available for blind export so far (`32 ×` [recalledStageCount]).
+  int get recalledBitCount =>
+      _recalledChunks.length * EncodingConstants.bitsPerPoint;
+
+  /// Whether any seed material has been recalled (so a blind export is
+  /// possible). Below the final stage this is a partial, shorter-than-standard
+  /// seed; at completion it is the full entropy root.
+  bool get canExport => _recalledChunks.isNotEmpty;
+
+  /// The seed recalled **so far** as a BIP39 mnemonic, for an explicit
   /// user-initiated **blind** export (copy → paste into another wallet's
-  /// import wizard without reading it). Returns null until recall is complete.
+  /// import wizard without reading it). Available at every stage once at least
+  /// one point has been recalled: before the final stage it encodes only the
+  /// points decoded so far (`32 ×` stages bits — a non-standard, weaker seed);
+  /// at completion it is the full entropy root. Returns null before any point
+  /// is recalled.
   ///
   /// "The user never sees the seed" holds in the blind-copy sense: this string
   /// is handed to the clipboard, never rendered on screen (ARCHITECTURE.md
   /// §"Stage 0" / §"Invariants"). It is computed on demand and not retained.
   String? exportMnemonic() {
-    final List<int>? bits = _recalledEntropyBits;
-    if (bits == null) return null;
-    return Bip39.entropyBitsToMnemonic(bits);
+    if (_recalledChunks.isEmpty) return null;
+    final List<int> bits = <int>[
+      for (final List<int> chunk in _recalledChunks) ...chunk,
+    ];
+    final String mnemonic = Bip39.entropyBitsToMnemonic(bits);
+    Entropy.wipe(bits);
+    return mnemonic;
   }
 
   /// `SHA-512(seed-phrase + salt)` as hex, for target apps that accept a
