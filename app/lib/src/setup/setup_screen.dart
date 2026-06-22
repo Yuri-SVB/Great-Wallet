@@ -31,6 +31,10 @@ class _SetupScreenState extends State<SetupScreen> {
       PanZoomController(initial: _initialViewport);
   final BrightnessController _brightness = BrightnessController();
 
+  /// Focus node for the canvas/hotkey handler, so we can return keyboard focus
+  /// to it after the user has been typing in a text field.
+  final FocusNode _hotkeys = FocusNode(debugLabel: 'setup-hotkeys');
+
   /// Descriptive salt for the SHA-512 export at recall (e.g. "main wallet").
   /// Domain-separates one setup from another — see ARCHITECTURE.md §"Stage 0".
   final TextEditingController _salt = TextEditingController();
@@ -74,6 +78,7 @@ class _SetupScreenState extends State<SetupScreen> {
     _brightness.dispose();
     _salt.dispose();
     _mnemonic.dispose();
+    _hotkeys.dispose();
     super.dispose();
   }
 
@@ -85,22 +90,30 @@ class _SetupScreenState extends State<SetupScreen> {
   Widget build(BuildContext context) {
     final bool hasResult = _setup.phase == SetupPhase.memorise;
     return Focus(
+      focusNode: _hotkeys,
       autofocus: true,
       onKeyEvent: _onKey,
       child: Row(
         children: <Widget>[
           Expanded(
-            child: Stack(
-              children: <Widget>[
-                Positioned.fill(child: _canvas()),
-                if (_busy) Positioned.fill(child: _progressOverlay()),
-                if (_selectMode)
-                  const Positioned(
-                    top: 12,
-                    left: 12,
-                    child: _Badge('Select mode — click a point (S to exit)'),
-                  ),
-              ],
+            // Clicking anywhere on the canvas returns keyboard focus to the
+            // hotkey handler, so S / R work again after the user has been
+            // typing in a text field (salt, seed phrase). Listener is passive,
+            // so it does not interfere with the canvas's own pan/zoom/select.
+            child: Listener(
+              onPointerDown: (_) => _hotkeys.requestFocus(),
+              child: Stack(
+                children: <Widget>[
+                  Positioned.fill(child: _canvas()),
+                  if (_busy) Positioned.fill(child: _progressOverlay()),
+                  if (_selectMode)
+                    const Positioned(
+                      top: 12,
+                      left: 12,
+                      child: _Badge('Select mode — click a point (S to exit)'),
+                    ),
+                ],
+              ),
             ),
           ),
           SizedBox(width: 260, child: _controlPanel(hasResult)),
@@ -111,6 +124,9 @@ class _SetupScreenState extends State<SetupScreen> {
 
   KeyEventResult _onKey(FocusNode node, KeyEvent event) {
     if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    // While a text field (salt, seed phrase, …) holds focus, let it consume the
+    // keystroke — never fire canvas shortcuts like S / R.
+    if (_textInputHasFocus) return KeyEventResult.ignored;
     if (event.logicalKey == LogicalKeyboardKey.keyS) {
       _setSelectMode(!_selectMode);
       return KeyEventResult.handled;
@@ -120,6 +136,16 @@ class _SetupScreenState extends State<SetupScreen> {
       return KeyEventResult.handled;
     }
     return KeyEventResult.ignored;
+  }
+
+  /// Whether the keyboard focus is currently inside an editable text field, so
+  /// typed characters must not be interpreted as canvas shortcuts. Checks the
+  /// active focus rather than specific fields, so any future input is covered.
+  bool get _textInputHasFocus {
+    final BuildContext? c = FocusManager.instance.primaryFocus?.context;
+    if (c == null) return false;
+    if (c.widget is EditableText) return true;
+    return c.findAncestorWidgetOfExactType<EditableText>() != null;
   }
 
   /// Recenter the canvas: restore the default position and zoom and the default
