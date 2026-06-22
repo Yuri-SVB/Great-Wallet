@@ -262,7 +262,7 @@ class _SetupScreenState extends State<SetupScreen> {
                     SelectableText(
                       _stage0Hidden ? '•' * text.length : text,
                       style: const TextStyle(
-                        fontFamily: 'Ubuntu Mono',
+                        fontFamily: GreatWallTypography.fontFamily,
                         fontFamilyFallback: <String>['monospace'],
                         fontSize: 18,
                         letterSpacing: 1.5,
@@ -620,7 +620,7 @@ class _SetupScreenState extends State<SetupScreen> {
           ),
         ),
         style: const TextStyle(
-          fontFamily: 'Ubuntu Mono',
+          fontFamily: GreatWallTypography.fontFamily,
           fontFamilyFallback: <String>['monospace'],
         ),
         onChanged: (_) => setState(() {}),

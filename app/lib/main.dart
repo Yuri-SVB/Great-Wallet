@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:great_wall_ux/great_wall_ux.dart';
 
 import 'great_wallet.dart';
 
@@ -34,7 +35,10 @@ class _GreatWalletAppState extends State<GreatWalletApp> {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Great Wallet',
-      theme: ThemeData.dark(useMaterial3: true),
+      // Adopt great-wall-ux's chrome typography (Ubuntu Mono) across the app,
+      // so the wallet shares the "sober, but game-like" terminal aesthetic of
+      // the canvas surface rather than the default Material face.
+      theme: GreatWallTypography.themed(ThemeData.dark(useMaterial3: true)),
       home: _core != null
           ? ModeShell(core: _core!)
           : _EngineMissing(error: _openError),
