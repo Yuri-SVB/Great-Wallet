@@ -9,7 +9,7 @@ export 'src/core/core_escape_count_source.dart';
 export 'src/core/encoding_constants.dart';
 export 'src/core/entropy.dart';
 export 'src/core/great_wall_core.dart';
-export 'src/core/stage2_params.dart';
+export 'src/core/stage_params.dart';
 export 'src/ffi/core_bindings.dart' show Argon2Profile, FixedRect, CoreDiscoveryParams, CoreDecodeResult;
 export 'src/ffi/fixed.dart';
 export 'src/ffi/library_loader.dart' show CoreLibraryLoader, CoreLibraryNotFound;

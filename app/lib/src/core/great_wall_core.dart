@@ -7,7 +7,7 @@ import '../ffi/library_loader.dart';
 import 'core_escape_count_source.dart';
 import 'encoding_constants.dart';
 import 'entropy.dart';
-import 'stage2_params.dart';
+import 'stage_params.dart';
 
 /// App-level facade over great-wall-core: opens the engine once, exposes the
 /// [EscapeCountSource] for the UX canvas, and wraps the encode / decode /
@@ -32,10 +32,12 @@ class GreatWallCore {
   /// Engine algorithm version (e.g. `"0.1.0"`).
   String get engineVersion => bindings.engineVersion();
 
-  /// Encode one stage's worth of bits into fractal points (32 bits/point).
+  /// Encode one stage's 32 bits into a single fractal point.
   ///
-  /// `(o, p, q)` selects the fractal: `(0,0,0)` for stage 1, the session
-  /// reservoirs for stage 2. Returns one encoded point per 32-bit chunk.
+  /// `(o, p, q)` selects the fractal: `(0,0,0)` for the canonical stage 0, the
+  /// stage's chain-derived reservoirs for any later stage. Under the chained
+  /// protocol a stage carries exactly one 32-bit point, but this still accepts
+  /// any multiple of 32 bits and returns one point per chunk.
   List<EncodedPoint> encodeStage(
     List<int> stageBits, {
     required int o,
@@ -85,19 +87,16 @@ class GreatWallCore {
     );
   }
 
-  /// Derive `(o, p, q)` from stage-1 bits by running `iterations` Argon2d
-  /// passes, feeding each digest back as the next input — the iterative
-  /// scheme of `run_argon2_iterative` (argon2_pipeline.py).
+  /// Derive a chained stage's `(o, p, q)` from the cumulative bits of every
+  /// preceding point, by running `iterations` Argon2d passes and feeding each
+  /// digest back as the next input — the iterative scheme of
+  /// `derive_stage_params` / `argon2_iterate` (argon2_pipeline.py). This is one
+  /// link of the chain: `priorBits` is the concatenation of points `0..k-1`,
+  /// so the input grows by 32 bits per stage.
   ///
-  /// `iterations == 0` is the identity case: the 8-byte stage-1 input
-  /// right-padded to the 32-byte digest, no Argon2 (used for fast dev runs).
-  ///
-  /// Start deriving `(o, p, q)` from stage-1 bits by running `iterations`
-  /// Argon2d passes (each digest fed back as the next input — the iterative
-  /// scheme of `run_argon2_iterative`, argon2_pipeline.py).
-  ///
-  /// `iterations == 0` is the identity case (8-byte input zero-padded to the
-  /// 32-byte digest, no Argon2) used for fast dev runs.
+  /// `iterations == 0` is the identity case (the natural-length input
+  /// zero-padded/truncated to the 32-byte digest, no Argon2) used for fast dev
+  /// runs.
   ///
   /// The whole loop runs in a **single dedicated worker isolate** (which opens
   /// its own engine binding — FFI handles cannot cross isolates), so the heavy,
@@ -108,8 +107,8 @@ class GreatWallCore {
   /// of waiting out the run. (A single in-flight native pass cannot be
   /// preempted mid-call, but cancel stops listening and tears the isolate down
   /// at once; granularity is one pass, as in the reference.)
-  Future<Argon2Job> startStage2Derivation(
-    List<int> stage1Bits, {
+  Future<Argon2Job> startStageDerivation(
+    List<int> priorBits, {
     required int iterations,
     Argon2Profile profile = Argon2Profile.basic,
     void Function(int completed, int total)? onProgress,
@@ -118,19 +117,19 @@ class GreatWallCore {
 
     if (iterations == 0) {
       // Identity case: data.ljust(32, 0)[:32] (argon2_pipeline.py). The input
-      // is the natural-length stage-1 bytes (not padded to 8).
-      final Uint8List input = Entropy.stage1Argon2Input(stage1Bits);
+      // is the natural-length prior-point bytes (not padded to a fixed width).
+      final Uint8List input = Entropy.argon2Input(priorBits);
       final int n = input.length < 32 ? input.length : 32;
       final Uint8List digest = Uint8List(32)..setRange(0, n, input);
       onProgress?.call(1, total);
-      final Stage2Reservoirs r = Stage2Reservoirs.fromArgon2Digest(digest);
+      final StageReservoirs r = StageReservoirs.fromArgon2Digest(digest);
       digest.fillRange(0, digest.length, 0);
-      return Argon2Job(Future<Stage2Reservoirs>.value(r), () {});
+      return Argon2Job(Future<StageReservoirs>.value(r), () {});
     }
 
-    final Uint8List input = Entropy.stage1Argon2Input(stage1Bits);
+    final Uint8List input = Entropy.argon2Input(priorBits);
     final ReceivePort port = ReceivePort();
-    final Completer<Stage2Reservoirs> completer = Completer<Stage2Reservoirs>();
+    final Completer<StageReservoirs> completer = Completer<StageReservoirs>();
     final Isolate isolate = await Isolate.spawn<(SendPort, Uint8List, int, int)>(
       _argon2IsolateEntry,
       (port.sendPort, input, iterations, profile.value),
@@ -144,7 +143,7 @@ class GreatWallCore {
       if (msg is int) {
         onProgress?.call(msg, total);
       } else if (msg is Uint8List) {
-        final Stage2Reservoirs r = Stage2Reservoirs.fromArgon2Digest(msg);
+        final StageReservoirs r = StageReservoirs.fromArgon2Digest(msg);
         msg.fillRange(0, msg.length, 0);
         if (!completer.isCompleted) completer.complete(r);
         cleanup();
@@ -183,12 +182,12 @@ void _argon2IsolateEntry((SendPort, Uint8List, int, int) args) {
   send.send(digest);
 }
 
-/// A running stage-2 derivation: its [result], and a [cancel] that kills the
+/// A running stage derivation: its [result], and a [cancel] that kills the
 /// worker isolate and fails [result] with [Argon2Cancelled].
 class Argon2Job {
   Argon2Job(this.result, this._cancel);
 
-  final Future<Stage2Reservoirs> result;
+  final Future<StageReservoirs> result;
   final void Function() _cancel;
 
   void cancel() => _cancel();

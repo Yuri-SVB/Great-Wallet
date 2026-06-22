@@ -7,8 +7,8 @@ import '../core/great_wall_core.dart';
 import '../ffi/core_bindings.dart';
 import 'setup_controller.dart';
 
-/// Setup mode screen: encode a fresh seed onto the two-stage fractal and let
-/// the user memorise the points.
+/// Setup mode screen: encode a fresh seed onto the chained fractals (one
+/// 32-bit point per stage) and let the user memorise the points.
 ///
 /// This is the concrete `great-wall-core + great-wall-ux` integration the
 /// architecture assigns to Setup (ARCHITECTURE.md §"7. great-wallet", mode 1):
@@ -68,9 +68,8 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   bool get _busy =>
-      _setup.phase == SetupPhase.encodingStage1 ||
-      _setup.phase == SetupPhase.derivingParams ||
-      _setup.phase == SetupPhase.encodingStage2;
+      _setup.phase == SetupPhase.encoding ||
+      _setup.phase == SetupPhase.deriving;
 
   @override
   Widget build(BuildContext context) {
@@ -103,10 +102,17 @@ class _SetupScreenState extends State<SetupScreen> {
   KeyEventResult _onKey(FocusNode node, KeyEvent event) {
     if (event is KeyDownEvent &&
         event.logicalKey == LogicalKeyboardKey.keyS) {
-      setState(() => _selectMode = !_selectMode);
+      _setSelectMode(!_selectMode);
       return KeyEventResult.handled;
     }
     return KeyEventResult.ignored;
+  }
+
+  /// Toggle select (recall) mode. Entering it snaps the canvas to the stage the
+  /// recall walk is on, so clicks land on the right fractal in chain order.
+  void _setSelectMode(bool v) {
+    setState(() => _selectMode = v);
+    if (v) _setup.showRecallStage();
   }
 
   Widget _canvas() {
@@ -117,7 +123,8 @@ class _SetupScreenState extends State<SetupScreen> {
       palette: Palette.classicWithHue(_hue),
       brightness: _brightness,
       stage: stage,
-      stageParameters: stage == Stage.stage2 ? _setup.stage2Params : null,
+      stageParameters:
+          stage == Stage.stage2 ? _setup.displayStageParams : null,
       maxIterations: EncodingConstants.guiParams.maxIter,
       // Generated points (white, after Generate) plus selected points (green,
       // in select mode). Empty until there is something to show.
@@ -134,24 +141,16 @@ class _SetupScreenState extends State<SetupScreen> {
     );
   }
 
-  Future<void> _onCanvasSelect(FractalSelection sel) async {
-    final SelectionOutcome outcome = await _setup.selectPoint(
-      sel,
-      preset: _preset,
-      argon2Iterations: _iterations,
-      profile: _profile,
-    );
+  void _onCanvasSelect(FractalSelection sel) {
+    final SelectionOutcome outcome = _setup.selectPoint(sel, preset: _preset);
     if (!mounted) return;
     final String? msg;
     switch (outcome) {
       case SelectionOutcome.invalid:
         msg = 'No encodable leaf there — zoom in and click closer.';
-      case SelectionOutcome.duplicate:
-        msg = 'That point is already selected.';
-      case SelectionOutcome.added:
-        msg = 'Selected ${_setup.selectedCount}/${_setup.requiredPerStage}.';
-      case SelectionOutcome.advancedToStage2:
-        msg = 'Stage 1 recalled → stage 2.';
+      case SelectionOutcome.advancedStage:
+        msg = 'Recalled — now on stage '
+            '${_setup.displayStageIndex + 1}/${_setup.nStages}.';
       case SelectionOutcome.complete:
         msg = 'Recall complete — seed reconstructed.';
       case SelectionOutcome.busy:
@@ -164,19 +163,19 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   Widget _progressOverlay() {
+    final String stageLabel =
+        'stage ${_setup.workingStageNumber}/${_setup.nStages}';
     final String label;
     switch (_setup.phase) {
-      case SetupPhase.encodingStage1:
-        label = 'Encoding stage 1…';
-      case SetupPhase.derivingParams:
-        label = 'Deriving stage-2 parameters (Argon2) '
+      case SetupPhase.deriving:
+        label = 'Deriving $stageLabel fractal (Argon2) '
             '${_setup.argon2Done}/${_setup.argon2Total}…';
-      case SetupPhase.encodingStage2:
-        label = 'Encoding stage 2…';
+      case SetupPhase.encoding:
+        label = 'Encoding $stageLabel point…';
       default:
         label = 'Working…';
     }
-    final bool deriving = _setup.phase == SetupPhase.derivingParams;
+    final bool deriving = _setup.phase == SetupPhase.deriving;
     final double? progress = deriving && _setup.argon2Total > 0
         ? _setup.argon2Done / _setup.argon2Total
         : null; // indeterminate for the quick encode phases
@@ -235,19 +234,13 @@ class _SetupScreenState extends State<SetupScreen> {
             title: const Text('Select mode'),
             subtitle: const Text('Click your points to recall (or press S)'),
             value: _selectMode,
-            onChanged: (bool v) => setState(() => _selectMode = v),
+            onChanged: _setSelectMode,
           ),
-          if (_selectMode && _setup.phase != SetupPhase.recallComplete) ...<Widget>[
+          if (_selectMode && _setup.phase != SetupPhase.recallComplete)
             Text(
-              '${_setup.displayStage == Stage.stage2 ? "Stage 2" : "Stage 1"}: '
-              'selected ${_setup.selectedCount}/${_preset.pointsPerStage}',
+              'Recalling stage ${_setup.displayStageIndex + 1}/${_setup.nStages}'
+              ' — click your one point to advance the chain.',
             ),
-            TextButton(
-              onPressed:
-                  _setup.selectedCount == 0 ? null : _setup.clearSelection,
-              child: const Text('Clear selection'),
-            ),
-          ],
           OutlinedButton.icon(
             onPressed: _busy ? null : _reset,
             icon: const Icon(Icons.refresh),
@@ -349,22 +342,34 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   List<Widget> _memoriseControls() {
+    final int idx = _setup.displayStageIndex;
+    final int n = _setup.nStages;
     return <Widget>[
       const Text('Memorise your points'),
       const SizedBox(height: 8),
-      SegmentedButton<Stage>(
-        segments: const <ButtonSegment<Stage>>[
-          ButtonSegment<Stage>(value: Stage.stage1, label: Text('Stage 1')),
-          ButtonSegment<Stage>(value: Stage.stage2, label: Text('Stage 2')),
+      // One fractal (one point) per stage; step through them in order. Stage 1
+      // is the public canonical fractal, the rest are chain-derived.
+      Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: <Widget>[
+          IconButton(
+            tooltip: 'Previous stage',
+            onPressed: idx > 0 ? () => _setup.showStage(idx - 1) : null,
+            icon: const Icon(Icons.chevron_left),
+          ),
+          Text('Stage ${idx + 1} / $n${idx == 0 ? " (canonical)" : ""}'),
+          IconButton(
+            tooltip: 'Next stage',
+            onPressed: idx < n - 1 ? () => _setup.showStage(idx + 1) : null,
+            icon: const Icon(Icons.chevron_right),
+          ),
         ],
-        selected: <Stage>{_setup.displayStage},
-        onSelectionChanged: (Set<Stage> s) => _setup.showStage(s.first),
       ),
       const SizedBox(height: 16),
       Text(
-        'Study the marked locations on each stage until you can find them '
-        'from memory. When you are confident, finish — the seed is then held '
-        'only in your recall.',
+        'Each stage is its own fractal carrying one point. Study the marked '
+        'location on every stage until you can find it from memory. When you '
+        'are confident, finish — the seed is then held only in your recall.',
         style: Theme.of(context).textTheme.bodySmall,
       ),
       const SizedBox(height: 16),
@@ -391,7 +396,7 @@ class _SetupScreenState extends State<SetupScreen> {
       ),
       const SizedBox(height: 8),
       Text(
-        'Both stages were selected back and the seed was reconstructed from '
+        'Every stage was selected back and the seed was reconstructed from '
         'your points. It is never shown on screen — the buttons below copy it '
         'straight to the clipboard so you can paste it blind into another '
         "wallet's import wizard and continue without ever reading it.",

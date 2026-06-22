@@ -5,7 +5,7 @@ import 'package:ffi/ffi.dart' as ffi;
 import 'package:great_wall_ux/great_wall_ux.dart';
 
 import '../ffi/core_bindings.dart';
-import 'stage2_params.dart';
+import 'stage_params.dart';
 
 /// The integration seam: a great-wall-ux [EscapeCountSource] backed by the
 /// real great-wall-core engine.
@@ -22,25 +22,28 @@ import 'stage2_params.dart';
 ///  - Convert the engine's `u8` escape-count buffer to the [Uint32List] the
 ///    UX layer expects, including the vertical flip that reconciles the two
 ///    coordinate conventions (see [escapeCountsFromPixels]).
-///  - Route stage-1 to the canonical renderer and stage-2 to the perturbed
-///    renderer using the session's [Stage2Reservoirs].
+///  - Route the canonical stage to the canonical renderer and any chain-derived
+///    stage to the perturbed renderer using the currently displayed stage's
+///    [StageReservoirs].
 class CoreEscapeCountSource implements EscapeCountSource {
   CoreEscapeCountSource(this._core);
 
   final GreatWallCoreBindings _core;
 
-  /// The active session's stage-2 reservoirs, set by the Setup/Train
-  /// orchestrator once Argon2 has produced `(o, p, q)`.
+  /// The reservoirs `(o, p, q)` for the fractal currently being rendered — the
+  /// chained stage on screen. The Setup/Train orchestrator sets this whenever
+  /// the displayed stage changes (to the canonical stage's `null`, or to a
+  /// chain-derived stage's reservoirs once Argon2 has produced `(o, p, q)`).
   ///
   /// Why the reservoirs live here and not on the request: great-wall-ux's
   /// [StageParameters] carries three `double`s, but the engine's perturbation
   /// is three raw `u64` reservoirs that cannot be represented losslessly as
   /// doubles. Rather than fork the UX library's public seam, the app keeps the
   /// authoritative `u64`s here and uses [StageParameters] only as a non-secret
-  /// repaint key (see [Stage2Reservoirs.displayKey]). Widening the UX seam to
+  /// repaint key (see [StageReservoirs.displayKey]). Widening the UX seam to
   /// carry raw reservoirs is a sensible follow-up; until then this is the
   /// minimal, library-preserving bridge.
-  Stage2Reservoirs? stage2Reservoirs;
+  StageReservoirs? reservoirs;
 
   @override
   Future<EscapeCountRaster> escapeCounts(EscapeCountRequest request) async {
@@ -63,14 +66,15 @@ class CoreEscapeCountSource implements EscapeCountSource {
     final double originRe = vp.centreRe + (0.5 - w / 2.0) * u;
     final double originIm = vp.centreIm + (0.5 - h / 2.0) * u;
 
-    // Both stages render through the *perturbed* engine path. This is
+    // Every stage renders through the *perturbed* engine path. This is
     // load-bearing, not an optimisation: `bs_encode` always encodes through
     // `escape_count_generic` (great-wall-core/discovery.rs), and at (0,0,0)
     // that formula still applies p's +1/8 baseline. The canonical
     // `bs_render_viewport` (pure z0=0, no shift) draws a *different* fractal,
-    // so stage-1 points — chosen on the baseline fractal — would appear to
-    // fall in the canonical "hole". Rendering stage 1 as generic(0,0,0) makes
-    // the displayed fractal the same one the points were encoded on.
+    // so canonical-stage points — chosen on the baseline fractal — would appear
+    // to fall in the canonical "hole". Rendering stage 0 as generic(0,0,0) makes
+    // the displayed fractal the same one the points were encoded on. Later
+    // stages render with their chain-derived reservoirs.
     final int o = request.stage == Stage.stage2 ? _requireReservoirs().o : 0;
     final int p = request.stage == Stage.stage2 ? _requireReservoirs().p : 0;
     final int q = request.stage == Stage.stage2 ? _requireReservoirs().q : 0;
@@ -102,12 +106,12 @@ class CoreEscapeCountSource implements EscapeCountSource {
     }
   }
 
-  Stage2Reservoirs _requireReservoirs() {
-    final Stage2Reservoirs? r = stage2Reservoirs;
+  StageReservoirs _requireReservoirs() {
+    final StageReservoirs? r = reservoirs;
     if (r == null) {
       throw StateError(
-        'Stage-2 render requested before (o, p, q) were derived. '
-        'Set CoreEscapeCountSource.stage2Reservoirs after Argon2 completes.',
+        'Perturbed-stage render requested before (o, p, q) were derived. '
+        'Set CoreEscapeCountSource.reservoirs after Argon2 completes.',
       );
     }
     return r;

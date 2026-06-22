@@ -22,14 +22,16 @@ void main() {
     });
   });
 
-  group('Entropy.stage1Argon2Input', () {
+  group('Entropy.argon2Input', () {
     test('returns the natural byte length (no padding/truncation)', () {
-      // Matches great-wall-core: data = bits_to_bytes(stage1_bits).
-      expect(Entropy.stage1Argon2Input(List<int>.filled(32, 1)).length, 4);
-      expect(Entropy.stage1Argon2Input(List<int>.filled(64, 1)).length, 8);
-      expect(Entropy.stage1Argon2Input(List<int>.filled(128, 1)).length, 16);
+      // Matches great-wall-core: data = bits_to_bytes(prior_bits). The chained
+      // protocol feeds the cumulative prior-point bits, which grow by 32 bits
+      // (4 bytes) per stage.
+      expect(Entropy.argon2Input(List<int>.filled(32, 1)).length, 4);
+      expect(Entropy.argon2Input(List<int>.filled(64, 1)).length, 8);
+      expect(Entropy.argon2Input(List<int>.filled(128, 1)).length, 16);
       expect(
-        Entropy.stage1Argon2Input(List<int>.filled(32, 1)),
+        Entropy.argon2Input(List<int>.filled(32, 1)),
         <int>[0xFF, 0xFF, 0xFF, 0xFF],
       );
     });

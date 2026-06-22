@@ -10,14 +10,17 @@ import '../ffi/core_bindings.dart';
 class EncodingConstants {
   EncodingConstants._();
 
-  /// Bits encoded per fractal point.
+  /// Bits encoded per fractal point — and, under the chained protocol, per
+  /// stage (one point = one stage = one 32-bit chunk).
   static const int bitsPerPoint = 32;
 
-  /// Stage-1 perturbation reservoirs: all zero yields the canonical Burning
-  /// Ship formula (z0 = 0, additive shift only the baseline, no linear term).
-  static const int stage1O = 0;
-  static const int stage1P = 0;
-  static const int stage1Q = 0;
+  /// Canonical (stage-0) perturbation reservoirs: all zero yields the canonical
+  /// Burning Ship formula. Stage 0 is the public, shared fractal; every later
+  /// stage's `(o, p, q)` is chain-derived from all preceding points
+  /// (protocol.py: `CANONICAL_O/P/Q`).
+  static const int canonicalO = 0;
+  static const int canonicalP = 0;
+  static const int canonicalQ = 0;
 
   /// The encoding area — the BS region where island density supports 32-bit
   /// encoding: `[-2.5, 1.5] x [-2.0, 1.5]` (constants.py: `ENCODE_AREA`).
@@ -35,31 +38,34 @@ class EncodingConstants {
     exclusionThresholdNum: 1023,
     rngSeed: 0x42,
   );
+
+  /// Number of chained stages for an entropy width: one 32-bit point per stage
+  /// (protocol.py: `n_stages_for`, `n_stages = entropy_bits / BITS_PER_POINT`).
+  static int nStagesFor(int entropyBits) => entropyBits ~/ bitsPerPoint;
 }
 
-/// A wallet size preset (constants.py: `SIZE_PRESETS`). Determines how many
-/// points the user memorises per stage and the resulting entropy width.
+/// A wallet size preset (constants.py: `SIZE_PRESETS`). Under the chained
+/// protocol each stage encodes exactly one 32-bit point, so the entropy width
+/// fixes the number of stages: `nStages = entropyBits / 32`. Stage 0 is the
+/// public canonical fractal; the remaining `nStages - 1` are secret,
+/// chain-derived fractals the user learns to recognise.
 enum SizePreset {
-  mini(pointsPerStage: 1, entropyBits: 64, bip39Words: 6),
-  defaultPreset(pointsPerStage: 2, entropyBits: 128, bip39Words: 12),
-  large(pointsPerStage: 4, entropyBits: 256, bip39Words: 24);
+  mini(entropyBits: 64, bip39Words: 6),
+  defaultPreset(entropyBits: 128, bip39Words: 12),
+  large(entropyBits: 256, bip39Words: 24);
 
   const SizePreset({
-    required this.pointsPerStage,
     required this.entropyBits,
     required this.bip39Words,
   });
 
-  /// Points the user identifies per stage (stage 1 and stage 2 each).
-  final int pointsPerStage;
-
-  /// Total raw entropy width (stage-1 || stage-2 bits).
+  /// Total raw entropy width (the concatenation of every stage's 32 bits).
   final int entropyBits;
 
   /// Equivalent BIP39 word count (the wire format the user never sees).
   final int bip39Words;
 
-  /// Bits encoded in one stage = `pointsPerStage * bitsPerPoint`. By
-  /// construction this is `entropyBits / 2`.
-  int get bitsPerStage => pointsPerStage * EncodingConstants.bitsPerPoint;
+  /// Number of chained stages (one 32-bit point each). The first is the public
+  /// canonical fractal; the rest are secret, chain-derived haystacks.
+  int get nStages => EncodingConstants.nStagesFor(entropyBits);
 }

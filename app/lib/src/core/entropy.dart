@@ -40,17 +40,17 @@ class Entropy {
     return bits;
   }
 
-  /// The Argon2 input derived from stage-1 bits.
+  /// The Argon2 input for a chain link: the cumulative bits of every point that
+  /// precedes the stage being derived.
   ///
-  /// This is `bits_to_bytes(stage1_bits)` at its **natural length** — 4 bytes
-  /// for the mini preset, 8 for default, 16 for large — exactly what
-  /// great-wall-core's `run_argon2_iterative` feeds
-  /// (argon2_pipeline.py: `data = bits_to_bytes(stage1_bits)`). No padding or
-  /// truncation: the engine's Argon2 accepts any input length, and padding to a
-  /// fixed 8 bytes would change the digest (hence `(o, p, q)` and the stage-2
-  /// fractal) for any preset other than default.
-  static Uint8List stage1Argon2Input(List<int> stage1Bits) =>
-      bitsToBytes(stage1Bits);
+  /// This is `bits_to_bytes(prior_bits)` at its **natural length** — one byte
+  /// per 8 prior bits — exactly what great-wall-core's `derive_stage_params`
+  /// feeds (argon2_pipeline.py: `data = bits_to_bytes(prior_bits)`). No padding
+  /// or truncation: the engine's Argon2 accepts any input length, and padding to
+  /// a fixed width would change the digest (hence `(o, p, q)` and the stage's
+  /// fractal). Because the prior-point prefix grows by 32 bits per stage, each
+  /// link hashes a longer input than the last.
+  static Uint8List argon2Input(List<int> priorBits) => bitsToBytes(priorBits);
 
   /// Generate `bitCount` cryptographically-random bits using a secure RNG.
   ///

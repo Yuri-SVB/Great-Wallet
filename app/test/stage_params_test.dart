@@ -1,10 +1,10 @@
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:great_wallet_app/src/core/stage2_params.dart';
+import 'package:great_wallet_app/src/core/stage_params.dart';
 
 void main() {
-  group('Stage2Reservoirs.fromArgon2Digest', () {
+  group('StageReservoirs.fromArgon2Digest', () {
     test('matches great-wall-core derive_stage2_params for a known digest', () {
       // digest = 0x00..0x1f. Reference (Python argon2_pipeline.derive_stage2_params):
       //   sha256(digest) = 630dcd2966c4336691125448bbb25b4f...
@@ -13,7 +13,7 @@ void main() {
       //   q = u64_be(h[16:24])= 17587300486689436360
       final Uint8List digest =
           Uint8List.fromList(List<int>.generate(32, (int i) => i));
-      final Stage2Reservoirs r = Stage2Reservoirs.fromArgon2Digest(digest);
+      final StageReservoirs r = StageReservoirs.fromArgon2Digest(digest);
 
       final BigInt mask = (BigInt.one << 64) - BigInt.one;
       BigInt u(int signed) => BigInt.from(signed) & mask;
@@ -24,12 +24,12 @@ void main() {
     });
 
     test('redacts (o, p, q) in toString', () {
-      final Stage2Reservoirs r = Stage2Reservoirs(o: 1, p: 2, q: 3);
-      expect(r.toString(), 'Stage2Reservoirs(<redacted>)');
+      final StageReservoirs r = StageReservoirs(o: 1, p: 2, q: 3);
+      expect(r.toString(), 'StageReservoirs(<redacted>)');
     });
 
     test('clear zeroes the reservoirs', () {
-      final Stage2Reservoirs r = Stage2Reservoirs(o: 1, p: 2, q: 3)..clear();
+      final StageReservoirs r = StageReservoirs(o: 1, p: 2, q: 3)..clear();
       expect(<int>[r.o, r.p, r.q], <int>[0, 0, 0]);
     });
   });
@@ -40,7 +40,7 @@ void main() {
     });
 
     test('p baseline contributes 2^-baselineExp', () {
-      // p=0 with baselineExp 3 -> +1/8 (matches STAGE1 p baseline +1/8).
+      // p=0 with baselineExp 3 -> +1/8 (matches the p baseline +1/8).
       expect(decodeDisplayReservoir(0, minExp: 4, baselineExp: 3), 0.125);
     });
   });

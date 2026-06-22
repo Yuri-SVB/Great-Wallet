@@ -2,19 +2,21 @@ import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
 
-/// Stage-2 perturbation reservoirs `(o, p, q)`.
+/// One chained stage's perturbation reservoirs `(o, p, q)`.
 ///
-/// `(o, p, q) = derive(Argon2(stage-1 bits))`. Each is a raw 64-bit entropy
-/// reservoir that the engine decodes into a complex perturbation; together
-/// they select the user's personal stage-2 fractal
-/// (ARCHITECTURE.md §"Stage 2 — perturbed fractal").
+/// Under the chained protocol, stage `k`'s fractal is derived from *all
+/// preceding points*: `(o, p, q) = derive(Argon2(bits of points 0..k-1))`.
+/// Each is a raw 64-bit entropy reservoir that the engine decodes into a
+/// complex perturbation; together they select that stage's personal fractal
+/// (ARCHITECTURE.md §"perturbed fractal"). Stage 0 is the canonical fractal and
+/// has no reservoirs (`(0, 0, 0)`).
 ///
 /// These exist only as ephemeral state during a rendering session. They are
 /// never persisted and never displayed to the user (the redacted [toString]
 /// enforces the "no logs of fractal coordinates / (o,p,q)" invariant in
 /// TECH_STACK.md). [clear] zeroes the values when the session ends.
-class Stage2Reservoirs {
-  Stage2Reservoirs({required this.o, required this.p, required this.q});
+class StageReservoirs {
+  StageReservoirs({required this.o, required this.p, required this.q});
 
   int o;
   int p;
@@ -23,14 +25,15 @@ class Stage2Reservoirs {
   /// Derive `(o, p, q)` from a 32-byte Argon2 digest.
   ///
   /// Faithful port of `derive_stage2_params` in
-  /// great-wall-core/burning_ship/argon2_pipeline.py:
+  /// great-wall-core/burning_ship/argon2_pipeline.py (the per-stage parameter
+  /// attribution is unchanged under the chained protocol):
   ///
   ///   h = sha256(digest)
   ///   o = u64_be(h[0:8]);  p = u64_be(h[8:16]);  q = u64_be(h[16:24])
-  factory Stage2Reservoirs.fromArgon2Digest(Uint8List digest) {
+  factory StageReservoirs.fromArgon2Digest(Uint8List digest) {
     final List<int> h = sha256.convert(digest).bytes;
     final ByteData bd = ByteData.sublistView(Uint8List.fromList(h));
-    return Stage2Reservoirs(
+    return StageReservoirs(
       o: bd.getUint64(0, Endian.big),
       p: bd.getUint64(8, Endian.big),
       q: bd.getUint64(16, Endian.big),
@@ -46,7 +49,7 @@ class Stage2Reservoirs {
 
   /// A non-secret, monotone-ish key used purely to drive canvas repaints when
   /// the reservoirs change. It is a low-resolution display proxy, NOT the
-  /// reservoirs themselves — see [Stage2Reservoirs] docs and
+  /// reservoirs themselves — see [StageReservoirs] docs and
   /// core_escape_count_source.dart for why the authoritative `u64`s never ride
   /// great-wall-ux's `StageParameters` (which carries `double`s).
   ({double o, double p, double q}) get displayKey => (
@@ -58,7 +61,7 @@ class Stage2Reservoirs {
   /// `toString` is intentionally redacted — `(o, p, q)` is session-only
   /// material that must not leak into logs.
   @override
-  String toString() => 'Stage2Reservoirs(<redacted>)';
+  String toString() => 'StageReservoirs(<redacted>)';
 }
 
 /// Decode the real component of an entropy reservoir into a magnitude, for the
