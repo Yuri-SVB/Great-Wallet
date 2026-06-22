@@ -52,6 +52,26 @@ class _SetupScreenState extends State<SetupScreen> {
   final TextEditingController _stage0 = TextEditingController();
   bool _stage0Hidden = true;
 
+  /// True when the last edit to [_stage0] had characters up-cased or dropped by
+  /// the engine's canonicalisation. Surfaced as an inline red-flag so the
+  /// restriction is never applied silently (DESIGN.md "Strong text
+  /// restrictions": the divergence must be signalled to the user).
+  bool _stage0Restricted = false;
+
+  /// Called by [_SaltPepperFormatter] (during the edit pipeline) with whether
+  /// the engine had to adjust the typed text. Defers the [setState] to a
+  /// post-frame callback so it never runs mid-build, and fires even when the
+  /// resolved text is unchanged (e.g. a lone disallowed char in an empty field,
+  /// which would not trigger `onChanged`).
+  void _onStage0Restricted({required bool adjusted}) {
+    if (_stage0Restricted == adjusted) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _stage0Restricted != adjusted) {
+        setState(() => _stage0Restricted = adjusted);
+      }
+    });
+  }
+
   HueOffset _hue = HueOffset.red;
   SizePreset _preset = SizePreset.defaultPreset;
   Argon2Profile _profile = Argon2Profile.basic;
@@ -580,7 +600,9 @@ class _SetupScreenState extends State<SetupScreen> {
         maxLines: 1,
         autocorrect: false,
         enableSuggestions: false,
-        inputFormatters: <TextInputFormatter>[_SaltPepperFormatter()],
+        inputFormatters: <TextInputFormatter>[
+          _SaltPepperFormatter(widget.core, _onStage0Restricted),
+        ],
         decoration: InputDecoration(
           isDense: true,
           border: const OutlineInputBorder(),
@@ -603,6 +625,30 @@ class _SetupScreenState extends State<SetupScreen> {
         ),
         onChanged: (_) => setState(() {}),
       ),
+      if (_stage0Restricted)
+        Padding(
+          padding: const EdgeInsets.only(top: 6),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              Icon(
+                Icons.warning_amber_rounded,
+                size: 16,
+                color: Theme.of(context).colorScheme.error,
+              ),
+              const SizedBox(width: 4),
+              Expanded(
+                child: Text(
+                  'Adjusted to A–Z, 0–9 and "-" so it stays reproducible.',
+                  style: TextStyle(
+                    color: Theme.of(context).colorScheme.error,
+                    fontSize: 12,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
     ];
   }
 
@@ -783,24 +829,36 @@ class _SetupScreenState extends State<SetupScreen> {
 /// uppercase letters, digits and hyphens. Lowercase is upper-cased; anything
 /// else (spaces, underscores, punctuation, non-ASCII) is dropped as typed.
 ///
-/// Rationale: this text must be reproduced exactly to re-derive the chain, so we
-/// remove characters that invite transcription ambiguity (case, whitespace,
-/// look-alike punctuation). A future pass should add an explicit signal (error
-/// bell / red flag) when a character is rejected; today it is filtered silently.
+/// Rather than reimplement the rule, this delegates to the shared engine
+/// ([GreatWallCore.canonicalizeSaltPepper], backed by
+/// `bs_salt_pepper_canonicalize`) — the *same* canonicalisation that builds the
+/// chain seed, so the field shows exactly the bytes that will be hashed. The
+/// `[A-Z0-9-]` restriction (DESIGN.md "Strong text restrictions") exists so the
+/// text reproduces identically across devices; a stray case/accent/look-alike
+/// would silently fork the chain into an unrecoverable result.
+///
+/// [onResult] is called with whether the engine had to adjust the text, so the
+/// field can flag the user — the divergence is never silent.
 class _SaltPepperFormatter extends TextInputFormatter {
-  static final RegExp _disallowed = RegExp(r'[^A-Z0-9-]');
+  _SaltPepperFormatter(this._core, this._onResult);
+
+  final GreatWallCore _core;
+  final void Function({required bool adjusted}) _onResult;
 
   @override
   TextEditingValue formatEditUpdate(
     TextEditingValue oldValue,
     TextEditingValue newValue,
   ) {
-    final String filtered =
-        newValue.text.toUpperCase().replaceAll(_disallowed, '');
-    if (filtered == newValue.text) return newValue;
+    final String canonical = _core.canonicalizeSaltPepper(newValue.text);
+    if (canonical == newValue.text) {
+      _onResult(adjusted: false);
+      return newValue;
+    }
+    _onResult(adjusted: true);
     return TextEditingValue(
-      text: filtered,
-      selection: TextSelection.collapsed(offset: filtered.length),
+      text: canonical,
+      selection: TextSelection.collapsed(offset: canonical.length),
     );
   }
 }
