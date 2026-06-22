@@ -141,8 +141,13 @@ class _SetupScreenState extends State<SetupScreen> {
     );
   }
 
-  void _onCanvasSelect(FractalSelection sel) {
-    final SelectionOutcome outcome = _setup.selectPoint(sel, preset: _preset);
+  Future<void> _onCanvasSelect(FractalSelection sel) async {
+    final SelectionOutcome outcome = await _setup.selectPoint(
+      sel,
+      preset: _preset,
+      argon2Iterations: _iterations,
+      profile: _profile,
+    );
     if (!mounted) return;
     final String? msg;
     switch (outcome) {

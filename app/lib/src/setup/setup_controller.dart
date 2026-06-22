@@ -128,6 +128,13 @@ class SetupController extends ChangeNotifier {
   final List<List<int>> _recalledChunks = <List<int>>[];
   List<int>? _recalledEntropyBits;
 
+  // The reservoirs for the stage currently being recalled (k >= 1), produced by
+  // re-running the chained Argon2 derivation when the previous stage's point was
+  // selected. `null` while recalling the canonical stage 0. This is distinct
+  // from [_reservoirs] (the begin-time values used only for memorise browsing):
+  // recall re-derives the chain link by link, exactly as protocol.py decode.
+  StageReservoirs? _recallReservoirs;
+
   /// The stage the next select-mode click should recall = number of stages
   /// already recalled (0 at the start of a recall walk).
   int get recallStageIndex => _recalledChunks.length;
@@ -309,35 +316,46 @@ class SetupController extends ChangeNotifier {
 
   /// Snap the canvas to the stage the recall walk is currently on. Called when
   /// the user enters select mode so the click always lands on the right fractal
-  /// (the chain must be recalled in order).
+  /// (the chain must be recalled in order). Uses the reservoirs the recall walk
+  /// has derived so far (canonical for stage 0).
   void showRecallStage() {
     final int target = recallStageIndex.clamp(0, nStages - 1);
-    _applyDisplayStage(target);
+    _displayStageIndex = target;
+    final StageReservoirs? res = target == 0 ? null : _recallReservoirs;
+    _core.source.reservoirs = res;
+    if (res == null) {
+      _displayParams = null;
+    } else {
+      final ({double o, double p, double q}) key = res.displayKey;
+      _displayParams = StageParameters(o: key.o, p: key.p, q: key.q);
+    }
     notifyListeners();
   }
 
   /// Handle a select-mode click: decode the point under the cursor on the stage
-  /// currently shown, then walk the chain forward.
+  /// currently shown, then walk the chain forward, **re-running the chained
+  /// Argon2 derivation** to form the next stage's fractal.
   ///
-  /// The recall mirrors encoding: stage 0 decodes on the canonical fractal;
-  /// each later stage decodes under the reservoirs derived during [begin] for
-  /// that stage. Selecting a stage's one point advances to the next stage's
-  /// fractal until the last stage completes and the full entropy
-  /// (concatenated per-stage bits) is reconstructed.
-  ///
-  /// NOTE: this in-session memorise→recall check reuses the reservoirs already
-  /// derived at [begin] (the costly chain ran once at "Generate"), so verifying
-  /// memorisation does not force the user to wait out the whole chain again. A
-  /// genuine cold recall on a fresh device — with no stored reservoirs — re-runs
-  /// the memory-hard chain link by link, exactly as protocol.py decode does.
+  /// The recall mirrors encoding (protocol.py `decode_entropy`): stage 0 decodes
+  /// on the canonical fractal; selecting its point feeds the recalled bits to a
+  /// memory-hard Argon2 pass that derives stage 1's `(o,p,q)`; stage 1 decodes
+  /// under those reservoirs; and so on. Each link hashes the cumulative bits of
+  /// every point recalled so far, so a stage's fractal does not exist until its
+  /// derivation finishes — the wall-clock cost the protocol is built on. The
+  /// last stage completes the full entropy (concatenated per-stage bits).
   ///
   /// Decoded bits and coordinates stay inside the session and are never logged
   /// (SCOPE.md invariants).
-  SelectionOutcome selectPoint(
+  Future<SelectionOutcome> selectPoint(
     FractalSelection selection, {
     required SizePreset preset,
-  }) {
-    if (_phase == SetupPhase.recallComplete) return SelectionOutcome.busy;
+    required int argon2Iterations,
+    Argon2Profile profile = Argon2Profile.basic,
+  }) async {
+    if (_phase == SetupPhase.deriving ||
+        _phase == SetupPhase.recallComplete) {
+      return SelectionOutcome.busy;
+    }
     _preset = preset;
 
     final int k = _displayStageIndex;
@@ -345,7 +363,10 @@ class SetupController extends ChangeNotifier {
     // recall. (Guards against decoding a browsed-ahead stage out of sequence.)
     if (k != recallStageIndex) return SelectionOutcome.busy;
 
-    final StageReservoirs? r = k == 0 ? null : _reservoirs[k];
+    // Decode under the reservoirs this recall walk derived for stage k
+    // (canonical for stage 0). These are produced by hashing, not reused from
+    // setup — so a genuine cold recall would behave identically.
+    final StageReservoirs? r = k == 0 ? null : _recallReservoirs;
     if (k != 0 && r == null) return SelectionOutcome.busy;
 
     final CoreDecodeResult result = _core.decodePoint(
@@ -358,10 +379,12 @@ class SetupController extends ChangeNotifier {
     if (!result.valid) return SelectionOutcome.invalid;
 
     _selectedMark = (re: selection.re, im: selection.im);
-    _recalledChunks.add(result.bits);
+    notifyListeners();
 
     if (k == nStages - 1) {
-      // Final stage recalled: reconstruct the full entropy root.
+      // Final stage recalled: reconstruct the full entropy root. No further
+      // derivation — there is no next fractal to form.
+      _recalledChunks.add(result.bits);
       _recalledEntropyBits = <int>[
         for (final List<int> chunk in _recalledChunks) ...chunk,
       ];
@@ -369,11 +392,50 @@ class SetupController extends ChangeNotifier {
       return SelectionOutcome.complete;
     }
 
-    // Advance to the next stage's fractal (its reservoirs are already derived).
-    _selectedMark = null;
-    _applyDisplayStage(k + 1);
-    notifyListeners();
-    return SelectionOutcome.advancedStage;
+    // Derive the next stage's fractal by hashing the cumulative bits of every
+    // point recalled so far (points 0..k) — one memory-hard link of the chain.
+    final List<int> priorBits = <int>[
+      for (final List<int> chunk in _recalledChunks) ...chunk,
+      ...result.bits,
+    ];
+    try {
+      _workingStageIndex = k + 1;
+      _setPhase(SetupPhase.deriving);
+      _argon2Total = argon2Iterations < 1 ? 1 : argon2Iterations;
+      _argon2Done = 0;
+      final Argon2Job job = await _core.startStageDerivation(
+        priorBits,
+        iterations: argon2Iterations,
+        profile: profile,
+        onProgress: (int done, int total) {
+          _argon2Done = done;
+          _argon2Total = total;
+          notifyListeners();
+        },
+      );
+      _argon2Job = job;
+      final StageReservoirs reservoirs = await job.result;
+      _argon2Job = null;
+      Entropy.wipe(priorBits);
+
+      // Commit: record this stage's point and advance to the new fractal.
+      _recalledChunks.add(result.bits);
+      _recallReservoirs = reservoirs;
+      _core.source.reservoirs = reservoirs;
+      _displayStageIndex = k + 1;
+      final ({double o, double p, double q}) key = reservoirs.displayKey;
+      _displayParams = StageParameters(o: key.o, p: key.p, q: key.q);
+      _selectedMark = null;
+      _setPhase(SetupPhase.memorise);
+      return SelectionOutcome.advancedStage;
+    } on Argon2Cancelled {
+      // Roll back: stage k is not advanced, so the user can retry the click.
+      Entropy.wipe(priorBits);
+      _argon2Job = null;
+      _selectedMark = null;
+      _setPhase(SetupPhase.memorise);
+      return SelectionOutcome.busy;
+    }
   }
 
   /// Clear the current stage's pending selection mark.
@@ -428,6 +490,8 @@ class SetupController extends ChangeNotifier {
     final List<int>? rec = _recalledEntropyBits;
     if (rec != null) Entropy.wipe(rec);
     _recalledEntropyBits = null;
+    _recallReservoirs?.clear();
+    _recallReservoirs = null;
   }
 
   void _resetSecrets() {
