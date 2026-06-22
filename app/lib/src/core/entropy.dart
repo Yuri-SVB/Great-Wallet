@@ -48,26 +48,11 @@ class Entropy {
   /// feeds (argon2_pipeline.py: `data = bits_to_bytes(prior_bits)`).
   static Uint8List argon2Input(List<int> priorBits) => bitsToBytes(priorBits);
 
-  /// The Argon2 input for a chain link under the **Stage-0** scheme: the
-  /// salt/pepper text bytes followed by the packed bits of every preceding
-  /// point. Stage 0 seeds the chain (so the first fractal, stage 1, derives from
-  /// the text alone), and every later fractal mixes the text with the prior
-  /// points — there is no canonical fractal. The text gates the chain only; it
-  /// never enters the entropy, so the BIP39 ↔ Great Wall conversion stays
-  /// lossless.
-  static Uint8List chainInput(Uint8List textBytes, List<int> priorPointBits) {
-    final Uint8List pts = bitsToBytes(priorPointBits);
-    final Uint8List out = Uint8List(textBytes.length + pts.length);
-    out.setRange(0, textBytes.length, textBytes);
-    out.setRange(textBytes.length, out.length, pts);
-    return out;
-  }
-
-  /// Encode the Stage-0 salt/pepper string to its derivation bytes. The input is
-  /// already constrained to a safe ASCII subset (uppercase letters, digits,
-  /// hyphen) by the UI, so a plain code-unit encoding is exact and stable.
-  static Uint8List saltPepperBytes(String text) =>
-      Uint8List.fromList(text.codeUnits);
+  // NOTE: the Stage-0 chain-input layout and salt/pepper canonicalisation are
+  // PROTOCOL and live in the shared engine (see GreatWallCore.chainInput /
+  // canonicalizeSaltPepper, backed by bs_chain_input / bs_salt_pepper_-
+  // canonicalize). They are deliberately NOT reimplemented here, so the wallet
+  // and great-wall-core produce byte-identical seeds for the same text.
 
   /// Generate `bitCount` cryptographically-random bits using a secure RNG.
   ///

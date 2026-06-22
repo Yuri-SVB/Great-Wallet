@@ -316,8 +316,9 @@ class SetupController extends ChangeNotifier {
     _clearRecall();
     final int pointStages = bits.length ~/ EncodingConstants.bitsPerPoint;
     _stageCount = pointStages + 1; // + the Stage-0 text stage
-    _chainText = text;
-    final Uint8List textBytes = Entropy.saltPepperBytes(text);
+    // Canonicalise through the engine so the stored/displayed text is exactly
+    // what gets hashed (the protocol rule lives in core, not here).
+    _chainText = _core.canonicalizeSaltPepper(text);
     try {
       _entropyBits = bits;
       _points = List<EncodedPoint?>.filled(pointStages + 1, null);
@@ -330,7 +331,7 @@ class SetupController extends ChangeNotifier {
         // (chunks 0..k-2) — one link of the memory-hard chain. Stage 1 derives
         // from the text alone.
         final List<int> priorPointBits = bits.sublist(0, (k - 1) * bpp);
-        final Uint8List input = Entropy.chainInput(textBytes, priorPointBits);
+        final Uint8List input = _core.chainInput(_chainText, priorPointBits);
         _setPhase(SetupPhase.deriving);
         _argon2Total = argon2Iterations < 1 ? 1 : argon2Iterations;
         _argon2Done = 0;
@@ -482,8 +483,7 @@ class SetupController extends ChangeNotifier {
       for (final List<int> chunk in _recalledChunks) ...chunk,
       ...result.bits,
     ];
-    final Uint8List input =
-        Entropy.chainInput(Entropy.saltPepperBytes(_chainText), priorPointBits);
+    final Uint8List input = _core.chainInput(_chainText, priorPointBits);
     try {
       _workingStageIndex = k + 1;
       _setPhase(SetupPhase.deriving);

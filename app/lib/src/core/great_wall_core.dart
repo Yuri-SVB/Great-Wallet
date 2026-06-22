@@ -31,6 +31,19 @@ class GreatWallCore {
   /// Engine algorithm version (e.g. `"0.1.0"`).
   String get engineVersion => bindings.engineVersion();
 
+  /// Canonicalise a Stage-0 salt/pepper string through the engine (uppercase
+  /// ASCII, keep only `A-Z0-9-`). Single source of truth shared with
+  /// great-wall-core; the wallet never reimplements the rule.
+  String canonicalizeSaltPepper(String text) =>
+      bindings.saltPepperCanonicalize(text);
+
+  /// Build one chain link's Argon2 input through the engine: the canonical
+  /// Stage-0 salt/pepper bytes followed by `bits_to_bytes(priorPointBits)`.
+  /// This is the protocol byte layout; it lives in the shared engine so the
+  /// wallet and great-wall-core produce identical seeds for the same text.
+  Uint8List chainInput(String text, List<int> priorPointBits) =>
+      bindings.chainInput(text, priorPointBits);
+
   /// Encode one stage's 32 bits into a single fractal point.
   ///
   /// `(o, p, q)` selects the fractal: `(0,0,0)` for the canonical stage 0, the

@@ -45,6 +45,11 @@ class GreatWallCoreBindings {
         _lib.lookupFunction<_DecodeFullC, _DecodeFullDart>('bs_decode_full');
     _argon2Single =
         _lib.lookupFunction<_Argon2SingleC, _Argon2SingleDart>('bs_argon2_single');
+    _saltPepperCanonicalize =
+        _lib.lookupFunction<_SaltPepperCanonicalizeC, _SaltPepperCanonicalizeDart>(
+            'bs_salt_pepper_canonicalize');
+    _chainInput =
+        _lib.lookupFunction<_ChainInputC, _ChainInputDart>('bs_chain_input');
     _getPrecision =
         _lib.lookupFunction<_GetPrecisionC, _GetPrecisionDart>('bs_get_precision');
     _engineVersion =
@@ -77,6 +82,8 @@ class GreatWallCoreBindings {
   late final _EncodeResultFreeDart _encodeResultFree;
   late final _DecodeFullDart _decodeFull;
   late final _Argon2SingleDart _argon2Single;
+  late final _SaltPepperCanonicalizeDart _saltPepperCanonicalize;
+  late final _ChainInputDart _chainInput;
   late final _GetPrecisionDart _getPrecision;
   late final _EngineVersionDart _engineVersion;
 
@@ -324,6 +331,52 @@ class GreatWallCoreBindings {
     }
   }
 
+  /// Canonicalise a Stage-0 salt/pepper string via the engine (the protocol
+  /// rule: uppercase ASCII, keep only `A-Z0-9-`). Returns the canonical string.
+  /// Defined in the shared engine so it is byte-identical to great-wall-core
+  /// (`bs_salt_pepper_canonicalize`).
+  String saltPepperCanonicalize(String text) {
+    final (Pointer<Uint8> inPtr, int inLen) = _allocAscii(text);
+    try {
+      final int n = _saltPepperCanonicalize(inPtr, inLen, nullptr, 0);
+      if (n == 0) return '';
+      final Pointer<Uint8> outPtr = calloc<Uint8>(n);
+      try {
+        _saltPepperCanonicalize(inPtr, inLen, outPtr, n);
+        return String.fromCharCodes(outPtr.asTypedList(n));
+      } finally {
+        _zeroAndFree(outPtr, n);
+      }
+    } finally {
+      if (inPtr != nullptr) _zeroAndFree(inPtr, inLen);
+    }
+  }
+
+  /// Build one chain link's Argon2 input via the engine: the canonical
+  /// salt/pepper bytes followed by `bits_to_bytes(priorBits)`
+  /// (`bs_chain_input`). [text] is the raw salt/pepper; [priorBits] is the
+  /// concatenated bits (0/1) of every preceding point. Single source of truth
+  /// shared with great-wall-core, so the same text yields the same seed.
+  Uint8List chainInput(String text, List<int> priorBits) {
+    final (Pointer<Uint8> tPtr, int tLen) = _allocAscii(text);
+    final int nBits = priorBits.length;
+    final Pointer<Uint8> bPtr = nBits == 0 ? nullptr : calloc<Uint8>(nBits);
+    try {
+      if (nBits != 0) bPtr.asTypedList(nBits).setAll(0, priorBits);
+      final int n = _chainInput(tPtr, tLen, bPtr, nBits, nullptr, 0);
+      final Pointer<Uint8> outPtr = calloc<Uint8>(n == 0 ? 1 : n);
+      try {
+        _chainInput(tPtr, tLen, bPtr, nBits, outPtr, n);
+        return Uint8List.fromList(outPtr.asTypedList(n));
+      } finally {
+        _zeroAndFree(outPtr, n == 0 ? 1 : n);
+      }
+    } finally {
+      if (tPtr != nullptr) _zeroAndFree(tPtr, tLen);
+      if (bPtr != nullptr) _zeroAndFree(bPtr, nBits);
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Helpers
   // -------------------------------------------------------------------------
@@ -490,6 +543,16 @@ typedef _Argon2SingleC = Void Function(
   Pointer<Uint8>, Uint32, Uint8, Pointer<Uint8>);
 typedef _Argon2SingleDart = void Function(
   Pointer<Uint8>, int, int, Pointer<Uint8>);
+
+typedef _SaltPepperCanonicalizeC = Uint32 Function(
+  Pointer<Uint8>, Uint32, Pointer<Uint8>, Uint32);
+typedef _SaltPepperCanonicalizeDart = int Function(
+  Pointer<Uint8>, int, Pointer<Uint8>, int);
+
+typedef _ChainInputC = Uint32 Function(
+  Pointer<Uint8>, Uint32, Pointer<Uint8>, Uint32, Pointer<Uint8>, Uint32);
+typedef _ChainInputDart = int Function(
+  Pointer<Uint8>, int, Pointer<Uint8>, int, Pointer<Uint8>, int);
 
 typedef _GetPrecisionC = Void Function(Pointer<Uint32>, Pointer<Uint32>);
 typedef _GetPrecisionDart = void Function(Pointer<Uint32>, Pointer<Uint32>);

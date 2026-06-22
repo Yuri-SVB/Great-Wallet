@@ -55,9 +55,15 @@ encoded onto the fractals as points to memorise, then wiped (`ARCHITECTURE.md`
 finish/reset; verifying its recall on a fresh device belongs to the trainer
 (CPNF), which will store only a hash of it. Nothing is persisted or logged.
 
-> Note: the Python reference (`great-wall-core/burning_ship/protocol.py`) still
-> models Stage 0 as the public canonical fractal. This app's Stage-0-text scheme
-> is ahead of it; the core should adopt the same chain seeding for parity.
+> Protocol ownership: the Stage-0 byte operations — salt/pepper canonicalization
+> (uppercase ASCII `A-Z0-9-`) and the chain-input layout
+> (`canonicalize(text) ‖ bits_to_bytes(prior_points)`) — are **protocol** and
+> live in the shared Rust engine (`bs_salt_pepper_canonicalize` / `bs_chain_input`,
+> from great-wall-core). Both this wallet (`GreatWallCore.canonicalizeSaltPepper`
+> / `chainInput`) and the Python reference call that one implementation, so the
+> same text yields byte-identical seeds — the wallet never re-implements the rule.
+> This requires the engine `.so`/dylib bundled with the app to be rebuilt from
+> the updated `rust_engine` (it exports the two new symbols).
 
 ## Known seam gap
 
