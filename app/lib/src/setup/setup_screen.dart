@@ -44,6 +44,14 @@ class _SetupScreenState extends State<SetupScreen> {
   final TextEditingController _mnemonic = TextEditingController();
   bool _mnemonicHidden = true;
 
+  /// Stage 0 — the salt/pepper text that seeds the fractal chain. One field,
+  /// one scheme: use it as a non-secret label ('MAIN-STASH') or a secret pepper
+  /// (a blindly pasted high-entropy string) — the app treats it identically.
+  /// Obscured by default with a reveal toggle; constrained to a safe ASCII
+  /// subset (see [_SaltPepperFormatter]).
+  final TextEditingController _stage0 = TextEditingController();
+  bool _stage0Hidden = true;
+
   HueOffset _hue = HueOffset.red;
   SizePreset _preset = SizePreset.defaultPreset;
   Argon2Profile _profile = Argon2Profile.basic;
@@ -78,6 +86,7 @@ class _SetupScreenState extends State<SetupScreen> {
     _brightness.dispose();
     _salt.dispose();
     _mnemonic.dispose();
+    _stage0.dispose();
     _hotkeys.dispose();
     super.dispose();
   }
@@ -104,9 +113,12 @@ class _SetupScreenState extends State<SetupScreen> {
               onPointerDown: (_) => _hotkeys.requestFocus(),
               child: Stack(
                 children: <Widget>[
-                  Positioned.fill(child: _canvas()),
+                  // Stage 0 has no fractal/point — show the salt/pepper panel.
+                  Positioned.fill(
+                    child: _setup.isTextStage ? _textStagePanel() : _canvas(),
+                  ),
                   if (_busy) Positioned.fill(child: _progressOverlay()),
-                  if (_selectMode)
+                  if (_selectMode && !_setup.isTextStage)
                     const Positioned(
                       top: 12,
                       left: 12,
@@ -194,6 +206,65 @@ class _SetupScreenState extends State<SetupScreen> {
     );
   }
 
+  /// The left-pane panel shown for Stage 0 (the salt/pepper text): there is no
+  /// fractal and no point to select here. Shows the text the chain was seeded
+  /// with, behind a reveal toggle (it may be a secret pepper).
+  Widget _textStagePanel() {
+    final String text = _setup.saltPepper;
+    return ColoredBox(
+      color: Theme.of(context).colorScheme.surface,
+      child: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              const Icon(Icons.password, size: 48),
+              const SizedBox(height: 16),
+              Text('Stage 0 — salt / pepper',
+                  style: Theme.of(context).textTheme.titleLarge),
+              const SizedBox(height: 8),
+              Text(
+                'This text seeds every fractal in your chain — there is no '
+                'shared "canonical" fractal, and no point to select here. '
+                'You chose whether it is a public label or a secret pepper.',
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.bodyMedium,
+              ),
+              const SizedBox(height: 20),
+              if (text.isEmpty)
+                Text('(no salt / pepper set)',
+                    style: Theme.of(context).textTheme.bodySmall)
+              else
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: <Widget>[
+                    SelectableText(
+                      _stage0Hidden ? '•' * text.length : text,
+                      style: const TextStyle(
+                        fontFamily: 'Ubuntu Mono',
+                        fontFamilyFallback: <String>['monospace'],
+                        fontSize: 18,
+                        letterSpacing: 1.5,
+                      ),
+                    ),
+                    IconButton(
+                      tooltip: _stage0Hidden ? 'Reveal' : 'Hide',
+                      icon: Icon(_stage0Hidden
+                          ? Icons.visibility
+                          : Icons.visibility_off),
+                      onPressed: () =>
+                          setState(() => _stage0Hidden = !_stage0Hidden),
+                    ),
+                  ],
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   Future<void> _onCanvasSelect(FractalSelection sel) async {
     final SelectionOutcome outcome = await _setup.selectPoint(
       sel,
@@ -207,8 +278,8 @@ class _SetupScreenState extends State<SetupScreen> {
       case SelectionOutcome.invalid:
         msg = 'No encodable leaf there — zoom in and click closer.';
       case SelectionOutcome.advancedStage:
-        msg = 'Recalled — now on stage '
-            '${_setup.displayStageIndex + 1}/${_setup.nStages}.';
+        msg = 'Recalled — now on Stage '
+            '${_setup.displayStageIndex}/${_setup.nStages - 1}.';
       case SelectionOutcome.complete:
         msg = 'Recall complete — seed reconstructed.';
       case SelectionOutcome.busy:
@@ -222,7 +293,7 @@ class _SetupScreenState extends State<SetupScreen> {
 
   Widget _progressOverlay() {
     final String stageLabel =
-        'stage ${_setup.workingStageNumber}/${_setup.nStages}';
+        'Stage ${_setup.workingStageNumber}/${_setup.nStages - 1}';
     final String label;
     switch (_setup.phase) {
       case SetupPhase.deriving:
@@ -284,9 +355,9 @@ class _SetupScreenState extends State<SetupScreen> {
             ..._memoriseControls(),
 
           const Divider(height: 32),
-          // Always available: selection works on whatever fractal is shown
-          // (stage 1 from app start, stage 2 after derivation), and Reset
-          // returns to the configuration screen without restarting the app.
+          // Always available: entering select mode snaps to the next fractal to
+          // recall (Stage 0 is text, not selectable), and Reset returns to the
+          // configuration screen without restarting the app.
           SwitchListTile(
             contentPadding: EdgeInsets.zero,
             title: const Text('Select mode'),
@@ -294,10 +365,13 @@ class _SetupScreenState extends State<SetupScreen> {
             value: _selectMode,
             onChanged: _setSelectMode,
           ),
-          if (_selectMode && _setup.phase != SetupPhase.recallComplete)
+          if (_selectMode &&
+              !_setup.isTextStage &&
+              _setup.phase != SetupPhase.recallComplete)
             Text(
-              'Recalling stage ${_setup.displayStageIndex + 1}/${_setup.nStages}'
-              ' — click your one point to advance the chain.',
+              'Recalling Stage ${_setup.displayStageIndex}/'
+              '${_setup.nStages - 1} — click your one point to advance the '
+              'chain.',
             ),
 
           // Blind export of the seed recalled so far — available at every stage
@@ -312,9 +386,9 @@ class _SetupScreenState extends State<SetupScreen> {
             ),
             const SizedBox(height: 4),
             Text(
-              '${_setup.recalledStageCount}/${_setup.nStages} stages recalled '
-              '(${_setup.recalledBitCount} bits). Until the final stage this is '
-              'a non-standard, shorter — therefore weaker — seed.',
+              '${_setup.recalledStageCount}/${_setup.nStages - 1} points '
+              'recalled (${_setup.recalledBitCount} bits). Until the final '
+              'stage this is a non-standard, shorter — therefore weaker — seed.',
               style: Theme.of(context).textTheme.bodySmall,
             ),
             const SizedBox(height: 12),
@@ -388,6 +462,8 @@ class _SetupScreenState extends State<SetupScreen> {
         ),
       ] else
         ..._mnemonicInput(),
+      const SizedBox(height: 16),
+      ..._stage0Input(),
       const SizedBox(height: 16),
       const Text('Argon2 profile'),
       DropdownButton<Argon2Profile>(
@@ -489,14 +565,55 @@ class _SetupScreenState extends State<SetupScreen> {
     ];
   }
 
+  /// The Stage-0 salt/pepper field: obscured by default with a reveal toggle,
+  /// constrained to a safe ASCII subset (uppercase letters, digits, hyphen).
+  /// One field, one scheme — the user decides whether it is a public label or a
+  /// secret pepper. The restriction (and why it exists) is explained inline.
+  List<Widget> _stage0Input() {
+    return <Widget>[
+      const Text('Stage 0 — salt / pepper'),
+      const SizedBox(height: 4),
+      TextField(
+        controller: _stage0,
+        obscureText: _stage0Hidden,
+        enabled: !_busy,
+        maxLines: 1,
+        autocorrect: false,
+        enableSuggestions: false,
+        inputFormatters: <TextInputFormatter>[_SaltPepperFormatter()],
+        decoration: InputDecoration(
+          isDense: true,
+          border: const OutlineInputBorder(),
+          hintText: 'e.g. MAIN-STASH',
+          helperText: 'Seeds your fractals. A label (MAIN-STASH) or a pasted '
+              'secret pepper — your call. Uppercase letters, digits and '
+              'hyphens only (kept unambiguous so it is reproducible).',
+          helperMaxLines: 3,
+          suffixIcon: IconButton(
+            tooltip: _stage0Hidden ? 'Show text' : 'Hide text',
+            icon: Icon(
+              _stage0Hidden ? Icons.visibility : Icons.visibility_off,
+            ),
+            onPressed: () => setState(() => _stage0Hidden = !_stage0Hidden),
+          ),
+        ),
+        style: const TextStyle(
+          fontFamily: 'Ubuntu Mono',
+          fontFamilyFallback: <String>['monospace'],
+        ),
+        onChanged: (_) => setState(() {}),
+      ),
+    ];
+  }
+
   List<Widget> _memoriseControls() {
     final int idx = _setup.displayStageIndex;
     final int n = _setup.nStages;
     return <Widget>[
       const Text('Memorise your points'),
       const SizedBox(height: 8),
-      // One fractal (one point) per stage; step through them in order. Stage 1
-      // is the public canonical fractal, the rest are chain-derived.
+      // Stage 0 is the salt/pepper text (no point); stages 1..N-1 are the
+      // chain-derived fractals, one point each. Step through with the arrows / T.
       Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: <Widget>[
@@ -505,7 +622,9 @@ class _SetupScreenState extends State<SetupScreen> {
             onPressed: idx > 0 ? () => _setup.showStage(idx - 1) : null,
             icon: const Icon(Icons.chevron_left),
           ),
-          Text('Stage ${idx + 1} / $n${idx == 0 ? " (canonical)" : ""}'),
+          Text(idx == 0
+              ? 'Stage 0 — salt / pepper'
+              : 'Stage $idx / ${n - 1}'),
           IconButton(
             tooltip: 'Next stage',
             onPressed: idx < n - 1 ? () => _setup.showStage(idx + 1) : null,
@@ -515,9 +634,10 @@ class _SetupScreenState extends State<SetupScreen> {
       ),
       const SizedBox(height: 16),
       Text(
-        'Each stage is its own fractal carrying one point. Study the marked '
-        'location on every stage until you can find it from memory. When you '
-        'are confident, finish — the seed is then held only in your recall.',
+        'Stage 0 is the salt/pepper you entered; each later stage is its own '
+        'fractal carrying one point. Study the marked location on every fractal '
+        'until you can find it from memory. When confident, finish — the seed '
+        'is then held only in your recall.',
         style: Theme.of(context).textTheme.bodySmall,
       ),
       const SizedBox(height: 16),
@@ -621,9 +741,11 @@ class _SetupScreenState extends State<SetupScreen> {
   Future<void> _start() async {
     _brightness.reset();
     setState(() => _selectMode = false);
+    final String text = _stage0.text;
     if (_importMode) {
       await _setup.beginFromMnemonic(
         _mnemonic.text,
+        text: text,
         argon2Iterations: _iterations,
         profile: _profile,
       );
@@ -634,10 +756,14 @@ class _SetupScreenState extends State<SetupScreen> {
     } else {
       await _setup.begin(
         preset: _preset,
+        text: text,
         argon2Iterations: _iterations,
         profile: _profile,
       );
     }
+    // The salt/pepper now lives in the chain; clear the input field on success
+    // (the controller keeps its own copy for the in-session recall).
+    if (_setup.phase != SetupPhase.error) _stage0.clear();
   }
 
   void _reset() {
@@ -645,7 +771,37 @@ class _SetupScreenState extends State<SetupScreen> {
     _brightness.reset();
     _viewport.viewport = _initialViewport;
     _mnemonic.clear();
-    setState(() => _selectMode = false);
+    _stage0.clear();
+    setState(() {
+      _selectMode = false;
+      _stage0Hidden = true;
+    });
+  }
+}
+
+/// Constrains the Stage-0 salt/pepper to a safe, reproducible ASCII subset:
+/// uppercase letters, digits and hyphens. Lowercase is upper-cased; anything
+/// else (spaces, underscores, punctuation, non-ASCII) is dropped as typed.
+///
+/// Rationale: this text must be reproduced exactly to re-derive the chain, so we
+/// remove characters that invite transcription ambiguity (case, whitespace,
+/// look-alike punctuation). A future pass should add an explicit signal (error
+/// bell / red flag) when a character is rejected; today it is filtered silently.
+class _SaltPepperFormatter extends TextInputFormatter {
+  static final RegExp _disallowed = RegExp(r'[^A-Z0-9-]');
+
+  @override
+  TextEditingValue formatEditUpdate(
+    TextEditingValue oldValue,
+    TextEditingValue newValue,
+  ) {
+    final String filtered =
+        newValue.text.toUpperCase().replaceAll(_disallowed, '');
+    if (filtered == newValue.text) return newValue;
+    return TextEditingValue(
+      text: filtered,
+      selection: TextSelection.collapsed(offset: filtered.length),
+    );
   }
 }
 

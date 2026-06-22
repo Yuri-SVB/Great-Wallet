@@ -6,7 +6,6 @@ import '../ffi/core_bindings.dart';
 import '../ffi/library_loader.dart';
 import 'core_escape_count_source.dart';
 import 'encoding_constants.dart';
-import 'entropy.dart';
 import 'stage_params.dart';
 
 /// App-level facade over great-wall-core: opens the engine once, exposes the
@@ -87,16 +86,16 @@ class GreatWallCore {
     );
   }
 
-  /// Derive a chained stage's `(o, p, q)` from the cumulative bits of every
-  /// preceding point, by running `iterations` Argon2d passes and feeding each
-  /// digest back as the next input — the iterative scheme of
-  /// `derive_stage_params` / `argon2_iterate` (argon2_pipeline.py). This is one
-  /// link of the chain: `priorBits` is the concatenation of points `0..k-1`,
-  /// so the input grows by 32 bits per stage.
+  /// Derive a chained stage's `(o, p, q)` from a ready Argon2 [input], by
+  /// running `iterations` Argon2d passes and feeding each digest back as the
+  /// next input — the iterative scheme of `derive_stage_params` /
+  /// `argon2_iterate` (argon2_pipeline.py). This is one link of the chain; the
+  /// caller assembles [input] as the Stage-0 salt/pepper bytes followed by the
+  /// packed bits of every preceding point, so the input grows by 32 bits per
+  /// stage and every fractal is personalised (there is no canonical fractal).
   ///
-  /// `iterations == 0` is the identity case (the natural-length input
-  /// zero-padded/truncated to the 32-byte digest, no Argon2) used for fast dev
-  /// runs.
+  /// `iterations == 0` is the identity case (the input zero-padded/truncated to
+  /// the 32-byte digest, no Argon2) used for fast dev runs.
   ///
   /// The whole loop runs in a **single dedicated worker isolate** (which opens
   /// its own engine binding — FFI handles cannot cross isolates), so the heavy,
@@ -108,7 +107,7 @@ class GreatWallCore {
   /// preempted mid-call, but cancel stops listening and tears the isolate down
   /// at once; granularity is one pass, as in the reference.)
   Future<Argon2Job> startStageDerivation(
-    List<int> priorBits, {
+    Uint8List input, {
     required int iterations,
     Argon2Profile profile = Argon2Profile.basic,
     void Function(int completed, int total)? onProgress,
@@ -116,9 +115,7 @@ class GreatWallCore {
     final int total = iterations < 1 ? 1 : iterations;
 
     if (iterations == 0) {
-      // Identity case: data.ljust(32, 0)[:32] (argon2_pipeline.py). The input
-      // is the natural-length prior-point bytes (not padded to a fixed width).
-      final Uint8List input = Entropy.argon2Input(priorBits);
+      // Identity case: data.ljust(32, 0)[:32] (argon2_pipeline.py).
       final int n = input.length < 32 ? input.length : 32;
       final Uint8List digest = Uint8List(32)..setRange(0, n, input);
       onProgress?.call(1, total);
@@ -127,7 +124,6 @@ class GreatWallCore {
       return Argon2Job(Future<StageReservoirs>.value(r), () {});
     }
 
-    final Uint8List input = Entropy.argon2Input(priorBits);
     final ReceivePort port = ReceivePort();
     final Completer<StageReservoirs> completer = Completer<StageReservoirs>();
     final Isolate isolate = await Isolate.spawn<(SendPort, Uint8List, int, int)>(

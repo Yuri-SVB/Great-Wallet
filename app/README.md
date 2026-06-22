@@ -22,34 +22,42 @@ supplies the production implementation of that seam and the Setup orchestration:
 | C ABI binding to the Rust engine | `lib/src/ffi/core_bindings.dart` | Dart port of the Python `ctypes` bridge (`burning_ship_engine.py`): render, encode, `decode_full`, `argon2_single`. |
 | Library discovery | `lib/src/ffi/library_loader.dart` | Finds `libburning_ship_engine` next to the exe or in the submodule's cargo output. |
 | I4F60 fixed-point | `lib/src/ffi/fixed.dart` | Coordinates cross the FFI as raw `i64`, never floats (determinism). |
-| **The UX seam** | `lib/src/core/core_escape_count_source.dart` | `EscapeCountSource` → engine. Maps the viewport to the raster call and converts the engine's `u8` buffer to the UX `Uint32List`. Renders **every** stage through the perturbed path (`escape_count_generic`) — the canonical stage 0 as `(0,0,0)` — because that is the formula `bs_encode` uses (it applies p's +1/8 baseline even at `(0,0,0)`); the pure-canonical `bs_render_viewport` would draw a different fractal and the points would appear to fall in the canonical hole. |
-| `(o,p,q)` derivation | `lib/src/core/stage_params.dart` | `sha256(argon2_digest)` split into three `u64` reservoirs — port of `derive_stage2_params` (per-stage attribution, unchanged under the chained protocol). |
-| Encode / decode / Argon2 facade | `lib/src/core/great_wall_core.dart` | One engine instance, shared `EscapeCountSource`. |
-| Setup state machine | `lib/src/setup/setup_controller.dart` | Generate entropy (or import an existing, possibly sub-standard, BIP39 phrase) → for each chained stage, derive its fractal from all preceding points (stage 0 canonical) and encode its one 32-bit point → memorise → wipe. |
-| Setup screen | `lib/src/setup/setup_screen.dart` | Wires `FractalCanvas`, `HueWheel`, brightness, overlays. |
+| **The UX seam** | `lib/src/core/core_escape_count_source.dart` | `EscapeCountSource` → engine. Maps the viewport to the raster call and converts the engine's `u8` buffer to the UX `Uint32List`. Renders every fractal through the perturbed path (`escape_count_generic`) with that stage's chain-derived `(o,p,q)`. |
+| `(o,p,q)` derivation | `lib/src/core/stage_params.dart` | `sha256(argon2_digest)` split into three `u64` reservoirs — port of `derive_stage2_params` (per-stage attribution). |
+| Encode / decode / Argon2 facade | `lib/src/core/great_wall_core.dart` | One engine instance, shared `EscapeCountSource`. `startStageDerivation` takes the raw Argon2 input bytes (Stage-0 text ‖ preceding points). |
+| Setup state machine | `lib/src/setup/setup_controller.dart` | Enter the Stage-0 salt/pepper text; generate entropy (or import an existing, possibly sub-standard, BIP39 phrase) → for each fractal stage, derive it from the text + all preceding points and encode its one 32-bit point → memorise → wipe. |
+| Setup screen | `lib/src/setup/setup_screen.dart` | Wires `FractalCanvas`, `HueWheel`, brightness, overlays, the Stage-0 text panel/field. |
 
 ### The chained pipeline, end to end
 
-Each stage carries exactly one 32-bit point (`nStages = entropyBits / 32`).
-Stage 0 is the public canonical fractal; every later stage's fractal is the
-memory-hard hash of *all preceding points*, so it cannot be formed until those
-points are fixed (one stage = one fractal = one haystack; one point = one
-needle).
+**Stage 0 is a salt/pepper *text*** — no fractal, no point. It seeds the chain,
+so it can act as a public label (`MAIN-STASH`) or a secret pepper; the app
+treats it identically and the user decides. The entropy root is then split into
+one 32-bit point per fractal stage (`pointStages = entropyBits / 32`). Every
+fractal is the memory-hard hash of the **text plus all preceding points**, so
+even the first fractal is personalised — **there is no app-canonical fractal**.
+The text never enters the entropy, so BIP39 ↔ Great Wall stays **lossless**.
 
 ```
-random entropy ──split into 32-bit chunks (one per stage)──┐
-                                                           │
-stage 0:  encode chunk0 (o=p=q=0)  ───────────────→ point P0   (canonical fractal)
-for k = 1 .. n-1:
-   θ_k = SHA-256(Argon2^N(points P0..P_{k-1})) → (o,p,q)_k
-   stage k:  encode chunk_k (o,p,q)_k ───────────→ point Pk    (perturbed fractal)
+Stage 0:  salt/pepper text  T   (no point — seeds the chain)
+random/imported entropy ──split into 32-bit chunks (one per fractal)──┐
+                                                                      │
+for k = 1 .. N:
+   θ_k = SHA-256(Argon2^N(T ‖ points P1..P_{k-1})) → (o,p,q)_k
+   stage k:  encode chunk_{k-1} (o,p,q)_k ───────────→ point Pk   (derived fractal)
 
-P0 ‖ P1 ‖ … ‖ P_{n-1}  →  entropy (32·n bits)  →  BIP39 mnemonic
+P1 ‖ P2 ‖ … ‖ P_N  →  entropy (32·N bits)  →  BIP39 mnemonic   (T not included)
 ```
 
 Setup is *write-only on the user's memory*: the plaintext entropy is generated,
-encoded onto the fractal as points to memorise, then wiped
-(`ARCHITECTURE.md` §"Invariants"). Nothing is persisted or logged.
+encoded onto the fractals as points to memorise, then wiped (`ARCHITECTURE.md`
+§"Invariants"). The Stage-0 text is held for the in-session recall and wiped on
+finish/reset; verifying its recall on a fresh device belongs to the trainer
+(CPNF), which will store only a hash of it. Nothing is persisted or logged.
+
+> Note: the Python reference (`great-wall-core/burning_ship/protocol.py`) still
+> models Stage 0 as the public canonical fractal. This app's Stage-0-text scheme
+> is ahead of it; the core should adopt the same chain seeding for parity.
 
 ## Known seam gap
 
