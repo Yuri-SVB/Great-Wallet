@@ -135,6 +135,10 @@ class _SetupScreenState extends State<SetupScreen> {
       _resetView();
       return KeyEventResult.handled;
     }
+    if (event.logicalKey == LogicalKeyboardKey.keyT) {
+      _setup.cycleStage();
+      return KeyEventResult.handled;
+    }
     return KeyEventResult.ignored;
   }
 
@@ -335,7 +339,8 @@ class _SetupScreenState extends State<SetupScreen> {
           const SizedBox(height: 16),
           const Text(
             'Hold L and scroll over the canvas to adjust brightness; '
-            'scroll to zoom, drag to pan; press R to recenter.',
+            'scroll to zoom, drag to pan; press R to recenter, T to cycle '
+            'stages, S to select.',
             textAlign: TextAlign.center,
           ),
           const SizedBox(height: 24),

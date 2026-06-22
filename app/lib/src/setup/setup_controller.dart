@@ -521,6 +521,26 @@ class SetupController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Advance the displayed stage to the next available one, wrapping around —
+  /// the `T` hotkey. "Available" means the canonical stage or a stage already
+  /// derived, so during a partial recall it only visits stages reached so far.
+  /// No-op until a session exists.
+  void cycleStage() {
+    if (_stageCount <= 1) return;
+    for (int step = 1; step <= nStages; step++) {
+      final int next = (_displayStageIndex + step) % nStages;
+      final bool available = next == 0 ||
+          (next < _reservoirs.length && _reservoirs[next] != null);
+      if (available) {
+        if (next != _displayStageIndex) {
+          _applyDisplayStage(next);
+          notifyListeners();
+        }
+        return;
+      }
+    }
+  }
+
   /// Point the canvas (and the render source) at [index]'s fractal: the
   /// canonical fractal for stage 0, otherwise that stage's chain-derived
   /// reservoirs. Does not notify; callers do.
