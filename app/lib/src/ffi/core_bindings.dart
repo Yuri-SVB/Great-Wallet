@@ -50,6 +50,12 @@ class GreatWallCoreBindings {
             'bs_salt_pepper_canonicalize');
     _chainInput =
         _lib.lookupFunction<_ChainInputC, _ChainInputDart>('bs_chain_input');
+    _encodeParams =
+        _lib.lookupFunction<_EncodeParamsC, _EncodeParamsDart>('bs_encode_params');
+    _encodeArea =
+        _lib.lookupFunction<_EncodeAreaC, _EncodeAreaDart>('bs_encode_area');
+    _bitsPerPoint = _lib
+        .lookupFunction<_BitsPerPointC, _BitsPerPointDart>('bs_bits_per_point');
     _getPrecision =
         _lib.lookupFunction<_GetPrecisionC, _GetPrecisionDart>('bs_get_precision');
     _engineVersion =
@@ -84,6 +90,9 @@ class GreatWallCoreBindings {
   late final _Argon2SingleDart _argon2Single;
   late final _SaltPepperCanonicalizeDart _saltPepperCanonicalize;
   late final _ChainInputDart _chainInput;
+  late final _EncodeParamsDart _encodeParams;
+  late final _EncodeAreaDart _encodeArea;
+  late final _BitsPerPointDart _bitsPerPoint;
   late final _GetPrecisionDart _getPrecision;
   late final _EngineVersionDart _engineVersion;
 
@@ -378,6 +387,72 @@ class GreatWallCoreBindings {
   }
 
   // -------------------------------------------------------------------------
+  // Canonical protocol parameters (engine is the single source of truth)
+  // -------------------------------------------------------------------------
+
+  /// The canonical encode/decode discovery parameters, read straight from the
+  /// engine (`bs_encode_params`). The wallet must not hard-code these — a stale
+  /// copy (`maxIter = 64`) is what stalled deep-zoom encodes; the engine
+  /// dictates the protocol.
+  CoreDiscoveryParams encodeParams() {
+    final Pointer<Uint32> maxIter = calloc<Uint32>();
+    final Pointer<Uint32> targetGood = calloc<Uint32>();
+    final Pointer<Uint64> maxFloodPoints = calloc<Uint64>();
+    final Pointer<Uint64> minGridCells = calloc<Uint64>();
+    final Pointer<Uint32> pMaxShift = calloc<Uint32>();
+    final Pointer<Uint32> exclusionThresholdNum = calloc<Uint32>();
+    final Pointer<Uint64> rngSeed = calloc<Uint64>();
+    try {
+      _encodeParams(maxIter, targetGood, maxFloodPoints, minGridCells,
+          pMaxShift, exclusionThresholdNum, rngSeed);
+      return CoreDiscoveryParams(
+        maxIter: maxIter.value,
+        targetGood: targetGood.value,
+        maxFloodPoints: maxFloodPoints.value,
+        minGridCells: minGridCells.value,
+        pMaxShift: pMaxShift.value,
+        exclusionThresholdNum: exclusionThresholdNum.value,
+        rngSeed: rngSeed.value,
+      );
+    } finally {
+      calloc
+        ..free(maxIter)
+        ..free(targetGood)
+        ..free(maxFloodPoints)
+        ..free(minGridCells)
+        ..free(pMaxShift)
+        ..free(exclusionThresholdNum)
+        ..free(rngSeed);
+    }
+  }
+
+  /// The canonical encode area as raw I4F60 `i64` bounds (`bs_encode_area`).
+  FixedRect encodeArea() {
+    final Pointer<Int64> reMin = calloc<Int64>();
+    final Pointer<Int64> reMax = calloc<Int64>();
+    final Pointer<Int64> imMin = calloc<Int64>();
+    final Pointer<Int64> imMax = calloc<Int64>();
+    try {
+      _encodeArea(reMin, reMax, imMin, imMax);
+      return FixedRect(
+        reMin: reMin.value,
+        reMax: reMax.value,
+        imMin: imMin.value,
+        imMax: imMax.value,
+      );
+    } finally {
+      calloc
+        ..free(reMin)
+        ..free(reMax)
+        ..free(imMin)
+        ..free(imMax);
+    }
+  }
+
+  /// Bits encoded per fractal point/stage (`bs_bits_per_point`).
+  int bitsPerPoint() => _bitsPerPoint();
+
+  // -------------------------------------------------------------------------
   // Helpers
   // -------------------------------------------------------------------------
 
@@ -440,19 +515,21 @@ class FixedRect {
   final int imMax;
 }
 
-/// Discovery / bisection parameters. Integer-only, mirroring the Python
-/// `DiscoveryParams`. The defaults here are the GUI presets from
-/// great-wall-core/burning_ship/constants.py (`GUI_PARAMS`) — the same values
-/// the reference viewer encodes with, so points round-trip identically.
+/// Discovery / bisection parameters. Integer-only, mirroring the Rust
+/// `DiscoveryParams`. These are *protocol* values that determine encode output;
+/// the engine is their single source of truth ([GreatWallCoreBindings
+/// .encodeParams], backed by `bs_encode_params`). All fields are required on
+/// purpose — there are deliberately no defaults, so a stale literal (e.g. a
+/// `maxIter` of 64) can never silently stand in for the engine's value.
 class CoreDiscoveryParams {
   const CoreDiscoveryParams({
-    this.maxIter = 64,
-    this.targetGood = 32,
-    this.maxFloodPoints = 256,
-    this.minGridCells = 1024 * 1024,
-    this.pMaxShift = 3,
-    this.exclusionThresholdNum = 1023,
-    this.rngSeed = 0x42,
+    required this.maxIter,
+    required this.targetGood,
+    required this.maxFloodPoints,
+    required this.minGridCells,
+    required this.pMaxShift,
+    required this.exclusionThresholdNum,
+    required this.rngSeed,
   });
 
   final int maxIter;
@@ -553,6 +630,21 @@ typedef _ChainInputC = Uint32 Function(
   Pointer<Uint8>, Uint32, Pointer<Uint8>, Uint32, Pointer<Uint8>, Uint32);
 typedef _ChainInputDart = int Function(
   Pointer<Uint8>, int, Pointer<Uint8>, int, Pointer<Uint8>, int);
+
+typedef _EncodeParamsC = Void Function(Pointer<Uint32>, Pointer<Uint32>,
+    Pointer<Uint64>, Pointer<Uint64>, Pointer<Uint32>, Pointer<Uint32>,
+    Pointer<Uint64>);
+typedef _EncodeParamsDart = void Function(Pointer<Uint32>, Pointer<Uint32>,
+    Pointer<Uint64>, Pointer<Uint64>, Pointer<Uint32>, Pointer<Uint32>,
+    Pointer<Uint64>);
+
+typedef _EncodeAreaC = Void Function(
+  Pointer<Int64>, Pointer<Int64>, Pointer<Int64>, Pointer<Int64>);
+typedef _EncodeAreaDart = void Function(
+  Pointer<Int64>, Pointer<Int64>, Pointer<Int64>, Pointer<Int64>);
+
+typedef _BitsPerPointC = Uint32 Function();
+typedef _BitsPerPointDart = int Function();
 
 typedef _GetPrecisionC = Void Function(Pointer<Uint32>, Pointer<Uint32>);
 typedef _GetPrecisionDart = void Function(Pointer<Uint32>, Pointer<Uint32>);

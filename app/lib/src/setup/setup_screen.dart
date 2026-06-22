@@ -210,7 +210,7 @@ class _SetupScreenState extends State<SetupScreen> {
       stage: stage,
       stageParameters:
           stage == Stage.stage2 ? _setup.displayStageParams : null,
-      maxIterations: EncodingConstants.guiParams.maxIter,
+      maxIterations: EncodingConstants.renderMaxIter,
       // Generated points (white, after Generate) plus selected points (green,
       // in select mode). Empty until there is something to show.
       overlays: _setup.overlaysForDisplayStage(),

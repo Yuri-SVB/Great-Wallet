@@ -15,7 +15,19 @@ import 'stage_params.dart';
 /// One instance is shared for the app's lifetime; the engine's internal
 /// thread pool (TECH_STACK.md §"Threading model") parallelises the renders.
 class GreatWallCore {
-  GreatWallCore._(this.bindings) : source = CoreEscapeCountSource(bindings);
+  GreatWallCore._(this.bindings) : source = CoreEscapeCountSource(bindings) {
+    // Bits-per-point is a structural protocol constant used in const contexts,
+    // so it stays a Dart constant — but the engine remains its authority. Fail
+    // loudly on drift rather than encode against a stale width.
+    final int engineBpp = bindings.bitsPerPoint();
+    if (engineBpp != EncodingConstants.bitsPerPoint) {
+      throw StateError(
+        'Engine bits-per-point ($engineBpp) does not match the wallet '
+        'constant (${EncodingConstants.bitsPerPoint}); the protocol changed. '
+        'Update EncodingConstants.bitsPerPoint before encoding anything.',
+      );
+    }
+  }
 
   /// Open and bind the engine library. Throws [CoreLibraryNotFound] if the
   /// `cdylib` has not been built (run `native/build_core.sh`).
@@ -27,6 +39,15 @@ class GreatWallCore {
 
   /// The production [EscapeCountSource] handed to great-wall-ux's FractalCanvas.
   final CoreEscapeCountSource source;
+
+  /// Canonical encode/decode parameters, fetched once from the engine — the
+  /// single source of truth for the values that determine encode output. The
+  /// wallet never hard-codes these (a stale `maxIter = 64` is what stalled
+  /// deep-zoom encodes); it reads whatever the linked engine dictates.
+  late final CoreDiscoveryParams encodeParams = bindings.encodeParams();
+
+  /// The canonical encode area, fetched once from the engine.
+  late final FixedRect encodeArea = bindings.encodeArea();
 
   /// Engine algorithm version (e.g. `"0.1.0"`).
   String get engineVersion => bindings.engineVersion();
@@ -56,8 +77,8 @@ class GreatWallCore {
     required int p,
     required int q,
   }) {
-    final FixedRect area = EncodingConstants.encodeArea();
-    const CoreDiscoveryParams params = EncodingConstants.guiParams;
+    final FixedRect area = encodeArea;
+    final CoreDiscoveryParams params = encodeParams;
     final int n = stageBits.length ~/ EncodingConstants.bitsPerPoint;
     final List<EncodedPoint> points = <EncodedPoint>[];
     for (int i = 0; i < n; i++) {
@@ -91,8 +112,8 @@ class GreatWallCore {
       pointReRaw: reRaw,
       pointImRaw: imRaw,
       numBits: EncodingConstants.bitsPerPoint,
-      area: EncodingConstants.encodeArea(),
-      params: EncodingConstants.guiParams,
+      area: encodeArea,
+      params: encodeParams,
       o: o,
       p: p,
       q: q,
