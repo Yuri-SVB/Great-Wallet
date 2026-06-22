@@ -25,7 +25,7 @@ supplies the production implementation of that seam and the Setup orchestration:
 | **The UX seam** | `lib/src/core/core_escape_count_source.dart` | `EscapeCountSource` → engine. Maps the viewport to the raster call and converts the engine's `u8` buffer to the UX `Uint32List`. Renders **every** stage through the perturbed path (`escape_count_generic`) — the canonical stage 0 as `(0,0,0)` — because that is the formula `bs_encode` uses (it applies p's +1/8 baseline even at `(0,0,0)`); the pure-canonical `bs_render_viewport` would draw a different fractal and the points would appear to fall in the canonical hole. |
 | `(o,p,q)` derivation | `lib/src/core/stage_params.dart` | `sha256(argon2_digest)` split into three `u64` reservoirs — port of `derive_stage2_params` (per-stage attribution, unchanged under the chained protocol). |
 | Encode / decode / Argon2 facade | `lib/src/core/great_wall_core.dart` | One engine instance, shared `EscapeCountSource`. |
-| Setup state machine | `lib/src/setup/setup_controller.dart` | Generate entropy → for each chained stage, derive its fractal from all preceding points (stage 0 canonical) and encode its one 32-bit point → memorise → wipe. |
+| Setup state machine | `lib/src/setup/setup_controller.dart` | Generate entropy (or import an existing, possibly sub-standard, BIP39 phrase) → for each chained stage, derive its fractal from all preceding points (stage 0 canonical) and encode its one 32-bit point → memorise → wipe. |
 | Setup screen | `lib/src/setup/setup_screen.dart` | Wires `FractalCanvas`, `HueWheel`, brightness, overlays. |
 
 ### The chained pipeline, end to end

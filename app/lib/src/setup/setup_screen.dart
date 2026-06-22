@@ -35,10 +35,19 @@ class _SetupScreenState extends State<SetupScreen> {
   /// Domain-separates one setup from another — see ARCHITECTURE.md §"Stage 0".
   final TextEditingController _salt = TextEditingController();
 
+  /// An existing BIP39 phrase to import instead of generating a fresh root.
+  /// Secret material: obscured by default, cleared once it has been encoded.
+  final TextEditingController _mnemonic = TextEditingController();
+  bool _mnemonicHidden = true;
+
   HueOffset _hue = HueOffset.red;
   SizePreset _preset = SizePreset.defaultPreset;
   Argon2Profile _profile = Argon2Profile.basic;
   int _iterations = 1;
+
+  /// Configuration source: generate a fresh random seed, or import an existing
+  /// (possibly sub-standard) BIP39 phrase and encode it onto the fractals.
+  bool _importMode = false;
 
   /// Select mode: when on, tapping the canvas decodes the point under the
   /// cursor instead of panning. Toggled by the panel button or the `S` key.
@@ -64,6 +73,7 @@ class _SetupScreenState extends State<SetupScreen> {
     _viewport.dispose();
     _brightness.dispose();
     _salt.dispose();
+    _mnemonic.dispose();
     super.dispose();
   }
 
@@ -315,22 +325,38 @@ class _SetupScreenState extends State<SetupScreen> {
 
   List<Widget> _configControls() {
     return <Widget>[
-      const Text('Size'),
-      DropdownButton<SizePreset>(
-        isExpanded: true,
-        value: _preset,
-        onChanged: _busy
-            ? null
-            : (SizePreset? v) => setState(() => _preset = v ?? _preset),
-        items: <DropdownMenuItem<SizePreset>>[
-          for (final SizePreset p in SizePreset.values)
-            DropdownMenuItem<SizePreset>(
-              value: p,
-              child: Text('${p.name} — ${p.bip39Words} words '
-                  '(${p.entropyBits}-bit)'),
-            ),
+      const Text('Source'),
+      const SizedBox(height: 4),
+      SegmentedButton<bool>(
+        segments: const <ButtonSegment<bool>>[
+          ButtonSegment<bool>(value: false, label: Text('New seed')),
+          ButtonSegment<bool>(value: true, label: Text('Import')),
         ],
+        selected: <bool>{_importMode},
+        onSelectionChanged: _busy
+            ? null
+            : (Set<bool> s) => setState(() => _importMode = s.first),
       ),
+      const SizedBox(height: 16),
+      if (!_importMode) ...<Widget>[
+        const Text('Size'),
+        DropdownButton<SizePreset>(
+          isExpanded: true,
+          value: _preset,
+          onChanged: _busy
+              ? null
+              : (SizePreset? v) => setState(() => _preset = v ?? _preset),
+          items: <DropdownMenuItem<SizePreset>>[
+            for (final SizePreset p in SizePreset.values)
+              DropdownMenuItem<SizePreset>(
+                value: p,
+                child: Text('${p.name} — ${p.bip39Words} words '
+                    '(${p.entropyBits}-bit)'),
+              ),
+          ],
+        ),
+      ] else
+        ..._mnemonicInput(),
       const SizedBox(height: 16),
       const Text('Argon2 profile'),
       DropdownButton<Argon2Profile>(
@@ -368,8 +394,10 @@ class _SetupScreenState extends State<SetupScreen> {
       ),
       const SizedBox(height: 16),
       FilledButton(
-        onPressed: _busy ? null : _start,
-        child: const Text('Generate'),
+        onPressed: (_busy || (_importMode && _mnemonic.text.trim().isEmpty))
+            ? null
+            : _start,
+        child: Text(_importMode ? 'Encode phrase' : 'Generate'),
       ),
       if (_setup.phase == SetupPhase.error && _setup.errorMessage != null) ...<Widget>[
         const SizedBox(height: 12),
@@ -378,6 +406,55 @@ class _SetupScreenState extends State<SetupScreen> {
           style: const TextStyle(color: Colors.redAccent),
         ),
       ],
+    ];
+  }
+
+  /// The obscured BIP39 import field plus a live word-count hint. The phrase is
+  /// secret, so the field is blind (asterisks) by default with an eye toggle;
+  /// it is never echoed back anywhere else.
+  List<Widget> _mnemonicInput() {
+    final int words = _mnemonic.text
+        .trim()
+        .split(RegExp(r'\s+'))
+        .where((String w) => w.isNotEmpty)
+        .length;
+    final bool standard = <int>{12, 15, 18, 21, 24}.contains(words);
+    final String hint;
+    if (words == 0) {
+      hint = 'Type or paste your seed phrase.';
+    } else if (words % 3 != 0 || words > 24) {
+      hint = '$words words — must be a multiple of 3 (3–24).';
+    } else {
+      hint = '$words words → ${words ~/ 3} stages'
+          '${standard ? "" : " (sub-standard length)"}.';
+    }
+    return <Widget>[
+      const Text('Seed phrase (BIP39)'),
+      const SizedBox(height: 4),
+      TextField(
+        controller: _mnemonic,
+        obscureText: _mnemonicHidden,
+        enabled: !_busy,
+        maxLines: 1,
+        autocorrect: false,
+        enableSuggestions: false,
+        decoration: InputDecoration(
+          isDense: true,
+          border: const OutlineInputBorder(),
+          hintText: 'word1 word2 …',
+          helperText: hint,
+          helperMaxLines: 2,
+          suffixIcon: IconButton(
+            tooltip: _mnemonicHidden ? 'Show phrase' : 'Hide phrase',
+            icon: Icon(
+              _mnemonicHidden ? Icons.visibility : Icons.visibility_off,
+            ),
+            onPressed: () =>
+                setState(() => _mnemonicHidden = !_mnemonicHidden),
+          ),
+        ),
+        onChanged: (_) => setState(() {}),
+      ),
     ];
   }
 
@@ -513,17 +590,30 @@ class _SetupScreenState extends State<SetupScreen> {
   Future<void> _start() async {
     _brightness.reset();
     setState(() => _selectMode = false);
-    await _setup.begin(
-      preset: _preset,
-      argon2Iterations: _iterations,
-      profile: _profile,
-    );
+    if (_importMode) {
+      await _setup.beginFromMnemonic(
+        _mnemonic.text,
+        argon2Iterations: _iterations,
+        profile: _profile,
+      );
+      // Setup is write-only on memory: once the phrase is encoded onto the
+      // fractals, wipe the plaintext from the field (keep it on error so the
+      // user can fix it).
+      if (_setup.phase != SetupPhase.error) _mnemonic.clear();
+    } else {
+      await _setup.begin(
+        preset: _preset,
+        argon2Iterations: _iterations,
+        profile: _profile,
+      );
+    }
   }
 
   void _reset() {
     _setup.reset();
     _brightness.reset();
     _viewport.viewport = _initialViewport;
+    _mnemonic.clear();
     setState(() => _selectMode = false);
   }
 }

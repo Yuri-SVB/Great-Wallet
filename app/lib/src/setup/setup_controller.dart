@@ -77,8 +77,12 @@ class SetupController extends ChangeNotifier {
   SizePreset _preset = SizePreset.defaultPreset;
   SizePreset get preset => _preset;
 
-  /// Number of chained stages for the active preset (one 32-bit point each).
-  int get nStages => _preset.nStages;
+  /// Number of chained stages of the active session (one 32-bit point each).
+  /// While a session is live this is the *actual* width — which, for an imported
+  /// seed phrase, may be any 3..24-word size, not one of the presets — falling
+  /// back to the configured preset before a session starts.
+  int _stageCount = 0;
+  int get nStages => _stageCount > 0 ? _stageCount : _preset.nStages;
 
   /// Which stage the canvas is currently showing (0 = canonical first fractal).
   int _displayStageIndex = 0;
@@ -224,27 +228,65 @@ class SetupController extends ChangeNotifier {
     );
   }
 
-  /// Run the full chained Setup pipeline: generate entropy, then for each stage
-  /// derive its fractal from all preceding points (stage 0 is canonical, no
-  /// derivation) and encode that stage's single 32-bit point, before entering
-  /// the memorise phase.
+  /// Run the full chained Setup pipeline on a **freshly generated** entropy
+  /// root of the configured [preset] size.
   Future<void> begin({
     required SizePreset preset,
+    required int argon2Iterations,
+    Argon2Profile profile = Argon2Profile.basic,
+  }) {
+    _preset = preset;
+    return _encodeRoot(
+      Entropy.randomBits(preset.entropyBits),
+      argon2Iterations: argon2Iterations,
+      profile: profile,
+    );
+  }
+
+  /// Run the chained Setup pipeline on an **imported BIP39 seed phrase** instead
+  /// of fresh entropy. The phrase may be sub-standard (any 3..24 words → a
+  /// matching number of stages). On an invalid phrase the controller enters the
+  /// error phase with a generic message (the seed content is never echoed).
+  Future<void> beginFromMnemonic(
+    String mnemonic, {
+    required int argon2Iterations,
+    Argon2Profile profile = Argon2Profile.basic,
+  }) {
+    final List<int> bits;
+    try {
+      bits = Bip39.mnemonicToEntropyBits(mnemonic);
+    } on FormatException catch (e) {
+      _errorMessage = e.message; // generic by construction; no seed content
+      _setPhase(SetupPhase.error);
+      return Future<void>.value();
+    }
+    return _encodeRoot(
+      bits,
+      argon2Iterations: argon2Iterations,
+      profile: profile,
+    );
+  }
+
+  /// The shared chained-encode pipeline over a ready entropy [bits] root: for
+  /// each stage derive its fractal from all preceding points (stage 0 is
+  /// canonical, no derivation) and encode that stage's single 32-bit point,
+  /// before entering the memorise phase. Takes ownership of [bits] and wipes it.
+  Future<void> _encodeRoot(
+    List<int> bits, {
     required int argon2Iterations,
     Argon2Profile profile = Argon2Profile.basic,
   }) async {
     if (_phase != SetupPhase.idle &&
         _phase != SetupPhase.complete &&
         _phase != SetupPhase.error) {
+      Entropy.wipe(bits);
       return; // a run is already in progress
     }
-    _preset = preset;
     _errorMessage = null;
     _clearRecall();
-    final int n = preset.nStages;
+    final int n = bits.length ~/ EncodingConstants.bitsPerPoint;
+    _stageCount = n;
     try {
-      // 1. Fresh entropy root (write-only on memory).
-      final List<int> bits = Entropy.randomBits(preset.entropyBits);
       _entropyBits = bits;
       _points = List<EncodedPoint?>.filled(n, null);
       _reservoirs = List<StageReservoirs?>.filled(n, null);
@@ -525,6 +567,7 @@ class SetupController extends ChangeNotifier {
     }
     _reservoirs = const <StageReservoirs?>[];
     _displayParams = null;
+    _stageCount = 0;
     _core.source.reservoirs?.clear();
     _core.source.reservoirs = null;
     _clearRecall();

@@ -79,6 +79,81 @@ class Bip39 {
     return sha512.convert(data).toString();
   }
 
+  /// Hard cap: 24 words / 256 entropy bits (constants.MAX_ENTROPY_BITS).
+  static const int _maxWords = 24;
+
+  /// Decode a BIP39 mnemonic into its raw **entropy** bits (checksum stripped),
+  /// for the "import an existing seed" path that encodes it onto the chained
+  /// fractals.
+  ///
+  /// Port of `mnemonic_to_bits` (great-wall-core/burning_ship/bip39.py): accepts
+  /// any multiple of 3 words from 3 to 24 — `words/3` stages, `32·words/3`
+  /// entropy bits — so the same sub-standard seeds the partial export can
+  /// produce round-trip back in. The BIP39 checksum is verified.
+  ///
+  /// SECURITY: the mnemonic is coercion-relevant. On bad input this throws a
+  /// [FormatException] whose message is deliberately generic — it never echoes
+  /// the offending word or any seed content (unlike the Python reference), so an
+  /// error surfaced in the UI or a log cannot leak the secret.
+  static List<int> mnemonicToEntropyBits(String mnemonic) {
+    final List<String> words = mnemonic
+        .trim()
+        .toLowerCase()
+        .split(RegExp(r'\s+'))
+        .where((String w) => w.isNotEmpty)
+        .toList();
+    final int n = words.length;
+    if (n == 0 || n % 3 != 0) {
+      throw const FormatException(
+          'A seed phrase must be a multiple of 3 words (3–24).');
+    }
+    if (n > _maxWords) {
+      throw const FormatException(
+          'Too many words: the cap is 24 (256-bit entropy).');
+    }
+
+    final int entropyLen = (n ~/ 3) * 32; // 32 bits per stage
+    final List<int> bits = <int>[];
+    for (final String w in words) {
+      final int idx = _indexOfWord(w);
+      if (idx < 0) {
+        throw const FormatException(
+            'That is not a valid BIP39 seed phrase (unknown word).');
+      }
+      for (int b = _bitsPerWord - 1; b >= 0; b--) {
+        bits.add((idx >> b) & 1);
+      }
+    }
+
+    final List<int> entropy = bits.sublist(0, entropyLen);
+    final List<int> checksum = bits.sublist(entropyLen);
+    final List<int> expected = _checksumBits(entropy);
+    if (!_bitsEqual(checksum, expected)) {
+      throw const FormatException(
+          'Seed phrase checksum is invalid — check for typos.');
+    }
+    return entropy;
+  }
+
+  static const int _bitsPerWord = 11; // log2(2048)
+
+  /// Lazily-built reverse index of the canonical wordlist; `-1` if not present.
+  static Map<String, int>? _wordToIndex;
+  static int _indexOfWord(String word) {
+    final Map<String, int> map = _wordToIndex ??= <String, int>{
+      for (int i = 0; i < bip39English.length; i++) bip39English[i]: i,
+    };
+    return map[word] ?? -1;
+  }
+
+  static bool _bitsEqual(List<int> a, List<int> b) {
+    if (a.length != b.length) return false;
+    for (int i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+
   /// The BIP39 checksum bits for [entropyBits]: the first `len / 32` bits of
   /// `SHA-256(entropy_bytes)`, MSB-first. Mirrors `_checksum_bits` in
   /// great-wall-core/burning_ship/bip39.py.
