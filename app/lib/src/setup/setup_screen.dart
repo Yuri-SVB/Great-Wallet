@@ -100,12 +100,25 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   KeyEventResult _onKey(FocusNode node, KeyEvent event) {
-    if (event is KeyDownEvent &&
-        event.logicalKey == LogicalKeyboardKey.keyS) {
+    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    if (event.logicalKey == LogicalKeyboardKey.keyS) {
       _setSelectMode(!_selectMode);
       return KeyEventResult.handled;
     }
+    if (event.logicalKey == LogicalKeyboardKey.keyR) {
+      _resetView();
+      return KeyEventResult.handled;
+    }
     return KeyEventResult.ignored;
+  }
+
+  /// Recenter the canvas: restore the default position and zoom and the default
+  /// brightness offset, without touching the session or the encoded points.
+  /// Bound to `R` — a quick "I'm lost, take me home" after panning/zooming far.
+  void _resetView() {
+    _viewport.viewport = _initialViewport;
+    _brightness.reset();
+    setState(() {});
   }
 
   /// Toggle select (recall) mode. Entering it snaps the canvas to the stage the
@@ -286,7 +299,7 @@ class _SetupScreenState extends State<SetupScreen> {
           const SizedBox(height: 16),
           const Text(
             'Hold L and scroll over the canvas to adjust brightness; '
-            'scroll to zoom, drag to pan.',
+            'scroll to zoom, drag to pan; press R to recenter.',
             textAlign: TextAlign.center,
           ),
           const SizedBox(height: 24),
