@@ -37,6 +37,10 @@ class GreatWallCoreBindings {
         _lib.lookupFunction<_EncodeResultPointC, _EncodeResultPointDart>(
       'bs_encode_result_point',
     );
+    _encodeResultFinalRect =
+        _lib.lookupFunction<_EncodeResultFinalRectC, _EncodeResultFinalRectDart>(
+      'bs_encode_result_final_rect',
+    );
     _encodeResultFree =
         _lib.lookupFunction<_EncodeResultFreeC, _EncodeResultFreeDart>(
       'bs_encode_result_free',
@@ -45,6 +49,10 @@ class GreatWallCoreBindings {
         _lib.lookupFunction<_DecodeFullC, _DecodeFullDart>('bs_decode_full');
     _argon2Single =
         _lib.lookupFunction<_Argon2SingleC, _Argon2SingleDart>('bs_argon2_single');
+    _argon2idMaster =
+        _lib.lookupFunction<_Argon2idMasterC, _Argon2idMasterDart>(
+      'bs_argon2id_master',
+    );
     _saltPepperCanonicalize =
         _lib.lookupFunction<_SaltPepperCanonicalizeC, _SaltPepperCanonicalizeDart>(
             'bs_salt_pepper_canonicalize');
@@ -85,9 +93,11 @@ class GreatWallCoreBindings {
   late final _RenderViewportGenericDart _renderViewportGeneric;
   late final _EncodeDart _encode;
   late final _EncodeResultPointDart _encodeResultPoint;
+  late final _EncodeResultFinalRectDart _encodeResultFinalRect;
   late final _EncodeResultFreeDart _encodeResultFree;
   late final _DecodeFullDart _decodeFull;
   late final _Argon2SingleDart _argon2Single;
+  late final _Argon2idMasterDart _argon2idMaster;
   late final _SaltPepperCanonicalizeDart _saltPepperCanonicalize;
   late final _ChainInputDart _chainInput;
   late final _EncodeParamsDart _encodeParams;
@@ -186,12 +196,14 @@ class GreatWallCoreBindings {
 
   /// Encode [bits] (a list of 0/1) into a fractal location under [params] and
   /// the perturbation reservoirs `(o, p, q)`. Returns the encoded point as raw
-  /// I4F60 `i64` coordinates.
+  /// I4F60 `i64` coordinates, plus the **leaf rectangle** the bisection settled
+  /// on (its centre is the master-secret export's per-stage coordinate — see
+  /// `MasterSecret.leafCentreRaw`).
   ///
   /// `area` bounds are raw `i64`. The opaque result handle is queried and freed
-  /// internally; only the point is returned (the app does not surface bisection
-  /// steps — that is debug-mode UX territory).
-  ({int reRaw, int imRaw}) encodePoint({
+  /// internally; only the point and leaf rect are returned (the app does not
+  /// surface bisection steps — that is debug-mode UX territory).
+  ({int reRaw, int imRaw, FixedRect leafRect}) encodePoint({
     required List<int> bits,
     required FixedRect area,
     required CoreDiscoveryParams params,
@@ -204,6 +216,11 @@ class GreatWallCoreBindings {
     final (Pointer<Uint8> ppPtr, int ppLen) = _allocAscii(pathPrefix);
     final Pointer<Int64> reOut = calloc<Int64>();
     final Pointer<Int64> imOut = calloc<Int64>();
+    // bs_encode_result_final_rect writes four separate Fixed (i64) out-params.
+    final Pointer<Int64> reMinOut = calloc<Int64>();
+    final Pointer<Int64> reMaxOut = calloc<Int64>();
+    final Pointer<Int64> imMinOut = calloc<Int64>();
+    final Pointer<Int64> imMaxOut = calloc<Int64>();
     try {
       bitsPtr.asTypedList(bits.length).setAll(0, bits);
       final Pointer<Void> handle = _encode(
@@ -231,7 +248,23 @@ class GreatWallCoreBindings {
       }
       try {
         _encodeResultPoint(handle, reOut, imOut);
-        return (reRaw: reOut.value, imRaw: imOut.value);
+        _encodeResultFinalRect(
+          handle,
+          reMinOut,
+          reMaxOut,
+          imMinOut,
+          imMaxOut,
+        );
+        return (
+          reRaw: reOut.value,
+          imRaw: imOut.value,
+          leafRect: FixedRect(
+            reMin: reMinOut.value,
+            reMax: reMaxOut.value,
+            imMin: imMinOut.value,
+            imMax: imMaxOut.value,
+          ),
+        );
       } finally {
         _encodeResultFree(handle);
       }
@@ -240,7 +273,11 @@ class GreatWallCoreBindings {
       if (ppPtr != nullptr) calloc.free(ppPtr);
       calloc
         ..free(reOut)
-        ..free(imOut);
+        ..free(imOut)
+        ..free(reMinOut)
+        ..free(reMaxOut)
+        ..free(imMinOut)
+        ..free(imMaxOut);
     }
   }
 
@@ -337,6 +374,31 @@ class GreatWallCoreBindings {
     } finally {
       _zeroAndFree(inPtr, input.length);
       _zeroAndFree(outPtr, 32);
+    }
+  }
+
+  /// Run the **master-secret export** — one Argon2id pass over the reproducible
+  /// setup-transcript [message] (`bs_argon2id_master`). Uses the fixed master
+  /// profile (Argon2id, `m = 64 MiB`, `t = 8`, `p = 2`) and the fixed salt
+  /// `b"greatwall"`; all per-setup uniqueness rides in [message]. Returns
+  /// [outLen] bytes (the protocol's `l = 1024`); the consumer takes only what it
+  /// needs.
+  ///
+  /// This is a heavy, blocking native call — callers run it off the UI isolate
+  /// (see `GreatWallCore.argon2idMaster`).
+  Uint8List argon2idMaster(Uint8List message, {int outLen = 1024}) {
+    final int inLen = message.isEmpty ? 1 : message.length;
+    final Pointer<Uint8> inPtr = calloc<Uint8>(inLen);
+    final Pointer<Uint8> outPtr = calloc<Uint8>(outLen);
+    try {
+      if (message.isNotEmpty) {
+        inPtr.asTypedList(message.length).setAll(0, message);
+      }
+      _argon2idMaster(inPtr, message.length, outPtr, outLen);
+      return Uint8List.fromList(outPtr.asTypedList(outLen));
+    } finally {
+      _zeroAndFree(inPtr, inLen);
+      _zeroAndFree(outPtr, outLen);
     }
   }
 
@@ -592,6 +654,11 @@ typedef _EncodeResultPointC = Void Function(
 typedef _EncodeResultPointDart = void Function(
   Pointer<Void>, Pointer<Int64>, Pointer<Int64>);
 
+typedef _EncodeResultFinalRectC = Void Function(
+  Pointer<Void>, Pointer<Int64>, Pointer<Int64>, Pointer<Int64>, Pointer<Int64>);
+typedef _EncodeResultFinalRectDart = void Function(
+  Pointer<Void>, Pointer<Int64>, Pointer<Int64>, Pointer<Int64>, Pointer<Int64>);
+
 typedef _EncodeResultFreeC = Void Function(Pointer<Void>);
 typedef _EncodeResultFreeDart = void Function(Pointer<Void>);
 
@@ -620,6 +687,11 @@ typedef _Argon2SingleC = Void Function(
   Pointer<Uint8>, Uint32, Uint8, Pointer<Uint8>);
 typedef _Argon2SingleDart = void Function(
   Pointer<Uint8>, int, int, Pointer<Uint8>);
+
+typedef _Argon2idMasterC = Void Function(
+  Pointer<Uint8>, Uint32, Pointer<Uint8>, Uint32);
+typedef _Argon2idMasterDart = void Function(
+  Pointer<Uint8>, int, Pointer<Uint8>, int);
 
 typedef _SaltPepperCanonicalizeC = Uint32 Function(
   Pointer<Uint8>, Uint32, Pointer<Uint8>, Uint32);

@@ -40,9 +40,25 @@ class _SetupScreenState extends State<SetupScreen> {
   /// to it after the user has been typing in a text field.
   final FocusNode _hotkeys = FocusNode(debugLabel: 'setup-hotkeys');
 
-  /// Descriptive salt for the SHA-512 export at recall (e.g. "main wallet").
-  /// Domain-separates one setup from another — see ARCHITECTURE.md §"Stage 0".
-  final TextEditingController _salt = TextEditingController();
+  /// Per-stage **master-secret export label** (e.g. `SIGNING-1`). Appended to
+  /// the Argon2id transcript message at the exporting stage, versioning the
+  /// derived secret — DESIGN.md §"Master-Secret Export". Same restricted
+  /// `[A-Z0-9-]` widget as Stage 0; shown on every non-0 stage in all modes. A
+  /// single field applies to whichever stage is on screen when Copy is pressed.
+  final TextEditingController _exportLabel = TextEditingController();
+
+  /// True when the last edit to [_exportLabel] had characters up-cased or
+  /// dropped by the engine's canonicalisation (mirrors [_stage0Restricted]).
+  bool _exportLabelRestricted = false;
+
+  void _onExportLabelRestricted({required bool adjusted}) {
+    if (_exportLabelRestricted == adjusted) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _exportLabelRestricted != adjusted) {
+        setState(() => _exportLabelRestricted = adjusted);
+      }
+    });
+  }
 
   /// An existing BIP39 phrase to import instead of generating a fresh root.
   /// Secret material: obscured by default, cleared once it has been encoded.
@@ -91,6 +107,10 @@ class _SetupScreenState extends State<SetupScreen> {
   /// cursor instead of panning. Toggled by the panel button or the `S` key.
   bool _selectMode = false;
 
+  /// True while a master-secret export's Argon2id pass is in flight, so a second
+  /// tap on "Copy master secret" is ignored until it finishes.
+  bool _exporting = false;
+
   @override
   void initState() {
     super.initState();
@@ -111,7 +131,7 @@ class _SetupScreenState extends State<SetupScreen> {
     _viewport.dispose();
     _brightness.dispose();
     _sounds.dispose();
-    _salt.dispose();
+    _exportLabel.dispose();
     _mnemonic.dispose();
     _stage0.dispose();
     _hotkeys.dispose();
@@ -390,6 +410,16 @@ class _SetupScreenState extends State<SetupScreen> {
           else
             ..._memoriseControls(),
 
+          // Stage navigation — available as soon as stages are loaded, in any
+          // mode (generation, import, recall): toggle between loaded stages and
+          // study each under the canvas (zoom / pan / brightness). Stages not
+          // yet reached during a recall walk stay disabled until recalled.
+          if ((hasResult || _setup.phase == SetupPhase.recallComplete) &&
+              _setup.nStages > 1) ...<Widget>[
+            const Divider(height: 32),
+            _stageNav(),
+          ],
+
           const Divider(height: 32),
           // Always available: entering select mode snaps to the next fractal to
           // recall (Stage 0 is text, not selectable), and Reset returns to the
@@ -410,9 +440,19 @@ class _SetupScreenState extends State<SetupScreen> {
               'chain.',
             ),
 
-          // Blind export of the seed recalled so far — available at every stage
-          // once a point has been recalled, not only at the end. Before the
-          // final stage it is a partial, shorter-than-standard seed.
+          // Master-secret export — offered at every non-0 stage in every mode
+          // (generation, import, recall) the moment the stage is resolved, not
+          // only at the end. Exports exactly the prefix fixed so far.
+          if (_setup.canExportMasterAt(_setup.displayStageIndex) &&
+              _setup.phase != SetupPhase.recallComplete) ...<Widget>[
+            const Divider(height: 32),
+            ..._masterExportControls(),
+          ],
+
+          // Blind BIP39 export of the seed recalled so far — recall only (it
+          // needs the decoded points). Available at every recall stage once a
+          // point is back; before the final stage it is a partial,
+          // shorter-than-standard seed.
           if (_setup.canExport &&
               _setup.phase != SetupPhase.recallComplete) ...<Widget>[
             const Divider(height: 32),
@@ -428,7 +468,7 @@ class _SetupScreenState extends State<SetupScreen> {
               style: Theme.of(context).textTheme.bodySmall,
             ),
             const SizedBox(height: 12),
-            ..._exportControls(),
+            _bip39CopyButton(),
           ],
 
           OutlinedButton.icon(
@@ -726,42 +766,12 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   List<Widget> _memoriseControls() {
-    final int idx = _setup.displayStageIndex;
-    final int n = _setup.nStages;
     return <Widget>[
       const Text('Memorise your points'),
-      const SizedBox(height: 8),
-      // Stage 0 is the salt/pepper text (no point); stages 1..N-1 are the
-      // chain-derived fractals, one point each. Step through with the arrows / T.
-      Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: <Widget>[
-          IconButton(
-            tooltip: 'Previous stage',
-            onPressed: idx > 0
-                ? () {
-                    _sounds.play(UiSound.select);
-                    _setup.showStage(idx - 1);
-                  }
-                : null,
-            icon: const Icon(Icons.chevron_left),
-          ),
-          Text(idx == 0
-              ? 'Stage 0 — salt / pepper'
-              : 'Stage $idx / ${n - 1}'),
-          IconButton(
-            tooltip: 'Next stage',
-            onPressed: idx < n - 1
-                ? () {
-                    _sounds.play(UiSound.select);
-                    _setup.showStage(idx + 1);
-                  }
-                : null,
-            icon: const Icon(Icons.chevron_right),
-          ),
-        ],
-      ),
       const SizedBox(height: 16),
+      // Stage 0 is the salt/pepper text (no point); stages 1..N-1 are the
+      // chain-derived fractals, one point each. Step through with the stage
+      // navigator below (or the arrows / T).
       Text(
         'Stage 0 is the salt/pepper you entered; each later stage is its own '
         'fractal carrying one point. Study the marked location on every fractal '
@@ -803,45 +813,138 @@ class _SetupScreenState extends State<SetupScreen> {
         style: Theme.of(context).textTheme.bodySmall,
       ),
       const SizedBox(height: 16),
-      ..._exportControls(),
+      _bip39CopyButton(),
+      const SizedBox(height: 24),
+      ..._masterExportControls(),
       const SizedBox(height: 24),
       FilledButton(onPressed: _reset, child: const Text('Done')),
     ];
   }
 
-  /// The blind-copy affordances (BIP39 phrase + SHA-512(seed + salt)). Shared by
-  /// the per-stage partial export and the recall-complete panel; both operate on
-  /// whatever has been recalled so far via [SetupController.exportMnemonic].
-  List<Widget> _exportControls() {
+  /// Toggle between the **loaded** stages of the active session: Stage 0 (the
+  /// salt/pepper text) plus every fractal already derived — in generation /
+  /// import that is all of them up-front, in a recall walk it grows as points
+  /// come back. Switching stages points the canvas at that fractal so it can be
+  /// studied under focus (zoom / pan / brightness); the arrows are disabled for
+  /// stages not yet reached. Mirrors the `T` hotkey.
+  Widget _stageNav() {
+    final int idx = _setup.displayStageIndex;
+    final int n = _setup.nStages;
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: <Widget>[
+        IconButton(
+          tooltip: 'Previous stage',
+          onPressed: _setup.isStageAvailable(idx - 1) ? () => _goStage(idx - 1) : null,
+          icon: const Icon(Icons.chevron_left),
+        ),
+        Text(idx == 0 ? 'Stage 0 — salt / pepper' : 'Stage $idx / ${n - 1}'),
+        IconButton(
+          tooltip: 'Next stage',
+          onPressed: _setup.isStageAvailable(idx + 1) ? () => _goStage(idx + 1) : null,
+          icon: const Icon(Icons.chevron_right),
+        ),
+      ],
+    );
+  }
+
+  void _goStage(int index) {
+    _sounds.play(UiSound.select);
+    _setup.showStage(index);
+  }
+
+  /// The blind BIP39 seed-phrase copy. Operates on whatever has been recalled so
+  /// far via [SetupController.exportMnemonic]; shown only where a decoded seed
+  /// exists (the recall partial export and the recall-complete panel).
+  Widget _bip39CopyButton() {
+    return OutlinedButton.icon(
+      onPressed: _copyMnemonic,
+      icon: const Icon(Icons.content_copy),
+      label: const Text('Copy seed phrase (BIP39)'),
+    );
+  }
+
+  /// The master-secret export affordances for the **currently displayed** stage:
+  /// an explanation, the optional per-stage export-label field (restricted
+  /// `[A-Z0-9-]`, versioning the key), and the blind copy. The Argon2id pass
+  /// covers stages `1..displayStageIndex` (DESIGN.md §"Master-Secret Export").
+  List<Widget> _masterExportControls() {
+    final int idx = _setup.displayStageIndex;
     return <Widget>[
-      OutlinedButton.icon(
-        onPressed: _copyMnemonic,
-        icon: const Icon(Icons.content_copy),
-        label: const Text('Copy seed phrase (BIP39)'),
-      ),
-      const SizedBox(height: 16),
       Text(
-        'Or, for an app that accepts a non-BIP39 seed, copy '
-        'SHA-512(seed + salt). The salt labels this setup (e.g. "main '
-        'wallet") and keeps it distinct from your others; the long hex '
-        'string is also far harder to memorise by accident.',
+        'Master-secret export',
+        style: Theme.of(context).textTheme.titleMedium,
+      ),
+      const SizedBox(height: 4),
+      Text(
+        'Argon2id over your setup so far (stages 1–$idx). Paste the result into '
+        'another wallet, derive a non-BIP39 secret, or use it as a downstream '
+        'pepper. The optional label versions this key (e.g. SIGNING-1) and is '
+        'mixed into the hash. Copied blind — never shown on screen.',
         style: Theme.of(context).textTheme.bodySmall,
       ),
       const SizedBox(height: 8),
       TextField(
-        controller: _salt,
+        controller: _exportLabel,
+        enabled: !_busy,
+        maxLines: 1,
+        autocorrect: false,
+        enableSuggestions: false,
+        inputFormatters: <TextInputFormatter>[
+          _SaltPepperFormatter(widget.core, _onExportLabelRestricted),
+        ],
         decoration: const InputDecoration(
           isDense: true,
           border: OutlineInputBorder(),
-          labelText: 'Descriptive salt',
-          hintText: 'e.g. main wallet',
+          labelText: 'Export label (optional)',
+          hintText: 'e.g. SIGNING-1',
+          helperText: 'Uppercase letters, digits and hyphens; any length.',
+          helperMaxLines: 2,
         ),
+        style: const TextStyle(
+          fontFamily: GreatWallTypography.fontFamily,
+          fontFamilyFallback: <String>['monospace'],
+        ),
+        onChanged: (_) {
+          _sounds.play(UiSound.click);
+          setState(() {});
+        },
       ),
+      if (_exportLabelRestricted)
+        Padding(
+          padding: const EdgeInsets.only(top: 6),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              Icon(
+                Icons.warning_amber_rounded,
+                size: 16,
+                color: Theme.of(context).colorScheme.error,
+              ),
+              const SizedBox(width: 4),
+              Expanded(
+                child: Text(
+                  'Adjusted to A–Z, 0–9 and "-" so it stays reproducible.',
+                  style: TextStyle(
+                    color: Theme.of(context).colorScheme.error,
+                    fontSize: 12,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
       const SizedBox(height: 8),
       OutlinedButton.icon(
-        onPressed: _copySaltedDigest,
-        icon: const Icon(Icons.content_copy),
-        label: const Text('Copy SHA-512(seed + salt)'),
+        onPressed: (_busy || _exporting) ? null : _copyMasterSecret,
+        icon: _exporting
+            ? const SizedBox(
+                width: 16,
+                height: 16,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              )
+            : const Icon(Icons.content_copy),
+        label: Text(_exporting ? 'Deriving…' : 'Copy master secret'),
       ),
     ];
   }
@@ -860,16 +963,32 @@ class _SetupScreenState extends State<SetupScreen> {
         'clipboard.');
   }
 
-  Future<void> _copySaltedDigest() async {
-    final String? digest = _setup.exportSaltedDigest(_salt.text);
-    if (digest == null) {
+  Future<void> _copyMasterSecret() async {
+    if (_exporting) return;
+    final int idx = _setup.displayStageIndex;
+    setState(() => _exporting = true);
+    // The Argon2id pass runs off the UI isolate, so this awaits; the finally
+    // clears the in-flight flag even if it fails, and we re-check `mounted`
+    // after the await before touching the clipboard or UI.
+    String? secret;
+    try {
+      secret = await _setup.exportMasterSecret(
+        stageIndex: idx,
+        label: _exportLabel.text,
+      );
+    } finally {
+      if (mounted) setState(() => _exporting = false);
+    }
+    if (!mounted) return;
+    if (secret == null) {
       _sounds.play(UiSound.deny);
       return;
     }
-    await Clipboard.setData(ClipboardData(text: digest));
+    await Clipboard.setData(ClipboardData(text: secret));
     if (!mounted) return;
     _sounds.play(UiSound.confirm);
-    _toast('SHA-512 digest copied — paste it, then clear the clipboard.');
+    // Confirmation never echoes the secret itself.
+    _toast('Master secret copied — paste it, then clear the clipboard.');
   }
 
   void _toast(String msg) {
@@ -942,9 +1061,11 @@ class _SetupScreenState extends State<SetupScreen> {
     _viewport.viewport = _initialViewport;
     _mnemonic.clear();
     _stage0.clear();
+    _exportLabel.clear();
     setState(() {
       _selectMode = false;
       _stage0Hidden = true;
+      _exportLabelRestricted = false;
     });
   }
 }

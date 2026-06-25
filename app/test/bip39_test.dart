@@ -2,8 +2,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:great_wallet_app/src/core/bip39.dart';
 
 /// Parity vectors captured from great-wall-core/burning_ship/bip39.py
-/// (`bits_to_mnemonic`) and viewer.py's SHA-512 export. If these match, a seed
-/// phrase exported by the wallet round-trips with the standalone byte-for-byte.
+/// (`bits_to_mnemonic`). If these match, a seed phrase exported by the wallet
+/// round-trips with the standalone byte-for-byte.
 void main() {
   List<int> bitsFromHex(String hex, int nBits) {
     final BigInt v = BigInt.parse(hex, radix: 16);
@@ -83,16 +83,5 @@ void main() {
         throwsArgumentError,
       );
     });
-  });
-
-  test('saltedDigestHex matches great-wall-core SHA-512(mnemonic + salt)', () {
-    const String mnemonic =
-        'abandon abandon abandon abandon abandon abandon abandon abandon '
-        'abandon abandon abandon about';
-    expect(
-      Bip39.saltedDigestHex(mnemonic, 'main wallet'),
-      '219da384b9b82f4d77b87252f5a23b210a36bba9acdd311dfa87073b94baa24d'
-      '3c4c87e30ae0dd45010135111b4a503b7a5837e5c1d85f8cea7696f543ec72f9',
-    );
   });
 }

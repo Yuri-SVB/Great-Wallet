@@ -8,6 +8,7 @@ import '../core/bip39.dart';
 import '../core/encoding_constants.dart';
 import '../core/entropy.dart';
 import '../core/great_wall_core.dart';
+import '../core/master_secret.dart';
 import '../ffi/core_bindings.dart';
 import '../ffi/fixed.dart';
 import '../core/stage_params.dart';
@@ -138,6 +139,19 @@ class SetupController extends ChangeNotifier {
   /// `null`. Every later stage is derived from the text + all preceding points.
   List<StageReservoirs?> _reservoirs = const <StageReservoirs?>[];
 
+  /// Each resolved stage's master-secret export record `(o, p, q, leaf-centre)`;
+  /// index 0 (the text stage) is always `null`. A fractal stage's record exists
+  /// once its **point** is known: at encode time for a fresh/imported setup
+  /// (every stage up-front), or as each point is decoded during a recall walk
+  /// (stages 1..k as they come back). Drives [canExportMasterAt] — see
+  /// [exportMasterSecret] and MasterSecret.
+  List<StageRecord?> _stageRecords = const <StageRecord?>[];
+
+  /// The Argon2 GUI iteration count of the active session — part of the export
+  /// transcript, so it is held for the session and must match across setup and
+  /// recall (see DESIGN.md §"Master-Secret Export").
+  int _iterations = 0;
+
   /// The displayed stage's perturbation as great-wall-ux's display surrogate
   /// (`null` for the Stage-0 text stage). The authoritative reservoirs live on
   /// [GreatWallCore.source]; see CoreEscapeCountSource.reservoirs.
@@ -211,15 +225,66 @@ class SetupController extends ChangeNotifier {
     return mnemonic;
   }
 
-  /// `SHA-512(seed-phrase + salt)` as hex, for target apps that accept a
-  /// non-BIP39 high-entropy seed. The descriptive [salt] domain-separates one
-  /// setup from another, and the 128-hex-char digest is far harder to memorise
-  /// from a stray glance than the word list. Returns null until recall is
-  /// complete. Mirrors great-wall-core's standalone "Salt & SHA512" button.
-  String? exportSaltedDigest(String salt) {
-    final String? mnemonic = exportMnemonic();
-    if (mnemonic == null) return null;
-    return Bip39.saltedDigestHex(mnemonic, salt);
+  /// Whether the **master-secret export** is available at stage [stageIndex].
+  ///
+  /// True for any non-0 stage whose point is resolved (so its export record
+  /// exists) and whose every preceding stage is resolved too — i.e. the prefix
+  /// `1..stageIndex` is complete. For a fresh/imported setup that holds for all
+  /// stages once encoded; during a recall walk it holds for each stage as its
+  /// point is decoded. The export at stage `k` covers exactly that prefix and is
+  /// **not** contingent on later stages (DESIGN.md §"Master-Secret Export":
+  /// available at every non-0 stage).
+  bool canExportMasterAt(int stageIndex) {
+    if (stageIndex < 1 || stageIndex >= _stageRecords.length) return false;
+    for (int k = 1; k <= stageIndex; k++) {
+      if (_stageRecords[k] == null) return false;
+    }
+    return true;
+  }
+
+  /// Run the **master-secret export** at stage [stageIndex] (protocol 0.3.0):
+  /// one Argon2id pass over the reproducible setup transcript of stages
+  /// `1..stageIndex`, with the exporting stage's own [label] appended to the
+  /// message. Returns the conventional 32-hex-char display string, or null if
+  /// the stage is not exportable ([canExportMasterAt]).
+  ///
+  /// This **replaces** the `0.2.0` `SHA512(seed-phrase + salt)` export: the
+  /// transcript (stage-0 text, iteration count, and each stage's params +
+  /// leaf-centre) is an order-preserving function of the setup, so it tolerates
+  /// large peppers/outputs without entropy collapse and reproduces bit-for-bit
+  /// on recovery. It needs only the per-stage params and points the app already
+  /// holds to render the fractals — **not** the plaintext seed — so it honours
+  /// "the master secret is never shown" (the digest goes straight to the
+  /// clipboard, never to the screen).
+  ///
+  /// The heavy Argon2id pass runs off the UI isolate ([GreatWallCore
+  /// .argon2idMaster]). Coercion-relevant intermediates (the transcript message
+  /// and raw output) are wiped before returning.
+  Future<String?> exportMasterSecret({
+    required int stageIndex,
+    required String label,
+  }) async {
+    if (!canExportMasterAt(stageIndex)) return null;
+    final List<StageRecord> records = <StageRecord>[
+      for (int k = 1; k <= stageIndex; k++) _stageRecords[k]!,
+    ];
+    // Canonicalise the label through the engine — the same [A-Z0-9-] rule the
+    // input field enforces — so the transcript byte layout matches the protocol.
+    final Uint8List message = MasterSecret.buildExportTranscript(
+      stage0Text: _chainText,
+      iterations: _iterations,
+      records: records,
+      exportLabel: _core.canonicalizeSaltPepper(label),
+    );
+    final Uint8List raw = await _core.argon2idMaster(
+      message,
+      outLen: MasterSecret.outputBytes,
+    );
+    final String display = MasterSecret.displayHex(raw);
+    // Wipe the coercion-relevant transcript and raw output.
+    message.fillRange(0, message.length, 0);
+    raw.fillRange(0, raw.length, 0);
+    return display;
   }
 
   /// The point markers to overlay for the currently displayed stage: the single
@@ -326,10 +391,12 @@ class SetupController extends ChangeNotifier {
     // Canonicalise through the engine so the stored/displayed text is exactly
     // what gets hashed (the protocol rule lives in core, not here).
     _chainText = _core.canonicalizeSaltPepper(text);
+    _iterations = argon2Iterations;
     try {
       _entropyBits = bits;
       _points = List<EncodedPoint?>.filled(pointStages + 1, null);
       _reservoirs = List<StageReservoirs?>.filled(pointStages + 1, null);
+      _stageRecords = List<StageRecord?>.filled(pointStages + 1, null);
 
       const int bpp = EncodingConstants.bitsPerPoint;
       for (int k = 1; k <= pointStages; k++) {
@@ -368,6 +435,17 @@ class SetupController extends ChangeNotifier {
           q: reservoirs.q,
         );
         _points[k] = pts.first;
+        // Record this stage's export contribution: its params and the centre of
+        // the encoded point's leaf rectangle (DESIGN.md §"Master-Secret Export").
+        final ({int re, int im}) leaf =
+            MasterSecret.leafCentreRaw(pts.first.leafRect);
+        _stageRecords[k] = StageRecord(
+          o: reservoirs.o,
+          p: reservoirs.p,
+          q: reservoirs.q,
+          leafReRaw: leaf.re,
+          leafImRaw: leaf.im,
+        );
         Entropy.wipe(chunk);
         notifyListeners();
       }
@@ -440,8 +518,10 @@ class SetupController extends ChangeNotifier {
     _preset = preset;
     _stageCount = preset.nStages + 1; // Stage-0 text + one per point stage
     _chainText = _core.canonicalizeSaltPepper(text);
+    _iterations = argon2Iterations;
     _points = List<EncodedPoint?>.filled(_stageCount, null);
     _reservoirs = List<StageReservoirs?>.filled(_stageCount, null);
+    _stageRecords = List<StageRecord?>.filled(_stageCount, null);
     try {
       _workingStageIndex = 1;
       _setPhase(SetupPhase.deriving);
@@ -461,8 +541,11 @@ class SetupController extends ChangeNotifier {
       _argon2Job = job;
       final StageReservoirs reservoirs = await job.result;
       _argon2Job = null;
-      // Land on Stage 1, ready for the first select-mode click.
+      // Land on Stage 1, ready for the first select-mode click. Store the
+      // reservoirs into the per-stage slot too, so stage navigation can revisit
+      // this fractal once it is reached (its export record waits on the click).
       _recallReservoirs = reservoirs;
+      _reservoirs[1] = reservoirs;
       _applyReservoirs(1, reservoirs);
       _selectedMark = null;
       _isRecallSession = true;
@@ -538,10 +621,23 @@ class SetupController extends ChangeNotifier {
     _selectedMark = (re: selection.re, im: selection.im);
     notifyListeners();
 
+    // This stage's master-secret export record is now known: its reservoirs and
+    // the centre of the decoded point's leaf rectangle. Recording it makes the
+    // export available at this stage (and keeps the running prefix exportable).
+    final ({int re, int im}) leaf = MasterSecret.leafCentreRaw(result.leafRect);
+    final StageRecord record = StageRecord(
+      o: r.o,
+      p: r.p,
+      q: r.q,
+      leafReRaw: leaf.re,
+      leafImRaw: leaf.im,
+    );
+
     if (k == nStages - 1) {
       // Final fractal recalled: reconstruct the full entropy root. No further
       // derivation — there is no next fractal to form.
       _recalledChunks.add(result.bits);
+      _stageRecords[k] = record;
       _recalledEntropyBits = <int>[
         for (final List<int> chunk in _recalledChunks) ...chunk,
       ];
@@ -576,9 +672,13 @@ class SetupController extends ChangeNotifier {
       _argon2Job = null;
       Entropy.wipe(priorPointBits);
 
-      // Commit: record this stage's point and advance to the new fractal.
+      // Commit: record this stage's point and export record, and advance to the
+      // new fractal. Store the next stage's reservoirs into the per-stage slot
+      // too, so stage navigation can revisit either fractal once reached.
       _recalledChunks.add(result.bits);
+      _stageRecords[k] = record;
       _recallReservoirs = reservoirs;
+      _reservoirs[k + 1] = reservoirs;
       _applyReservoirs(k + 1, reservoirs);
       _selectedMark = null;
       _setPhase(SetupPhase.memorise);
@@ -611,6 +711,16 @@ class SetupController extends ChangeNotifier {
     if (_selectedMark == null) return;
     _selectedMark = null;
     notifyListeners();
+  }
+
+  /// Whether stage [index] can currently be shown: the Stage-0 text stage, or a
+  /// fractal already derived this session. In generation / import every stage is
+  /// available once the setup is encoded; during a recall walk it becomes
+  /// available as its fractal is reached. Drives the stage-navigation arrows.
+  bool isStageAvailable(int index) {
+    if (index < 0 || index >= nStages) return false;
+    if (index == 0) return true;
+    return index < _reservoirs.length && _reservoirs[index] != null;
   }
 
   /// Switch the displayed stage during memorisation. Only stages that can be
@@ -691,6 +801,8 @@ class SetupController extends ChangeNotifier {
       r?.clear();
     }
     _reservoirs = const <StageReservoirs?>[];
+    _stageRecords = const <StageRecord?>[];
+    _iterations = 0;
     _displayParams = null;
     _stageCount = 0;
     _chainText = '';
