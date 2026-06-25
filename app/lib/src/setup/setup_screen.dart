@@ -371,18 +371,23 @@ class _SetupScreenState extends State<SetupScreen> {
       });
       return KeyEventResult.handled;
     }
-    if (event.logicalKey == LogicalKeyboardKey.keyR) {
-      _resetView();
-      return KeyEventResult.handled;
-    }
     // C — focus the colour wheel (then ← → cycle hues).
     if (event.logicalKey == LogicalKeyboardKey.keyC) {
       _focusField(_hueFocus, 'colour wheel');
       return KeyEventResult.handled;
     }
-    if (event.logicalKey == LogicalKeyboardKey.keyT) {
-      _sounds.play(UiSound.select);
-      _setup.cycleStage();
+    // N / I / R — choose the source on the config screen (New seed / Import /
+    // Recall). No-op once a session is running.
+    if (event.logicalKey == LogicalKeyboardKey.keyN) {
+      _setSource(_SourceMode.fresh);
+      return KeyEventResult.handled;
+    }
+    if (event.logicalKey == LogicalKeyboardKey.keyI) {
+      _setSource(_SourceMode.import);
+      return KeyEventResult.handled;
+    }
+    if (event.logicalKey == LogicalKeyboardKey.keyR) {
+      _setSource(_SourceMode.recall);
       return KeyEventResult.handled;
     }
     // K — derive and copy the exported master secret ("the key") for the stage
@@ -409,17 +414,22 @@ class _SetupScreenState extends State<SetupScreen> {
       _sounds.play(UiSound.deny);
       return;
     }
-    if (index == _setup.displayStageIndex) return; // already here — no-op
+    if (index == _setup.displayStageIndex) {
+      // Re-selecting the current stage zooms to its point (if any).
+      _focusPoint(index);
+      return;
+    }
     if (index < 0 || index >= _setup.nStages) {
       _sounds.play(UiSound.deny);
       _toast('This setup has ${_setup.nStages - 1} stage'
           '${_setup.nStages - 1 == 1 ? '' : 's'} (0–${_setup.nStages - 1}).');
       return;
     }
-    // Already derived (or the Stage-0 text) — just focus it.
+    // Already derived (or the Stage-0 text) — focus it and recenter the view.
     if (_setup.isStageAvailable(index)) {
       _sounds.play(UiSound.select);
       _setup.showStage(index);
+      _recenter();
       return;
     }
     // Not derived yet because generation is still running in the background —
@@ -455,8 +465,8 @@ class _SetupScreenState extends State<SetupScreen> {
     switch (outcome) {
       case DeriveOutcome.derived:
         _sounds.play(UiSound.select);
-        _toast('Stage ${_setup.displayStageIndex}/${_setup.nStages - 1} '
-            'derived — recall your point.');
+        _recenter(); // land centred on the fresh fractal
+        _toast('Stage ${_setup.displayStageIndex} derived — recall your point.');
       case DeriveOutcome.noPriorPoint:
         _sounds.play(UiSound.deny);
         _toast('Select your point on the previous stage first.');
@@ -476,13 +486,43 @@ class _SetupScreenState extends State<SetupScreen> {
     return c.findAncestorWidgetOfExactType<EditableText>() != null;
   }
 
-  /// Recenter the canvas: restore the default position and zoom and the default
-  /// brightness offset, without touching the session or the encoded points.
-  /// Bound to `R` — a quick "I'm lost, take me home" after panning/zooming far.
-  void _resetView() {
-    _sounds.play(UiSound.click);
+  /// Soft-coded target: a focused point's leaf should occupy this fraction of
+  /// the view's (shorter-axis) span — half by default.
+  static const double _kFocusLeafRatio = 0.5;
+
+  /// Recenter the canvas to the default position/zoom and reset brightness,
+  /// without touching the session. Triggered automatically on arriving at a
+  /// stage (the old `R` behaviour, now folded into stage selection).
+  void _recenter() {
     _viewport.viewport = _initialViewport;
     _brightness.reset();
+    setState(() {});
+  }
+
+  /// Zoom-to-fit the point of [index] ("focus"): centre on its coordinates and
+  /// set the zoom so the leaf's largest dimension is [_kFocusLeafRatio] of the
+  /// view's shorter-axis span. No-op (deny) if that stage has no point.
+  void _focusPoint(int index) {
+    final ({double re, double im, double leafW, double leafH})? t =
+        _setup.focusTargetAt(index);
+    if (t == null) {
+      _sounds.play(UiSound.deny);
+      _toast('No point on Stage $index to focus yet.');
+      return;
+    }
+    final double leafMax = math.max(t.leafW, t.leafH);
+    final FractalViewport cur = _viewport.viewport;
+    // half-extent is half the shorter-axis span; choose it so leafMax /
+    // (2*halfExtent) == ratio. Fall back to the current zoom if the leaf size is
+    // unknown.
+    final double half =
+        leafMax > 0 ? leafMax / (2 * _kFocusLeafRatio) : cur.halfExtent;
+    _sounds.play(UiSound.select);
+    _viewport.viewport = cur.copyWith(
+      centreRe: t.re,
+      centreIm: t.im,
+      halfExtent: half,
+    );
     setState(() {});
   }
 
@@ -688,8 +728,8 @@ class _SetupScreenState extends State<SetupScreen> {
   static const List<String> _manualLines = <String>[
     'Alt+M  minimize / restore the console and the stage-tab bar',
     'H  show / hide this manual',
-    'R  recenter the canvas      T  cycle through stages',
-    '0–8  jump to that stage (tab or number key)',
+    '0–8  go to that stage (recenters); press again to zoom to its point',
+    'N / I / R  New seed / Import / Recall (config screen)',
     'K  copy the master secret ("the key") for the focused stage',
     'C  focus the colour wheel, then ← → to cycle hues',
     'Alt+S salt/pepper   Alt+N iterations   Alt+G stages   Alt+P profile',
@@ -975,6 +1015,15 @@ class _SetupScreenState extends State<SetupScreen> {
     );
   }
 
+  /// Choose the config source (New seed / Import / Recall) — from the segmented
+  /// button or the N / I / R hotkeys. Only meaningful on the config screen.
+  void _setSource(_SourceMode mode) {
+    if (_hasSession) return;
+    _sounds.play(UiSound.click);
+    setState(() => _source = mode);
+    _toast(_sourceBlurb(mode));
+  }
+
   /// One-line description of a source mode, shown in the console when selected
   /// (instead of an inline paragraph in the panel).
   String _sourceBlurb(_SourceMode mode) {
@@ -1004,13 +1053,8 @@ class _SetupScreenState extends State<SetupScreen> {
               value: _SourceMode.recall, label: Text('Recall')),
         ],
         selected: <_SourceMode>{_source},
-        onSelectionChanged: _busy
-            ? null
-            : (Set<_SourceMode> s) {
-                _sounds.play(UiSound.click);
-                setState(() => _source = s.first);
-                _toast(_sourceBlurb(s.first)); // explanation goes to the console
-              },
+        onSelectionChanged:
+            _busy ? null : (Set<_SourceMode> s) => _setSource(s.first),
       ),
       const SizedBox(height: 16),
       if (_source == _SourceMode.import)
@@ -1169,25 +1213,11 @@ class _SetupScreenState extends State<SetupScreen> {
     );
   }
 
-  /// The obscured BIP39 import field plus a live word-count hint. The phrase is
-  /// secret, so the field is blind (asterisks) by default with an eye toggle;
-  /// it is never echoed back anywhere else.
+  /// The obscured BIP39 import field. The phrase is secret, so the field is
+  /// blind (asterisks) by default with an eye toggle; it is never echoed back.
+  /// The instruction and live word-count are shown in the console on focus
+  /// ([_fieldHelp]).
   List<Widget> _mnemonicInput() {
-    final int words = _mnemonic.text
-        .trim()
-        .split(RegExp(r'\s+'))
-        .where((String w) => w.isNotEmpty)
-        .length;
-    final bool standard = <int>{12, 15, 18, 21, 24}.contains(words);
-    final String hint;
-    if (words == 0) {
-      hint = 'Type or paste your seed phrase.';
-    } else if (words % 3 != 0 || words > 24) {
-      hint = '$words words — must be a multiple of 3 (3–24).';
-    } else {
-      hint = '$words words → ${words ~/ 3} stages'
-          '${standard ? "" : " (sub-standard length)"}.';
-    }
     return <Widget>[
       _track(
         _Field.mnemonic,
@@ -1204,9 +1234,6 @@ class _SetupScreenState extends State<SetupScreen> {
             border: const OutlineInputBorder(),
             labelText: 'Import phrase (BIP39)',
             hintText: 'word1 word2 …',
-            // Live word-count validity stays inline (it is status, not a label).
-            helperText: hint,
-            helperMaxLines: 2,
             suffixIcon: IconButton(
               tooltip: _mnemonicHidden ? 'Show phrase' : 'Hide phrase',
               icon: Icon(
@@ -1630,8 +1657,21 @@ class _SetupScreenState extends State<SetupScreen> {
         return 'Stage 0 salt/pepper: seeds the fractal chain. A public label or '
             'a secret pasted pepper (uppercase letters, digits, hyphen).';
       case _Field.mnemonic:
-        return 'Import phrase: an existing BIP39 mnemonic to encode onto the '
-            'fractals (kept hidden).';
+        final int wc = _mnemonic.text
+            .trim()
+            .split(RegExp(r'\s+'))
+            .where((String w) => w.isNotEmpty)
+            .length;
+        if (wc == 0) {
+          return 'Import phrase: type or paste your existing BIP39 seed phrase '
+              '(kept hidden).';
+        }
+        if (wc % 3 != 0 || wc > 24) {
+          return 'Import phrase: $wc words — must be a multiple of 3 (3–24).';
+        }
+        final bool standard = <int>{12, 15, 18, 21, 24}.contains(wc);
+        return 'Import phrase: $wc words → ${wc ~/ 3} stages'
+            '${standard ? '' : ' (sub-standard length)'}.';
       case _Field.exportLabel:
         return 'Export label: versions the derived master secret (uppercase '
             'letters, digits, hyphen).';

@@ -185,6 +185,12 @@ class SetupController extends ChangeNotifier {
   /// [exportMasterSecret] and MasterSecret.
   List<StageRecord?> _stageRecords = const <StageRecord?>[];
 
+  /// Each resolved stage's leaf rectangle (the small region the point sits in),
+  /// kept so the UI can zoom-to-fit a point ("focus"). Set at encode time for a
+  /// generated/imported setup and as each point is decoded during a recall walk;
+  /// index 0 is always null.
+  List<FixedRect?> _leafRects = const <FixedRect?>[];
+
   /// The Argon2 GUI iteration count of the active session — part of the export
   /// transcript, so it is held for the session and must match across setup and
   /// recall (see DESIGN.md §"Master-Secret Export").
@@ -260,6 +266,37 @@ class SetupController extends ChangeNotifier {
 
   /// Points selected on the stage currently displayed (0 or 1).
   int get selectedCount => selectedMarkAt(_displayStageIndex) == null ? 0 : 1;
+
+  /// The point + leaf geometry to zoom-to ("focus") for stage [index], or null
+  /// if that stage has no point yet. Uses the encoded point of a generated /
+  /// imported setup, or the recalled mark of a recall walk; the leaf width/height
+  /// are in fractal units (0 if the leaf rect is unknown). Stage 0 has no point.
+  ({double re, double im, double leafW, double leafH})? focusTargetAt(
+      int index) {
+    if (index < 1) return null;
+    double? re;
+    double? im;
+    if (index < _points.length && _points[index] != null) {
+      re = fixedToDouble(_points[index]!.reRaw);
+      im = fixedToDouble(_points[index]!.imRaw);
+    } else {
+      final ({double re, double im})? mark = selectedMarkAt(index);
+      if (mark != null) {
+        re = mark.re;
+        im = mark.im;
+      }
+    }
+    if (re == null || im == null) return null;
+    final FixedRect? rect =
+        (index < _leafRects.length) ? _leafRects[index] : null;
+    double leafW = 0;
+    double leafH = 0;
+    if (rect != null) {
+      leafW = (fixedToDouble(rect.reMax) - fixedToDouble(rect.reMin)).abs();
+      leafH = (fixedToDouble(rect.imMax) - fixedToDouble(rect.imMin)).abs();
+    }
+    return (re: re, im: im, leafW: leafW, leafH: leafH);
+  }
 
   /// Points required to complete a stage — always one under the chained
   /// protocol (one point = one stage).
@@ -490,6 +527,7 @@ class SetupController extends ChangeNotifier {
       _points = List<EncodedPoint?>.filled(pointStages + 1, null);
       _reservoirs = List<StageReservoirs?>.filled(pointStages + 1, null);
       _stageRecords = List<StageRecord?>.filled(pointStages + 1, null);
+      _leafRects = List<FixedRect?>.filled(pointStages + 1, null);
       // Sized for the in-session practice recall (clicking your points back on
       // the already-derived fractals); empty until a point is marked.
       _selectedChunks = List<List<int>?>.filled(pointStages + 1, null);
@@ -597,6 +635,7 @@ class SetupController extends ChangeNotifier {
       q: reservoirs.q,
     );
     _points[k] = pts.first;
+    _leafRects[k] = pts.first.leafRect;
     // Record this stage's export contribution: its params and the centre of
     // the encoded point's leaf rectangle (DESIGN.md §"Master-Secret Export").
     final ({int re, int im}) leaf =
@@ -698,6 +737,7 @@ class SetupController extends ChangeNotifier {
     _points = List<EncodedPoint?>.filled(_stageCount, null);
     _reservoirs = List<StageReservoirs?>.filled(_stageCount, null);
     _stageRecords = List<StageRecord?>.filled(_stageCount, null);
+    _leafRects = List<FixedRect?>.filled(_stageCount, null);
     _selectedChunks = List<List<int>?>.filled(_stageCount, null);
     _selectedMarks = List<({double re, double im})?>.filled(_stageCount, null);
     try {
@@ -813,6 +853,7 @@ class SetupController extends ChangeNotifier {
     // Record this stage's point and its master-secret export record (its
     // reservoirs + the centre of the decoded point's leaf rectangle).
     _selectedMarks[k] = (re: selection.re, im: selection.im);
+    if (k < _leafRects.length) _leafRects[k] = result.leafRect;
     _setSelectedChunk(k, result.bits);
     final ({int re, int im}) leaf = MasterSecret.leafCentreRaw(result.leafRect);
     _stageRecords[k] = StageRecord(
@@ -919,6 +960,7 @@ class SetupController extends ChangeNotifier {
       _selectedChunks[j] = null;
       _selectedMarks[j] = null;
       _stageRecords[j] = null;
+      _leafRects[j] = null;
     }
     final List<int>? rec = _recalledEntropyBits;
     if (rec != null) Entropy.wipe(rec);
@@ -1045,6 +1087,7 @@ class SetupController extends ChangeNotifier {
     }
     _reservoirs = const <StageReservoirs?>[];
     _stageRecords = const <StageRecord?>[];
+    _leafRects = const <FixedRect?>[];
     _iterations = 0;
     _displayParams = null;
     _stageCount = 0;
