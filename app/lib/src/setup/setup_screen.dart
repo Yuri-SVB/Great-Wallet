@@ -297,15 +297,15 @@ class _SetupScreenState extends State<SetupScreen> {
                             right: 0,
                             child: _stageTabs(),
                           ),
-                        // When minimized, the console floats as a thin bar at the
-                        // foot of the viewer instead of taking its own row.
-                        if (_chromeMinimized)
-                          Positioned(
-                            bottom: 0,
-                            left: 0,
-                            right: 0,
-                            child: _console(),
-                          ),
+                        // The console always floats over the foot of the viewer
+                        // (expanded or as a thin minimized bar) — it never takes
+                        // a layout row, so the view is never squeezed.
+                        Positioned(
+                          bottom: 0,
+                          left: 0,
+                          right: 0,
+                          child: _console(),
+                        ),
                       ],
                     ),
                   ),
@@ -314,9 +314,6 @@ class _SetupScreenState extends State<SetupScreen> {
               ],
             ),
           ),
-          // Expanded: the console takes the foot row. Minimized: it floats over
-          // the canvas (above), leaving the view unsqueezed.
-          if (!_chromeMinimized) _console(),
         ],
       ),
       ),
@@ -754,9 +751,9 @@ class _SetupScreenState extends State<SetupScreen> {
     'L+scroll brightness · scroll zoom · drag pan (over the canvas)',
   ];
 
-  /// Terminal palette: saturated green text on black.
+  /// Terminal palette: fully-saturated green on black.
   static const Color _kConsoleBg = Color(0xFF000000);
-  static const Color _kConsoleFg = Color(0xFF35FF6A);
+  static const Color _kConsoleFg = Color(0xFF00FF00);
   static const TextStyle _termStyle = TextStyle(
     color: _kConsoleFg,
     fontFamily: GreatWallTypography.fontFamily,
@@ -1074,10 +1071,17 @@ class _SetupScreenState extends State<SetupScreen> {
             _busy ? null : (Set<_SourceMode> s) => _setSource(s.first),
       ),
       const SizedBox(height: 16),
-      if (_source == _SourceMode.import)
-        ..._mnemonicInput()
-      else
-        ..._stagesInput(),
+      // Keep the source-specific input the same height (the import field vs the
+      // stages slider) so switching New seed / Import / Recall does not shift the
+      // controls below it. Each builder returns a single widget.
+      SizedBox(
+        height: 56,
+        child: Align(
+          child: _source == _SourceMode.import
+              ? _mnemonicInput().single
+              : _stagesInput().single,
+        ),
+      ),
       const SizedBox(height: 16),
       ..._stage0Input(),
       const SizedBox(height: 16),
