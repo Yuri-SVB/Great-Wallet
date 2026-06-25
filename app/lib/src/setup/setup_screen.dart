@@ -443,16 +443,10 @@ class _SetupScreenState extends State<SetupScreen> {
       _focusField(_exportLabelFocus, 'export label');
       return KeyEventResult.handled;
     }
-    // A — abort an in-progress derivation (foreground Stage-1 or background
-    // generation of later stages). (TLP solving will hook in here too.)
+    // A — abort an in-progress derivation, behind a console confirmation
+    // (foreground Stage-1 or background generation). TLP solving hooks in later.
     if (event.logicalKey == LogicalKeyboardKey.keyA) {
-      if (_busy || _setup.isGenerating) {
-        _sounds.play(UiSound.click);
-        _setup.requestStop();
-        _toast('Derivation aborted.');
-      } else {
-        _sounds.play(UiSound.deny);
-      }
+      _abortDerivation();
       return KeyEventResult.handled;
     }
     // Z — reset, behind a console confirmation so a stray keypress cannot wipe a
@@ -728,27 +722,38 @@ class _SetupScreenState extends State<SetupScreen> {
     _toast(msg);
   }
 
-  /// Confirm a point re-selection that will discard the later fractals already
-  /// derived from this stage. The confirmation is shown **inline in the
-  /// console** (not a modal dialog); the returned future completes when the user
-  /// presses one of the console's action buttons.
-  Future<bool> _confirmReselect() {
+  /// Show an inline console confirmation and complete with the user's choice
+  /// when they press a button. Shared by every confirm flow (re-derive, abort,
+  /// reset). Ensures the console is expanded so the prompt is visible.
+  Future<bool> _consoleConfirm({
+    required String message,
+    required String confirmLabel,
+    String cancelLabel = 'Cancel',
+  }) {
     final Completer<bool> completer = Completer<bool>();
-    // If one is already pending (shouldn't happen), decline it first.
-    _resolvePrompt(false);
+    _resolvePrompt(false); // decline any already-pending prompt first
     setState(() {
       _chromeMinimized = false; // make sure the prompt is visible
       _prompt = _ConsolePrompt(
-        message: 'Re-derive later stages? This stage already has a point and '
-            'later stages were derived from it. Choosing a new point discards '
-            'those later stages — you will re-derive and re-select them.',
-        confirmLabel: 'Discard & re-select',
-        cancelLabel: 'Cancel',
+        message: message,
+        confirmLabel: confirmLabel,
+        cancelLabel: cancelLabel,
         completer: completer,
       );
     });
     return completer.future;
   }
+
+  /// Confirm a point re-selection that will discard the later fractals already
+  /// derived from this stage. The confirmation is shown **inline in the
+  /// console** (not a modal dialog); the returned future completes when the user
+  /// presses one of the console's action buttons.
+  Future<bool> _confirmReselect() => _consoleConfirm(
+        message: 'Re-derive later stages? This stage already has a point and '
+            'later stages were derived from it. Choosing a new point discards '
+            'those later stages — you will re-derive and re-select them.',
+        confirmLabel: 'Discard & re-select',
+      );
 
   Widget _progressOverlay() {
     final String stageLabel =
@@ -901,27 +906,34 @@ class _SetupScreenState extends State<SetupScreen> {
           ],
         ),
         Divider(height: 1, color: _kConsoleFg.withOpacity(0.4)),
+        // Live region — pinned above the scroll so a confirmation prompt or the
+        // focused-field help is always visible (never scrolled behind the
+        // manual).
+        if (_prompt != null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+            child: _consolePromptBlock(),
+          ),
+        if (_prompt == null && _focusedField != null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                const Icon(Icons.info_outline, size: 14),
+                const SizedBox(width: 6),
+                Expanded(child: Text(_fieldHelp(_focusedField!))),
+              ],
+            ),
+          ),
         ConstrainedBox(
-          constraints: const BoxConstraints(maxHeight: 200),
+          constraints: const BoxConstraints(maxHeight: 180),
           child: SingleChildScrollView(
             reverse: true,
             padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: <Widget>[
-                if (_prompt != null) _consolePromptBlock(),
-                if (_focusedField != null)
-                  Padding(
-                    padding: const EdgeInsets.only(bottom: 6),
-                    child: Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: <Widget>[
-                        const Icon(Icons.info_outline, size: 14),
-                        const SizedBox(width: 6),
-                        Expanded(child: Text(_fieldHelp(_focusedField!))),
-                      ],
-                    ),
-                  ),
                 for (final String line in _consoleLog) Text('› $line'),
                 if (_manualVisible) ...<Widget>[
                   const SizedBox(height: 8),
@@ -1834,19 +1846,30 @@ class _SetupScreenState extends State<SetupScreen> {
   /// Reset behind an inline console confirmation, so the Z hotkey (or a stray
   /// keypress) cannot discard a setup by accident.
   Future<void> _confirmReset() async {
-    final Completer<bool> completer = Completer<bool>();
-    _resolvePrompt(false); // clear any other pending prompt first
-    setState(() {
-      _chromeMinimized = false; // make sure the prompt is visible
-      _prompt = _ConsolePrompt(
-        message: 'Reset and discard the current setup? Un-memorised points and '
-            'any entered text will be lost.',
-        confirmLabel: 'Reset',
-        cancelLabel: 'Cancel',
-        completer: completer,
-      );
-    });
-    if (await completer.future && mounted) _reset();
+    final bool ok = await _consoleConfirm(
+      message: 'Reset and discard the current setup? Un-memorised points and '
+          'any entered text will be lost.',
+      confirmLabel: 'Reset',
+    );
+    if (ok && mounted) _reset();
+  }
+
+  /// Abort a running derivation behind a console confirmation (the A hotkey).
+  /// No-op with a deny cue when nothing is deriving.
+  Future<void> _abortDerivation() async {
+    if (!_busy && !_setup.isGenerating) {
+      _sounds.play(UiSound.deny);
+      return;
+    }
+    final bool ok = await _consoleConfirm(
+      message: 'Abort the running derivation? Progress on the current stage is '
+          'lost (stages already derived are kept).',
+      confirmLabel: 'Abort',
+    );
+    if (ok && mounted && (_busy || _setup.isGenerating)) {
+      _setup.requestStop();
+      _toast('Derivation aborted.');
+    }
   }
 
   void _reset() {
