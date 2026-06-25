@@ -264,21 +264,20 @@ class _SetupScreenState extends State<SetupScreen> {
       onKeyEvent: _onKey,
       child: Column(
         children: <Widget>[
-          // Upper edge: a fixed, full-width bar of stage tabs (0..8). Always
-          // present; unreachable tabs are greyed but stay in place. Tap or press
-          // 0–8 to jump. Hidden along with the console when the chrome is
-          // minimized.
-          if (!_chromeMinimized) _stageTabs(),
           Expanded(
             child: Row(
               children: <Widget>[
                 Expanded(
-                  // Clicking anywhere on the canvas returns keyboard focus to the
-                  // hotkey handler, so the shortcuts work again after the user
-                  // has been typing in a text field (salt, seed phrase). Listener
-                  // is passive — it does not interfere with the canvas's own
-                  // pan/zoom/select.
-                  child: Listener(
+                  child: Column(
+                    children: <Widget>[
+                      // Stage tabs span only the fractal-view width and sit just
+                      // above the canvas, so the right panel keeps full height.
+                      if (!_chromeMinimized) _stageTabs(),
+                      Expanded(
+                        // Clicking anywhere on the canvas returns keyboard focus
+                        // to the hotkey handler, so shortcuts work again after
+                        // typing in a text field. The Listener is passive.
+                        child: Listener(
                     onPointerDown: (_) => _hotkeys.requestFocus(),
                     child: Stack(
                       children: <Widget>[
@@ -299,7 +298,10 @@ class _SetupScreenState extends State<SetupScreen> {
                       ],
                     ),
                   ),
-                ),
+                        ),
+                      ],
+                    ),
+                  ),
                 SizedBox(width: 260, child: _controlPanel(hasResult)),
               ],
             ),
@@ -313,7 +315,7 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   /// The upper-edge stage tabs: a **fixed** bar of nine numbered tabs (0..8,
-  /// the protocol ceiling) that always span the full width. Stage 0 is the
+  /// the protocol ceiling) spanning the fractal-view width. Stage 0 is the
   /// salt/pepper text; 1..N-1 are the chain-derived fractals. The stage under
   /// focus is highlighted; tabs that are not currently reachable — outside this
   /// setup's stage count, not yet derived, or before any session — stay visible
@@ -865,8 +867,6 @@ class _SetupScreenState extends State<SetupScreen> {
       padding: const EdgeInsets.all(16),
       child: ListView(
         children: <Widget>[
-          Text('Setup', style: Theme.of(context).textTheme.titleLarge),
-          const Divider(height: 24),
 
           if (_setup.phase == SetupPhase.recallComplete)
             ..._recallCompleteControls()
@@ -975,11 +975,26 @@ class _SetupScreenState extends State<SetupScreen> {
     );
   }
 
+  /// One-line description of a source mode, shown in the console when selected
+  /// (instead of an inline paragraph in the panel).
+  String _sourceBlurb(_SourceMode mode) {
+    switch (mode) {
+      case _SourceMode.fresh:
+        return 'New seed: generate fresh entropy and encode it onto the '
+            'fractals to memorise.';
+      case _SourceMode.import:
+        return 'Import: encode an existing BIP39 phrase onto the fractals.';
+      case _SourceMode.recall:
+        return 'Recall: enter the same salt, number of stages and Argon2 '
+            'settings, then click your memorised point on each stage. Nothing '
+            'is encoded — the seed is rebuilt from your clicks.';
+    }
+  }
+
   List<Widget> _configControls() {
     return <Widget>[
-      const Text('Source'),
-      const SizedBox(height: 4),
       SegmentedButton<_SourceMode>(
+        showSelectedIcon: false,
         segments: const <ButtonSegment<_SourceMode>>[
           ButtonSegment<_SourceMode>(
               value: _SourceMode.fresh, label: Text('New seed')),
@@ -994,23 +1009,14 @@ class _SetupScreenState extends State<SetupScreen> {
             : (Set<_SourceMode> s) {
                 _sounds.play(UiSound.click);
                 setState(() => _source = s.first);
+                _toast(_sourceBlurb(s.first)); // explanation goes to the console
               },
       ),
       const SizedBox(height: 16),
       if (_source == _SourceMode.import)
         ..._mnemonicInput()
-      else ...<Widget>[
-        if (_source == _SourceMode.recall) ...<Widget>[
-          Text(
-            'Recall an existing setup: enter the same salt, number of stages and '
-            'Argon2 settings you used, then click your memorised point on each '
-            'stage. Nothing is encoded — the seed is rebuilt from your clicks.',
-            style: Theme.of(context).textTheme.bodySmall,
-          ),
-          const SizedBox(height: 8),
-        ],
+      else
         ..._stagesInput(),
-      ],
       const SizedBox(height: 16),
       ..._stage0Input(),
       const SizedBox(height: 16),
