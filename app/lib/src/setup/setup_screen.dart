@@ -820,9 +820,15 @@ class _SetupScreenState extends State<SetupScreen> {
     'L+scroll brightness · scroll zoom · drag pan (over the canvas)',
   ];
 
-  /// Terminal palette: fully-saturated green on black.
-  static const Color _kConsoleBg = Color(0xFF000000);
-  static const Color _kConsoleFg = Color(0xFF00FF00);
+  /// Console palette: "Gunmetal" — a cool, near-neutral blue-grey, translucent
+  /// over the canvas so the fractal faintly bleeds through. The slight blue cast
+  /// (channels offset a few levels from pure grey) reads as a *material* rather
+  /// than an abstract flat grey; it stays unsaturated enough to sit neutrally
+  /// against all six fractal hue schemes. See great-wall-ux/SCOPE.md
+  /// §"Console palette" for the rationale.
+  static const Color _kConsoleBg = Color(0xE6131519); // ~90% opaque gunmetal
+  static const Color _kConsoleFg = Color(0xFFE9EDF2); // cool off-white
+  static const Color _kConsoleAccent = Color(0xFFB8C2CC); // brighter, same cast
   static const TextStyle _termStyle = TextStyle(
     color: _kConsoleFg,
     fontFamily: GreatWallTypography.fontFamily,
@@ -843,8 +849,8 @@ class _SetupScreenState extends State<SetupScreen> {
     return Material(
       color: _kConsoleBg,
       child: DecoratedBox(
-        decoration: const BoxDecoration(
-          border: Border(top: BorderSide(color: _kConsoleFg)),
+        decoration: BoxDecoration(
+          border: Border(top: BorderSide(color: _kConsoleAccent.withOpacity(0.35))),
         ),
         child: SafeArea(
           top: false,
@@ -896,7 +902,8 @@ class _SetupScreenState extends State<SetupScreen> {
             const Icon(Icons.terminal),
             const SizedBox(width: 8),
             Text('Console',
-                style: _termStyle.copyWith(fontWeight: FontWeight.bold)),
+                style: _termStyle.copyWith(
+                    color: _kConsoleAccent, fontWeight: FontWeight.bold)),
             const Spacer(),
             IconButton(
               tooltip: _manualVisible ? 'Hide manual (H)' : 'Show manual (H)',
@@ -912,7 +919,7 @@ class _SetupScreenState extends State<SetupScreen> {
             ),
           ],
         ),
-        Divider(height: 1, color: _kConsoleFg.withOpacity(0.4)),
+        Divider(height: 1, color: _kConsoleAccent.withOpacity(0.25)),
         // Live region — pinned above the scroll so a confirmation prompt or the
         // focused-field help is always visible (never scrolled behind the
         // manual).
@@ -945,7 +952,8 @@ class _SetupScreenState extends State<SetupScreen> {
                 if (_manualVisible) ...<Widget>[
                   const SizedBox(height: 8),
                   Text('Hotkeys',
-                      style: _termStyle.copyWith(fontWeight: FontWeight.bold)),
+                      style: _termStyle.copyWith(
+                          color: _kConsoleAccent, fontWeight: FontWeight.bold)),
                   const SizedBox(height: 2),
                   for (final String line in _manualLines) Text(line),
                 ],
