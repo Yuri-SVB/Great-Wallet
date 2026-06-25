@@ -393,15 +393,15 @@ class _SetupScreenState extends State<SetupScreen> {
     // N / I / R — choose the source on the config screen (New seed / Import /
     // Recall). No-op once a session is running.
     if (event.logicalKey == LogicalKeyboardKey.keyN) {
-      _setSource(_SourceMode.fresh);
+      _setSource(_SourceMode.fresh, focusInput: true);
       return KeyEventResult.handled;
     }
     if (event.logicalKey == LogicalKeyboardKey.keyI) {
-      _setSource(_SourceMode.import);
+      _setSource(_SourceMode.import, focusInput: true);
       return KeyEventResult.handled;
     }
     if (event.logicalKey == LogicalKeyboardKey.keyR) {
-      _setSource(_SourceMode.recall);
+      _setSource(_SourceMode.recall, focusInput: true);
       return KeyEventResult.handled;
     }
     // K — derive and copy the exported master secret ("the key") for the stage
@@ -743,7 +743,7 @@ class _SetupScreenState extends State<SetupScreen> {
     'Alt+M  minimize / restore the console and the stage-tab bar',
     'H  show / hide this manual',
     '0–8  go to that stage (recenters); press again to zoom to its point',
-    'N / I / R  New seed / Import / Recall (config screen)',
+    'N / I / R  New seed / Import / Recall (also focuses its input)',
     'K  copy the master secret ("the key") for the focused stage',
     'C  focus the colour wheel, then ← → to cycle hues',
     'Alt+S salt/pepper   Alt+N iterations   Alt+G stages   Alt+P profile',
@@ -1031,11 +1031,20 @@ class _SetupScreenState extends State<SetupScreen> {
 
   /// Choose the config source (New seed / Import / Recall) — from the segmented
   /// button or the N / I / R hotkeys. Only meaningful on the config screen.
-  void _setSource(_SourceMode mode) {
+  void _setSource(_SourceMode mode, {bool focusInput = false}) {
     if (_hasSession) return;
     _sounds.play(UiSound.click);
     setState(() => _source = mode);
     _toast(_sourceBlurb(mode));
+    if (focusInput) {
+      // Jump straight to the mode's primary input (the import field, or the
+      // stages slider for New seed / Recall) once the rebuild has placed it.
+      final FocusNode node =
+          mode == _SourceMode.import ? _mnemonicFocus : _stagesFocus;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && node.context != null) node.requestFocus();
+      });
+    }
   }
 
   /// One-line description of a source mode, shown in the console when selected
@@ -1130,25 +1139,39 @@ class _SetupScreenState extends State<SetupScreen> {
     return <Widget>[
       _track(
         _Field.stages,
-        Slider(
-          focusNode: _stagesFocus,
-          value: n.toDouble(),
-          min: 0,
-          max: maxN.toDouble(),
-          divisions: maxN,
-          label: '$n',
-          onChanged: _busy
-              ? null
-              : (double v) {
-                  final int next = v.round();
-                  if (next == _pointStages) return;
-                  _sounds.play(UiSound.click);
-                  setState(() => _pointStages = next);
-                },
+        Row(
+          children: <Widget>[
+            _sliderLabel('Stages'),
+            Expanded(
+              child: Slider(
+                focusNode: _stagesFocus,
+                value: n.toDouble(),
+                min: 0,
+                max: maxN.toDouble(),
+                divisions: maxN,
+                label: '$n',
+                onChanged: _busy
+                    ? null
+                    : (double v) {
+                        final int next = v.round();
+                        if (next == _pointStages) return;
+                        _sounds.play(UiSound.click);
+                        setState(() => _pointStages = next);
+                      },
+              ),
+            ),
+          ],
         ),
       ),
     ];
   }
+
+  /// A fixed-width label placed to the left of a slider, so the label adds no
+  /// vertical height (layout stays put) and never shifts horizontally.
+  Widget _sliderLabel(String text) => SizedBox(
+        width: 58,
+        child: Text(text, style: Theme.of(context).textTheme.labelMedium),
+      );
 
   /// Free numeric input for **N**, the per-stage Argon2 iteration count. The
   /// range is essentially 0..∞ — a deliberately heavy setup may take hours,
@@ -1215,21 +1238,28 @@ class _SetupScreenState extends State<SetupScreen> {
     // label still shows it on drag.
     return _track(
       _Field.profile,
-      Slider(
-        focusNode: _profileFocus,
-        value: idx.toDouble(),
-        min: 0,
-        max: (_profiles.length - 1).toDouble(),
-        divisions: _profiles.length - 1,
-        label: _profileLabels[idx],
-        onChanged: _busy
-            ? null
-            : (double v) {
-                final Argon2Profile next = _profiles[v.round()];
-                if (next == _profile) return;
-                _sounds.play(UiSound.click);
-                setState(() => _profile = next);
-              },
+      Row(
+        children: <Widget>[
+          _sliderLabel('Memory'),
+          Expanded(
+            child: Slider(
+              focusNode: _profileFocus,
+              value: idx.toDouble(),
+              min: 0,
+              max: (_profiles.length - 1).toDouble(),
+              divisions: _profiles.length - 1,
+              label: _profileLabels[idx],
+              onChanged: _busy
+                  ? null
+                  : (double v) {
+                      final Argon2Profile next = _profiles[v.round()];
+                      if (next == _profile) return;
+                      _sounds.play(UiSound.click);
+                      setState(() => _profile = next);
+                    },
+            ),
+          ),
+        ],
       ),
     );
   }
