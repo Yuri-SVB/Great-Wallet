@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:great_wall_ux/great_wall_ux.dart';
@@ -129,6 +131,28 @@ class _SetupScreenState extends State<SetupScreen> {
   /// tap on "Copy master secret" is ignored until it finishes.
   bool _exporting = false;
 
+  // --- Bottom console ---------------------------------------------------------
+  // The console at the foot of the screen is the app's single message surface:
+  // toasts, the help text of whatever control is under focus, and confirmation
+  // prompts all land here instead of as SnackBars / modal dialogs.
+
+  /// Recent console lines, most recent last (capped).
+  final List<String> _consoleLog = <String>[];
+
+  /// Help text for the control currently under focus, shown in the console.
+  String? _focusHelp;
+
+  /// Whether the hotkey manual is shown in the console. On at launch.
+  bool _manualVisible = true;
+
+  /// Whether the console and the stage-tab bar are collapsed to a thin status
+  /// line. Toggled by the console's button (and, later, a hotkey).
+  bool _chromeMinimized = false;
+
+  /// A confirmation awaiting an inline answer in the console (replaces modal
+  /// dialogs). Resolved by the console's action buttons.
+  _ConsolePrompt? _prompt;
+
   @override
   void initState() {
     super.initState();
@@ -144,6 +168,10 @@ class _SetupScreenState extends State<SetupScreen> {
 
   @override
   void dispose() {
+    // Release any awaiter blocked on an unanswered console prompt.
+    if (_prompt != null && !_prompt!.completer.isCompleted) {
+      _prompt!.completer.complete(false);
+    }
     _setup.removeListener(_onSetupChanged);
     _setup.dispose();
     _viewport.dispose();
@@ -180,8 +208,9 @@ class _SetupScreenState extends State<SetupScreen> {
         children: <Widget>[
           // Upper edge: a fixed, full-width bar of stage tabs (0..8). Always
           // present; unreachable tabs are greyed but stay in place. Tap or press
-          // 0–8 to jump.
-          _stageTabs(),
+          // 0–8 to jump. Hidden along with the console when the chrome is
+          // minimized.
+          if (!_chromeMinimized) _stageTabs(),
           Expanded(
             child: Row(
               children: <Widget>[
@@ -217,6 +246,8 @@ class _SetupScreenState extends State<SetupScreen> {
               ],
             ),
           ),
+          // Foot of the screen: the console (single message surface).
+          _console(),
         ],
       ),
     );
@@ -507,36 +538,29 @@ class _SetupScreenState extends State<SetupScreen> {
         msg = null;
     }
     if (msg == null) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(duration: const Duration(milliseconds: 1100), content: Text(msg)),
-    );
+    _toast(msg);
   }
 
   /// Confirm a point re-selection that will discard the later fractals already
-  /// derived from this stage. Returns true if the user chooses to proceed.
-  Future<bool> _confirmReselect() async {
-    final bool? ok = await showDialog<bool>(
-      context: context,
-      builder: (BuildContext context) => AlertDialog(
-        title: const Text('Re-derive later stages?'),
-        content: const Text(
-          'This stage already has a selected point, and later stages were '
-          'derived from it. Choosing a new point here discards those later '
-          'stages — you will re-derive and re-select them.',
-        ),
-        actions: <Widget>[
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(false),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.of(context).pop(true),
-            child: const Text('Discard & re-select'),
-          ),
-        ],
-      ),
-    );
-    return ok ?? false;
+  /// derived from this stage. The confirmation is shown **inline in the
+  /// console** (not a modal dialog); the returned future completes when the user
+  /// presses one of the console's action buttons.
+  Future<bool> _confirmReselect() {
+    final Completer<bool> completer = Completer<bool>();
+    // If one is already pending (shouldn't happen), decline it first.
+    _resolvePrompt(false);
+    setState(() {
+      _chromeMinimized = false; // make sure the prompt is visible
+      _prompt = _ConsolePrompt(
+        message: 'Re-derive later stages? This stage already has a point and '
+            'later stages were derived from it. Choosing a new point discards '
+            'those later stages — you will re-derive and re-select them.',
+        confirmLabel: 'Discard & re-select',
+        cancelLabel: 'Cancel',
+        completer: completer,
+      );
+    });
+    return completer.future;
   }
 
   Widget _progressOverlay() {
@@ -577,6 +601,184 @@ class _SetupScreenState extends State<SetupScreen> {
             ],
           ],
         ),
+      ),
+    );
+  }
+
+  // --- Console ----------------------------------------------------------------
+
+  /// The hotkey manual, shown in the console (on by default at launch, toggled
+  /// with `H`). Lists every shortcut the setup screen handles.
+  static const List<String> _manualLines = <String>[
+    '`  minimize / restore the console and the stage-tab bar',
+    'H  show / hide this manual',
+    'R  recenter the canvas      T  cycle through stages',
+    '0–8  jump to that stage (tab or number key)',
+    'K  copy the master secret ("the key") for the focused stage',
+    'Alt+S salt/pepper   Alt+N iterations   Alt+G stages   Alt+P profile',
+    'Alt+I import phrase   Alt+L export label',
+    'L+scroll brightness · scroll zoom · drag pan (over the canvas)',
+  ];
+
+  /// The bottom console — the single surface for toasts, focus help, and inline
+  /// confirmations. Collapses to a one-line status bar when minimized.
+  Widget _console() {
+    final ColorScheme scheme = Theme.of(context).colorScheme;
+    final String status = _prompt != null
+        ? _prompt!.message
+        : _focusHelp ?? (_consoleLog.isEmpty ? 'Ready.' : _consoleLog.last);
+    return Material(
+      color: scheme.surface,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          border: Border(top: BorderSide(color: scheme.outlineVariant)),
+        ),
+        child: SafeArea(
+          top: false,
+          child: _chromeMinimized
+              ? _consoleStatusBar(status, scheme)
+              : _consoleExpanded(scheme),
+        ),
+      ),
+    );
+  }
+
+  /// The collapsed console: one status line plus a restore button.
+  Widget _consoleStatusBar(String status, ColorScheme scheme) {
+    return Row(
+      children: <Widget>[
+        const SizedBox(width: 12),
+        Icon(Icons.terminal, size: 16, color: scheme.onSurfaceVariant),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            status,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+        ),
+        IconButton(
+          tooltip: 'Restore console (`)',
+          icon: const Icon(Icons.keyboard_arrow_up),
+          onPressed: () => setState(() => _chromeMinimized = false),
+        ),
+      ],
+    );
+  }
+
+  /// The expanded console: header, optional inline prompt, focus help, the
+  /// recent log, and the optional hotkey manual.
+  Widget _consoleExpanded(ColorScheme scheme) {
+    final TextStyle? mono = Theme.of(context).textTheme.bodySmall?.copyWith(
+          fontFamily: GreatWallTypography.fontFamily,
+          fontFamilyFallback: const <String>['monospace'],
+        );
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        // Header.
+        Row(
+          children: <Widget>[
+            const SizedBox(width: 12),
+            Icon(Icons.terminal, size: 16, color: scheme.onSurfaceVariant),
+            const SizedBox(width: 8),
+            Text('Console', style: Theme.of(context).textTheme.labelLarge),
+            const Spacer(),
+            IconButton(
+              tooltip: _manualVisible ? 'Hide manual (H)' : 'Show manual (H)',
+              icon: Icon(_manualVisible ? Icons.help : Icons.help_outline),
+              onPressed: () => setState(() => _manualVisible = !_manualVisible),
+            ),
+            IconButton(
+              tooltip: 'Minimize console & tabs (`)',
+              icon: const Icon(Icons.keyboard_arrow_down),
+              onPressed: () => setState(() => _chromeMinimized = true),
+            ),
+          ],
+        ),
+        const Divider(height: 1),
+        ConstrainedBox(
+          constraints: const BoxConstraints(maxHeight: 200),
+          child: SingleChildScrollView(
+            reverse: true,
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: <Widget>[
+                if (_prompt != null) _consolePromptBlock(scheme),
+                if (_focusHelp != null)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 6),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: <Widget>[
+                        Icon(Icons.info_outline,
+                            size: 14, color: scheme.onSurfaceVariant),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: Text(_focusHelp!,
+                              style: Theme.of(context).textTheme.bodySmall),
+                        ),
+                      ],
+                    ),
+                  ),
+                for (final String line in _consoleLog)
+                  Text('› $line', style: mono),
+                if (_manualVisible) ...<Widget>[
+                  const SizedBox(height: 8),
+                  Text('Hotkeys',
+                      style: Theme.of(context).textTheme.labelMedium),
+                  const SizedBox(height: 2),
+                  for (final String line in _manualLines)
+                    Text(line, style: mono),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// The inline confirmation block (replaces modal dialogs): the prompt message
+  /// plus Cancel / Confirm buttons that complete the pending future.
+  Widget _consolePromptBlock(ColorScheme scheme) {
+    final _ConsolePrompt p = _prompt!;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(8),
+      decoration: BoxDecoration(
+        color: scheme.secondaryContainer,
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: scheme.outline),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          Text(
+            p.message,
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: scheme.onSecondaryContainer,
+                ),
+          ),
+          const SizedBox(height: 8),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: <Widget>[
+              TextButton(
+                onPressed: () => _resolvePrompt(false),
+                child: Text(p.cancelLabel),
+              ),
+              const SizedBox(width: 8),
+              FilledButton(
+                onPressed: () => _resolvePrompt(true),
+                child: Text(p.confirmLabel),
+              ),
+            ],
+          ),
+        ],
       ),
     );
   }
@@ -789,20 +991,24 @@ class _SetupScreenState extends State<SetupScreen> {
             '${n * 3} BIP39 words.';
     return <Widget>[
       Text('Number of stages: $n'),
-      Slider(
-        value: n.toDouble(),
-        min: 0,
-        max: maxN.toDouble(),
-        divisions: maxN,
-        label: '$n',
-        onChanged: _busy
-            ? null
-            : (double v) {
-                final int next = v.round();
-                if (next == _pointStages) return;
-                _sounds.play(UiSound.click);
-                setState(() => _pointStages = next);
-              },
+      _withHelp(
+        'Number of stages (0–8): how many fractal points your seed has. '
+        '0 = Stage-0 text only; 8 = 24 words / 256 bits.',
+        Slider(
+          value: n.toDouble(),
+          min: 0,
+          max: maxN.toDouble(),
+          divisions: maxN,
+          label: '$n',
+          onChanged: _busy
+              ? null
+              : (double v) {
+                  final int next = v.round();
+                  if (next == _pointStages) return;
+                  _sounds.play(UiSound.click);
+                  setState(() => _pointStages = next);
+                },
+        ),
       ),
       Text(summary, style: Theme.of(context).textTheme.bodySmall),
     ];
@@ -821,30 +1027,34 @@ class _SetupScreenState extends State<SetupScreen> {
     return <Widget>[
       const Text('Argon2 iterations (N)'),
       const SizedBox(height: 4),
-      TextField(
-        controller: _iterationsField,
-        enabled: !_busy,
-        maxLines: 1,
-        keyboardType: TextInputType.number,
-        inputFormatters: <TextInputFormatter>[
-          FilteringTextInputFormatter.digitsOnly,
-          LengthLimitingTextInputFormatter(12),
-        ],
-        decoration: InputDecoration(
-          isDense: true,
-          border: const OutlineInputBorder(),
-          hintText: 'e.g. 1',
-          helperText: 'Per-stage Argon2 passes — no upper limit; a high N can '
-              'take hours, days, even weeks to derive.',
-          helperMaxLines: 2,
-          errorText: invalid ? 'Enter a whole number (0 or more).' : null,
+      _withHelp(
+        'Argon2 iterations (N): per-stage memory-hard passes. Unbounded — a '
+        'higher N means a longer, stronger derivation (hours to weeks).',
+        TextField(
+          controller: _iterationsField,
+          enabled: !_busy,
+          maxLines: 1,
+          keyboardType: TextInputType.number,
+          inputFormatters: <TextInputFormatter>[
+            FilteringTextInputFormatter.digitsOnly,
+            LengthLimitingTextInputFormatter(12),
+          ],
+          decoration: InputDecoration(
+            isDense: true,
+            border: const OutlineInputBorder(),
+            hintText: 'e.g. 1',
+            helperText: 'Per-stage Argon2 passes — no upper limit; a high N can '
+                'take hours, days, even weeks to derive.',
+            helperMaxLines: 2,
+            errorText: invalid ? 'Enter a whole number (0 or more).' : null,
+          ),
+          onChanged: (_) {
+            _sounds.play(UiSound.click);
+            final int? v = int.tryParse(_iterationsField.text.trim());
+            if (v != null && v >= 0) _iterations = v;
+            setState(() {});
+          },
         ),
-        onChanged: (_) {
-          _sounds.play(UiSound.click);
-          final int? v = int.tryParse(_iterationsField.text.trim());
-          if (v != null && v >= 0) _iterations = v;
-          setState(() {});
-        },
       ),
     ];
   }
@@ -867,26 +1077,30 @@ class _SetupScreenState extends State<SetupScreen> {
   /// iteration-count (N) field.
   Widget _argon2ProfileSlider() {
     final int idx = _profiles.indexOf(_profile).clamp(0, _profiles.length - 1);
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: <Widget>[
-        Text('Argon2 profile: ${_profileLabels[idx]}'),
-        Slider(
-          value: idx.toDouble(),
-          min: 0,
-          max: (_profiles.length - 1).toDouble(),
-          divisions: _profiles.length - 1,
-          label: _profileLabels[idx],
-          onChanged: _busy
-              ? null
-              : (double v) {
-                  final Argon2Profile next = _profiles[v.round()];
-                  if (next == _profile) return;
-                  _sounds.play(UiSound.click);
-                  setState(() => _profile = next);
-                },
-        ),
-      ],
+    return _withHelp(
+      'Argon2 profile: memory per pass — Basic 1 GiB, Advanced 32 GiB, '
+      'Great Wall 128 GiB. Higher resists parallel attack harder.',
+      Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          Text('Argon2 profile: ${_profileLabels[idx]}'),
+          Slider(
+            value: idx.toDouble(),
+            min: 0,
+            max: (_profiles.length - 1).toDouble(),
+            divisions: _profiles.length - 1,
+            label: _profileLabels[idx],
+            onChanged: _busy
+                ? null
+                : (double v) {
+                    final Argon2Profile next = _profiles[v.round()];
+                    if (next == _profile) return;
+                    _sounds.play(UiSound.click);
+                    setState(() => _profile = next);
+                  },
+          ),
+        ],
+      ),
     );
   }
 
@@ -1283,10 +1497,52 @@ class _SetupScreenState extends State<SetupScreen> {
     _toast('Key copied — paste it, then clear the clipboard.');
   }
 
+  /// Append a line to the console log (the app's toast surface).
   void _toast(String msg) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(duration: const Duration(milliseconds: 1400), content: Text(msg)),
+    if (!mounted) return;
+    setState(() {
+      _consoleLog.add(msg);
+      if (_consoleLog.length > 50) _consoleLog.removeRange(0, _consoleLog.length - 50);
+    });
+  }
+
+  /// Set the focus-help line when a control gains focus. Deferred to a
+  /// post-frame callback so it never runs mid-build (focus changes fire during
+  /// layout).
+  void _gainHelp(String help) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _focusHelp == help) return;
+      setState(() => _focusHelp = help);
+    });
+  }
+
+  /// Clear the focus-help line when a control loses focus — but only if it is
+  /// still showing this control's help (so the gain of the next control wins
+  /// regardless of callback order).
+  void _loseHelp(String help) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _focusHelp != help) return;
+      setState(() => _focusHelp = null);
+    });
+  }
+
+  /// Wrap [child] so that, while it (or a descendant, e.g. a text field) holds
+  /// focus, [help] is shown in the console. The wrapper is not itself a tab stop.
+  Widget _withHelp(String help, Widget child) {
+    return Focus(
+      canRequestFocus: false,
+      skipTraversal: true,
+      onFocusChange: (bool has) => has ? _gainHelp(help) : _loseHelp(help),
+      child: child,
     );
+  }
+
+  /// Answer the pending console confirmation, completing its future.
+  void _resolvePrompt(bool ok) {
+    final _ConsolePrompt? p = _prompt;
+    if (p == null) return;
+    setState(() => _prompt = null);
+    if (!p.completer.isCompleted) p.completer.complete(ok);
   }
 
   Future<void> _start() async {
@@ -1350,6 +1606,7 @@ class _SetupScreenState extends State<SetupScreen> {
 
   void _reset() {
     _sounds.play(UiSound.click);
+    _resolvePrompt(false); // drop any pending console confirmation
     _setup.reset();
     _brightness.reset();
     _viewport.viewport = _initialViewport;
@@ -1368,6 +1625,22 @@ class _SetupScreenState extends State<SetupScreen> {
 /// imported BIP39 phrase, or a cold-start recall of an existing setup (derive
 /// from the salt and reconstruct the seed from the user's clicks).
 enum _SourceMode { fresh, import, recall }
+
+/// A confirmation rendered inline in the console (instead of a modal dialog).
+/// The console's action buttons complete [completer] with the user's choice.
+class _ConsolePrompt {
+  _ConsolePrompt({
+    required this.message,
+    required this.confirmLabel,
+    required this.cancelLabel,
+    required this.completer,
+  });
+
+  final String message;
+  final String confirmLabel;
+  final String cancelLabel;
+  final Completer<bool> completer;
+}
 
 /// Maps the number-row and numpad digit keys 0..8 to a stage index, so pressing
 /// a number focuses that stage (when no text field holds the keystroke). 9 is
