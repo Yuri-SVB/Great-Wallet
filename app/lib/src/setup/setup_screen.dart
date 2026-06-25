@@ -424,6 +424,25 @@ class _SetupScreenState extends State<SetupScreen> {
       _setSource(_SourceMode.recall, focusInput: true);
       return KeyEventResult.handled;
     }
+    // Field focus (uniform coverage): S salt · P profile · D derivation steps ·
+    // X export label. Each no-ops with a console note if its field is not in the
+    // current mode.
+    if (event.logicalKey == LogicalKeyboardKey.keyS) {
+      _focusField(_stage0Focus, 'salt / pepper');
+      return KeyEventResult.handled;
+    }
+    if (event.logicalKey == LogicalKeyboardKey.keyP) {
+      _focusField(_profileFocus, 'Argon2 profile');
+      return KeyEventResult.handled;
+    }
+    if (event.logicalKey == LogicalKeyboardKey.keyD) {
+      _focusField(_iterationsFocus, 'derivation steps');
+      return KeyEventResult.handled;
+    }
+    if (event.logicalKey == LogicalKeyboardKey.keyX) {
+      _focusField(_exportLabelFocus, 'export label');
+      return KeyEventResult.handled;
+    }
     // K — derive and copy the exported master secret ("the key") for the stage
     // under focus.
     if (event.logicalKey == LogicalKeyboardKey.keyK) {
@@ -765,9 +784,9 @@ class _SetupScreenState extends State<SetupScreen> {
     'H  show / hide this manual      M  minimize / restore chrome',
     '0–8  go to that stage (recenters); press again to zoom to its point',
     'N / I / R  New seed / Import / Recall (also focuses its input)',
+    'S salt · P profile · D derivation steps · X export label · C colour',
     'Enter  start (Generate / Encode / Begin recall) from a field',
     'K  copy the master secret ("the key") for the focused stage',
-    'C  focus the colour wheel, then ← → to cycle hues',
     'L+scroll brightness · scroll zoom · drag pan (over the canvas)',
   ];
 
@@ -1235,8 +1254,8 @@ class _SetupScreenState extends State<SetupScreen> {
           decoration: InputDecoration(
             isDense: true,
             border: const OutlineInputBorder(),
-            labelText: 'N',
-            hintText: 'iterations, e.g. 1',
+            labelText: 'Derivation steps between stages',
+            hintText: 'e.g. 1',
             errorText: invalid ? 'Enter a whole number (0 or more).' : null,
           ),
           onChanged: (_) {
@@ -1686,8 +1705,9 @@ class _SetupScreenState extends State<SetupScreen> {
             '8 = 24 words / 256 bits. ← → or drag to change.';
       case _Field.iterations:
         final String n = _iterationsField.text.trim();
-        return 'Argon2 iterations N = ${n.isEmpty ? '—' : n} (0…∞). Higher = a '
-            'longer, stronger derivation (hours to weeks).';
+        return 'Derivation steps between stages (Argon2 N) = '
+            '${n.isEmpty ? '—' : n} (0…∞). Higher = a longer, stronger '
+            'derivation (hours to weeks).';
       case _Field.profile:
         final int idx =
             _profiles.indexOf(_profile).clamp(0, _profiles.length - 1);
