@@ -731,31 +731,7 @@ class _SetupScreenState extends State<SetupScreen> {
       const SizedBox(height: 16),
       ..._stage0Input(),
       const SizedBox(height: 16),
-      const Text('Argon2 profile'),
-      DropdownButton<Argon2Profile>(
-        isExpanded: true,
-        value: _profile,
-        onChanged: _busy
-            ? null
-            : (Argon2Profile? v) {
-                _sounds.play(UiSound.click);
-                setState(() => _profile = v ?? _profile);
-              },
-        items: const <DropdownMenuItem<Argon2Profile>>[
-          DropdownMenuItem<Argon2Profile>(
-            value: Argon2Profile.basic,
-            child: Text('Basic (1 GiB)'),
-          ),
-          DropdownMenuItem<Argon2Profile>(
-            value: Argon2Profile.advanced,
-            child: Text('Advanced (32 GiB)'),
-          ),
-          DropdownMenuItem<Argon2Profile>(
-            value: Argon2Profile.greatWall,
-            child: Text('Great Wall (128 GiB)'),
-          ),
-        ],
-      ),
+      _argon2ProfileSlider(),
       const SizedBox(height: 16),
       ..._iterationsInput(),
       const SizedBox(height: 16),
@@ -859,6 +835,47 @@ class _SetupScreenState extends State<SetupScreen> {
         },
       ),
     ];
+  }
+
+  /// The three Argon2 memory profiles in ascending cost, paired with their
+  /// slider labels (`Argon2Profile` order == ascending GiB).
+  static const List<Argon2Profile> _profiles = <Argon2Profile>[
+    Argon2Profile.basic,
+    Argon2Profile.advanced,
+    Argon2Profile.greatWall,
+  ];
+  static const List<String> _profileLabels = <String>[
+    'Basic — 1 GiB',
+    'Advanced — 32 GiB',
+    'Great Wall — 128 GiB',
+  ];
+
+  /// The Argon2 memory profile, chosen on a three-stop slider rather than a
+  /// dropdown so the memory cost reads as one escalating axis next to the
+  /// iteration-count (N) field.
+  Widget _argon2ProfileSlider() {
+    final int idx = _profiles.indexOf(_profile).clamp(0, _profiles.length - 1);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        Text('Argon2 profile: ${_profileLabels[idx]}'),
+        Slider(
+          value: idx.toDouble(),
+          min: 0,
+          max: (_profiles.length - 1).toDouble(),
+          divisions: _profiles.length - 1,
+          label: _profileLabels[idx],
+          onChanged: _busy
+              ? null
+              : (double v) {
+                  final Argon2Profile next = _profiles[v.round()];
+                  if (next == _profile) return;
+                  _sounds.play(UiSound.click);
+                  setState(() => _profile = next);
+                },
+        ),
+      ],
+    );
   }
 
   /// The obscured BIP39 import field plus a live word-count hint. The phrase is
