@@ -236,7 +236,7 @@ class _SetupScreenState extends State<SetupScreen> {
                   index: i,
                   selected: i == current,
                   available: _setup.isStageAvailable(i),
-                  onTap: () => _goToStageByNumber(i),
+                  onTap: () => _selectStage(i),
                 ),
               ),
           ],
@@ -269,37 +269,72 @@ class _SetupScreenState extends State<SetupScreen> {
       if (!_busy) _copyMasterSecret();
       return KeyEventResult.handled;
     }
-    // 0–8 — jump focus to that stage (if available; otherwise a deny cue).
+    // 0–8 — select that stage: focus it, or derive it if it is next.
     final int? digit = _digitKeys[event.logicalKey];
     if (digit != null) {
-      _goToStageByNumber(digit);
+      _selectStage(digit);
       return KeyEventResult.handled;
     }
     return KeyEventResult.ignored;
   }
 
-  /// Focus stage [index] if it exists and is available (Stage 0, or a fractal
-  /// already derived). Otherwise sound a deny cue and flag why — the stage is
-  /// out of range for this setup, or not yet reached in the recall walk.
-  void _goToStageByNumber(int index) {
-    if (!_hasSession) {
+  /// Select stage [index]: focus it if it is already available (Stage 0, or a
+  /// fractal already derived), or — if it is the first not-yet-derived stage —
+  /// trigger that stage's derivation. Anything else (out of range, or a gap
+  /// beyond the next stage) sounds a deny cue and explains why.
+  void _selectStage(int index) {
+    if (_busy || !_hasSession) {
       _sounds.play(UiSound.deny);
       return;
     }
     if (index == _setup.displayStageIndex) return; // already here — no-op
-    if (index >= _setup.nStages) {
+    if (index < 0 || index >= _setup.nStages) {
       _sounds.play(UiSound.deny);
       _toast('This setup has ${_setup.nStages - 1} stage'
           '${_setup.nStages - 1 == 1 ? '' : 's'} (0–${_setup.nStages - 1}).');
       return;
     }
-    if (!_setup.isStageAvailable(index)) {
-      _sounds.play(UiSound.deny);
-      _toast('Stage $index is not available yet — recall up to it first.');
+    // Already derived (or the Stage-0 text) — just focus it.
+    if (_setup.isStageAvailable(index)) {
+      _sounds.play(UiSound.select);
+      _setup.showStage(index);
       return;
     }
-    _sounds.play(UiSound.select);
-    _setup.showStage(index);
+    // Not derived. Only the very next stage can be derived, and only once the
+    // previous stage carries a selected point.
+    if (index != _setup.firstUnderivedStage) {
+      _sounds.play(UiSound.deny);
+      _toast('Recall the earlier stages first.');
+      return;
+    }
+    if (!_setup.hasSelectedPoint(index - 1)) {
+      _sounds.play(UiSound.deny);
+      _toast('Select your point on Stage ${index - 1} first.');
+      return;
+    }
+    _deriveNextStage();
+  }
+
+  /// Derive the next stage's fractal (the explicit chain-advance step). Shows the
+  /// progress overlay while the Argon2 pass runs, then lands on the new fractal.
+  Future<void> _deriveNextStage() async {
+    final DeriveOutcome outcome = await _setup.deriveNextStage(
+      argon2Iterations: _iterations,
+      profile: _profile,
+    );
+    if (!mounted) return;
+    switch (outcome) {
+      case DeriveOutcome.derived:
+        _sounds.play(UiSound.select);
+        _toast('Stage ${_setup.displayStageIndex}/${_setup.nStages - 1} '
+            'derived — recall your point.');
+      case DeriveOutcome.noPriorPoint:
+        _sounds.play(UiSound.deny);
+        _toast('Select your point on the previous stage first.');
+      case DeriveOutcome.none:
+      case DeriveOutcome.busy:
+        break;
+    }
   }
 
   /// Whether the keyboard focus is currently inside an editable text field, so
@@ -417,31 +452,65 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   Future<void> _onCanvasSelect(FractalSelection sel) async {
-    final SelectionOutcome outcome = await _setup.selectPoint(
-      sel,
-      argon2Iterations: _iterations,
-      profile: _profile,
-    );
-    if (!mounted) return;
+    SelectionOutcome outcome = _setup.selectPoint(sel);
+    // A valid click that would clobber a re-selected stage's later fractals asks
+    // for confirmation before discarding them.
+    if (outcome == SelectionOutcome.needsConfirm) {
+      final bool ok = await _confirmReselect();
+      if (!mounted || !ok) return;
+      outcome = _setup.selectPoint(sel, confirmedReselect: true);
+      if (!mounted) return;
+    }
     final String? msg;
     switch (outcome) {
       case SelectionOutcome.invalid:
         _sounds.play(UiSound.deny);
         msg = 'No encodable leaf there — zoom in and click closer.';
-      case SelectionOutcome.advancedStage:
+      case SelectionOutcome.marked:
         _sounds.play(UiSound.select);
-        msg = 'Recalled — now on Stage '
-            '${_setup.displayStageIndex}/${_setup.nStages - 1}.';
+        final int k = _setup.displayStageIndex;
+        msg = k < _setup.nStages - 1
+            ? 'Point marked on Stage $k/${_setup.nStages - 1} — '
+                'select Stage ${k + 1} to derive it.'
+            : 'Point marked on Stage $k/${_setup.nStages - 1}.';
       case SelectionOutcome.complete:
         _sounds.play(UiSound.confirm);
         msg = 'Recall complete — seed reconstructed.';
+      case SelectionOutcome.needsConfirm:
       case SelectionOutcome.busy:
         msg = null;
     }
     if (msg == null) return;
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(duration: const Duration(milliseconds: 900), content: Text(msg)),
+      SnackBar(duration: const Duration(milliseconds: 1100), content: Text(msg)),
     );
+  }
+
+  /// Confirm a point re-selection that will discard the later fractals already
+  /// derived from this stage. Returns true if the user chooses to proceed.
+  Future<bool> _confirmReselect() async {
+    final bool? ok = await showDialog<bool>(
+      context: context,
+      builder: (BuildContext context) => AlertDialog(
+        title: const Text('Re-derive later stages?'),
+        content: const Text(
+          'This stage already has a selected point, and later stages were '
+          'derived from it. Choosing a new point here discards those later '
+          'stages — you will re-derive and re-select them.',
+        ),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Discard & re-select'),
+          ),
+        ],
+      ),
+    );
+    return ok ?? false;
   }
 
   Widget _progressOverlay() {
@@ -535,8 +604,8 @@ class _SetupScreenState extends State<SetupScreen> {
               _setup.phase != SetupPhase.recallComplete)
             Text(
               'Recalling Stage ${_setup.displayStageIndex}/'
-              '${_setup.nStages - 1} — click your one point to advance the '
-              'chain.',
+              '${_setup.nStages - 1} — click your point to mark it, then select '
+              'the next stage (tab or number key) to derive it.',
             ),
 
           // Master-secret export — offered at every non-0 stage in every mode
@@ -881,9 +950,10 @@ class _SetupScreenState extends State<SetupScreen> {
       const Text('Recall your points'),
       const SizedBox(height: 8),
       Text(
-        'Select mode is on. Click your memorised point on each stage in turn; '
-        'each correct point derives the next fractal (the same Argon2 cost as '
-        'setup). Nothing is shown — the seed is rebuilt only from your clicks.',
+        'Select mode is on. Click your memorised point to mark it, then select '
+        'the next stage (its tab or number key) to derive that fractal (the '
+        'same Argon2 cost as setup). Nothing is shown — the seed is rebuilt only '
+        'from your clicks.',
         style: Theme.of(context).textTheme.bodySmall,
       ),
     ];
@@ -945,36 +1015,35 @@ class _SetupScreenState extends State<SetupScreen> {
     ];
   }
 
-  /// Toggle between the **loaded** stages of the active session: Stage 0 (the
-  /// salt/pepper text) plus every fractal already derived — in generation /
-  /// import that is all of them up-front, in a recall walk it grows as points
-  /// come back. Switching stages points the canvas at that fractal so it can be
-  /// studied under focus (zoom / pan / brightness); the arrows are disabled for
-  /// stages not yet reached. Mirrors the `T` hotkey.
+  /// Step between stages of the active session. The left arrow focuses the
+  /// previous (always-loaded) stage; the right arrow focuses the next stage if
+  /// it is derived, or — when it is the first not-yet-derived stage — triggers
+  /// its derivation (the same as selecting it by tab or number key). Disabled at
+  /// the ends or while a derivation is running.
   Widget _stageNav() {
     final int idx = _setup.displayStageIndex;
     final int n = _setup.nStages;
+    final bool canPrev = idx > 0;
+    final bool canNext = !_busy &&
+        idx + 1 < n &&
+        (_setup.isStageAvailable(idx + 1) ||
+            idx + 1 == _setup.firstUnderivedStage);
     return Row(
       mainAxisAlignment: MainAxisAlignment.spaceBetween,
       children: <Widget>[
         IconButton(
           tooltip: 'Previous stage',
-          onPressed: _setup.isStageAvailable(idx - 1) ? () => _goStage(idx - 1) : null,
+          onPressed: canPrev ? () => _selectStage(idx - 1) : null,
           icon: const Icon(Icons.chevron_left),
         ),
         Text(idx == 0 ? 'Stage 0 — salt / pepper' : 'Stage $idx / ${n - 1}'),
         IconButton(
           tooltip: 'Next stage',
-          onPressed: _setup.isStageAvailable(idx + 1) ? () => _goStage(idx + 1) : null,
+          onPressed: canNext ? () => _selectStage(idx + 1) : null,
           icon: const Icon(Icons.chevron_right),
         ),
       ],
     );
-  }
-
-  void _goStage(int index) {
-    _sounds.play(UiSound.select);
-    _setup.showStage(index);
   }
 
   /// The blind BIP39 seed-phrase copy. Operates on whatever has been recalled so
@@ -1207,7 +1276,10 @@ enum _SourceMode { fresh, import, recall }
 /// Maps the number-row and numpad digit keys 0..8 to a stage index, so pressing
 /// a number focuses that stage (when no text field holds the keystroke). 9 is
 /// included so it produces the usual out-of-range cue rather than nothing.
-const Map<LogicalKeyboardKey, int> _digitKeys = <LogicalKeyboardKey, int>{
+///
+/// Not `const`: [LogicalKeyboardKey] has no primitive `==`, so it cannot be a
+/// constant map key — a lazily-initialised `final` map is the idiomatic form.
+final Map<LogicalKeyboardKey, int> _digitKeys = <LogicalKeyboardKey, int>{
   LogicalKeyboardKey.digit0: 0,
   LogicalKeyboardKey.digit1: 1,
   LogicalKeyboardKey.digit2: 2,
@@ -1257,7 +1329,9 @@ class _StageTab extends StatelessWidget {
     return Tooltip(
       message: index == 0 ? 'Stage 0 — salt / pepper' : 'Stage $index',
       child: InkWell(
-        onTap: available ? onTap : null,
+        // Always tappable: the handler navigates to a derived stage, derives the
+        // next one, or sounds a deny cue for an out-of-reach stage.
+        onTap: onTap,
         borderRadius: BorderRadius.circular(6),
         child: Container(
           width: 32,
