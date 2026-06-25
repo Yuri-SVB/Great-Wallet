@@ -85,15 +85,25 @@ class SetupController extends ChangeNotifier {
   String? _errorMessage;
   String? get errorMessage => _errorMessage;
 
-  SizePreset _preset = SizePreset.defaultPreset;
-  SizePreset get preset => _preset;
+  /// Configured number of fractal **point stages** for a fresh/recall session
+  /// (1..[maxPointStages]). Each point stage is one 32-bit chunk, so this fixes
+  /// the entropy width (`32 ×`) — every value 1..8 is a valid setup, not just the
+  /// old mini/default/large presets. An imported seed phrase overrides it with
+  /// its own word count. Used only as the pre-session fallback for [nStages].
+  int _pointStages = 4;
+  int get configuredPointStages => _pointStages;
+
+  /// The largest number of point stages a setup may have: 8 (256-bit / 24-word
+  /// BIP39), the BIP39 ceiling. Stage 0 (text) sits on top, so the displayed
+  /// stages run 0..8 at most.
+  static const int maxPointStages = 8;
 
   /// Total number of displayed stages of the active session: the Stage-0 text
   /// stage plus one per 32-bit fractal point (`pointStageCount + 1`). For an
-  /// imported seed phrase the point count may be any 3..24-word size, not one of
-  /// the presets. Falls back to the configured preset before a session starts.
+  /// imported seed phrase the point count may be any 3..24-word size. Falls back
+  /// to the configured point-stage count before a session starts.
   int _stageCount = 0;
-  int get nStages => _stageCount > 0 ? _stageCount : _preset.nStages + 1;
+  int get nStages => _stageCount > 0 ? _stageCount : _pointStages + 1;
 
   /// Number of fractal point stages (`nStages - 1`): Stage 0 carries no point.
   int get pointStageCount => nStages - 1;
@@ -317,18 +327,18 @@ class SetupController extends ChangeNotifier {
     );
   }
 
-  /// Run the full chained Setup pipeline on a **freshly generated** entropy
-  /// root of the configured [preset] size. [text] is the Stage-0 salt/pepper
-  /// that seeds the fractal chain.
+  /// Run the full chained Setup pipeline on a **freshly generated** entropy root
+  /// of [pointStages] fractal stages (each one 32-bit point, so `32 × pointStages`
+  /// bits). [text] is the Stage-0 salt/pepper that seeds the fractal chain.
   Future<void> begin({
-    required SizePreset preset,
+    required int pointStages,
     required String text,
     required int argon2Iterations,
     Argon2Profile profile = Argon2Profile.basic,
   }) {
-    _preset = preset;
+    _pointStages = pointStages;
     return _encodeRoot(
-      Entropy.randomBits(preset.entropyBits),
+      Entropy.randomBits(pointStages * EncodingConstants.bitsPerPoint),
       text: text,
       argon2Iterations: argon2Iterations,
       profile: profile,
@@ -496,14 +506,14 @@ class SetupController extends ChangeNotifier {
   /// their memorised point on each stage in turn — exactly as [selectPoint]
   /// continues the chain.
   ///
-  /// [preset] fixes how many point stages the seed has (so the walk knows when
-  /// it is complete); [argon2Iterations] and [profile] MUST match the original
-  /// setup or every derived fractal will differ and no point will decode.
-  /// Nothing is encoded and no target markers are shown — recall reconstructs
-  /// the seed purely from the user's clicks. Secrets stay in-session and are
-  /// never logged (SCOPE.md invariants).
+  /// [pointStages] fixes how many point stages the seed has (so the walk knows
+  /// when it is complete); [argon2Iterations] and [profile] MUST match the
+  /// original setup or every derived fractal will differ and no point will
+  /// decode. Nothing is encoded and no target markers are shown — recall
+  /// reconstructs the seed purely from the user's clicks. Secrets stay
+  /// in-session and are never logged (SCOPE.md invariants).
   Future<void> beginRecall({
-    required SizePreset preset,
+    required int pointStages,
     required String text,
     required int argon2Iterations,
     Argon2Profile profile = Argon2Profile.basic,
@@ -515,8 +525,8 @@ class SetupController extends ChangeNotifier {
     // Start from a clean session; no encoded points exist in a recall.
     _resetSecrets();
     _errorMessage = null;
-    _preset = preset;
-    _stageCount = preset.nStages + 1; // Stage-0 text + one per point stage
+    _pointStages = pointStages;
+    _stageCount = pointStages + 1; // Stage-0 text + one per point stage
     _chainText = _core.canonicalizeSaltPepper(text);
     _iterations = argon2Iterations;
     _points = List<EncodedPoint?>.filled(_stageCount, null);
@@ -590,7 +600,6 @@ class SetupController extends ChangeNotifier {
   /// (SCOPE.md invariants).
   Future<SelectionOutcome> selectPoint(
     FractalSelection selection, {
-    required SizePreset preset,
     required int argon2Iterations,
     Argon2Profile profile = Argon2Profile.basic,
   }) async {
@@ -598,7 +607,6 @@ class SetupController extends ChangeNotifier {
         _phase == SetupPhase.recallComplete) {
       return SelectionOutcome.busy;
     }
-    _preset = preset;
 
     final int k = _displayStageIndex;
     // Recall must proceed in order: the displayed fractal must be the next one

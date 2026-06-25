@@ -94,9 +94,20 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   HueOffset _hue = HueOffset.red;
-  SizePreset _preset = SizePreset.defaultPreset;
   Argon2Profile _profile = Argon2Profile.basic;
   int _iterations = 1;
+
+  /// Number of fractal **point stages** (N) for a fresh/recall setup, set by a
+  /// numeric text field. Every value 1..[SetupController.maxPointStages] is a
+  /// valid setup (`32 × N` bits), not just the old mini/default/large presets.
+  /// Held as text so the field can show an out-of-range hint; [_pointStages]
+  /// returns the parsed value when it is in range, else null.
+  final TextEditingController _stagesField = TextEditingController(text: '4');
+  int? get _pointStages {
+    final int? n = int.tryParse(_stagesField.text.trim());
+    if (n == null || n < 1 || n > SetupController.maxPointStages) return null;
+    return n;
+  }
 
   /// Configuration source: generate a fresh random seed, import an existing
   /// (possibly sub-standard) BIP39 phrase, or recall an existing setup from its
@@ -131,6 +142,7 @@ class _SetupScreenState extends State<SetupScreen> {
     _viewport.dispose();
     _brightness.dispose();
     _sounds.dispose();
+    _stagesField.dispose();
     _exportLabel.dispose();
     _mnemonic.dispose();
     _stage0.dispose();
@@ -142,6 +154,14 @@ class _SetupScreenState extends State<SetupScreen> {
       _setup.phase == SetupPhase.encoding ||
       _setup.phase == SetupPhase.deriving;
 
+  /// Whether a setup session is live (stages exist to navigate / focus): not the
+  /// initial config screen, an error, or a finished/wiped session.
+  bool get _hasSession =>
+      _setup.phase == SetupPhase.encoding ||
+      _setup.phase == SetupPhase.deriving ||
+      _setup.phase == SetupPhase.memorise ||
+      _setup.phase == SetupPhase.recallComplete;
+
   @override
   Widget build(BuildContext context) {
     final bool hasResult = _setup.phase == SetupPhase.memorise;
@@ -149,34 +169,78 @@ class _SetupScreenState extends State<SetupScreen> {
       focusNode: _hotkeys,
       autofocus: true,
       onKeyEvent: _onKey,
-      child: Row(
+      child: Column(
         children: <Widget>[
+          // Upper edge: numbered stage tabs (0..N-1) marking the stage under
+          // focus. Shown once a session has stages; tap or press 0–8 to jump.
+          if (_hasSession) _stageTabs(),
           Expanded(
-            // Clicking anywhere on the canvas returns keyboard focus to the
-            // hotkey handler, so S / R work again after the user has been
-            // typing in a text field (salt, seed phrase). Listener is passive,
-            // so it does not interfere with the canvas's own pan/zoom/select.
-            child: Listener(
-              onPointerDown: (_) => _hotkeys.requestFocus(),
-              child: Stack(
-                children: <Widget>[
-                  // Stage 0 has no fractal/point — show the salt/pepper panel.
-                  Positioned.fill(
-                    child: _setup.isTextStage ? _textStagePanel() : _canvas(),
-                  ),
-                  if (_busy) Positioned.fill(child: _progressOverlay()),
-                  if (_selectMode && !_setup.isTextStage)
-                    const Positioned(
-                      top: 12,
-                      left: 12,
-                      child: _Badge('Select mode — click a point (S to exit)'),
+            child: Row(
+              children: <Widget>[
+                Expanded(
+                  // Clicking anywhere on the canvas returns keyboard focus to the
+                  // hotkey handler, so the shortcuts work again after the user
+                  // has been typing in a text field (salt, seed phrase). Listener
+                  // is passive — it does not interfere with the canvas's own
+                  // pan/zoom/select.
+                  child: Listener(
+                    onPointerDown: (_) => _hotkeys.requestFocus(),
+                    child: Stack(
+                      children: <Widget>[
+                        // Stage 0 has no fractal/point — show the salt/pepper
+                        // panel.
+                        Positioned.fill(
+                          child:
+                              _setup.isTextStage ? _textStagePanel() : _canvas(),
+                        ),
+                        if (_busy) Positioned.fill(child: _progressOverlay()),
+                        if (_selectMode && !_setup.isTextStage)
+                          const Positioned(
+                            top: 12,
+                            left: 12,
+                            child: _Badge(
+                                'Select mode — click a point (S to exit)'),
+                          ),
+                      ],
                     ),
-                ],
-              ),
+                  ),
+                ),
+                SizedBox(width: 260, child: _controlPanel(hasResult)),
+              ],
             ),
           ),
-          SizedBox(width: 260, child: _controlPanel(hasResult)),
         ],
+      ),
+    );
+  }
+
+  /// The upper-edge stage tabs: one numbered chip per displayed stage
+  /// (`0..nStages-1`). Stage 0 is the salt/pepper text; 1..N-1 are the
+  /// chain-derived fractals. The stage under focus is highlighted; stages not
+  /// yet reached (during a recall walk) are disabled. Tapping an available stage
+  /// focuses it — the same as pressing its number key.
+  Widget _stageTabs() {
+    final int n = _setup.nStages;
+    final int current = _setup.displayStageIndex;
+    return Material(
+      color: Theme.of(context).colorScheme.surface,
+      child: SizedBox(
+        height: 44,
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: <Widget>[
+            for (int i = 0; i < n; i++)
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 6),
+                child: _StageTab(
+                  index: i,
+                  selected: i == current,
+                  available: _setup.isStageAvailable(i),
+                  onTap: () => _goToStageByNumber(i),
+                ),
+              ),
+          ],
+        ),
       ),
     );
   }
@@ -199,7 +263,43 @@ class _SetupScreenState extends State<SetupScreen> {
       _setup.cycleStage();
       return KeyEventResult.handled;
     }
+    // K — derive and copy the exported master secret ("the key") for the stage
+    // under focus.
+    if (event.logicalKey == LogicalKeyboardKey.keyK) {
+      if (!_busy) _copyMasterSecret();
+      return KeyEventResult.handled;
+    }
+    // 0–8 — jump focus to that stage (if available; otherwise a deny cue).
+    final int? digit = _digitKeys[event.logicalKey];
+    if (digit != null) {
+      _goToStageByNumber(digit);
+      return KeyEventResult.handled;
+    }
     return KeyEventResult.ignored;
+  }
+
+  /// Focus stage [index] if it exists and is available (Stage 0, or a fractal
+  /// already derived). Otherwise sound a deny cue and flag why — the stage is
+  /// out of range for this setup, or not yet reached in the recall walk.
+  void _goToStageByNumber(int index) {
+    if (!_hasSession) {
+      _sounds.play(UiSound.deny);
+      return;
+    }
+    if (index == _setup.displayStageIndex) return; // already here — no-op
+    if (index >= _setup.nStages) {
+      _sounds.play(UiSound.deny);
+      _toast('This setup has ${_setup.nStages - 1} stage'
+          '${_setup.nStages - 1 == 1 ? '' : 's'} (0–${_setup.nStages - 1}).');
+      return;
+    }
+    if (!_setup.isStageAvailable(index)) {
+      _sounds.play(UiSound.deny);
+      _toast('Stage $index is not available yet — recall up to it first.');
+      return;
+    }
+    _sounds.play(UiSound.select);
+    _setup.showStage(index);
   }
 
   /// Whether the keyboard focus is currently inside an editable text field, so
@@ -319,7 +419,6 @@ class _SetupScreenState extends State<SetupScreen> {
   Future<void> _onCanvasSelect(FractalSelection sel) async {
     final SelectionOutcome outcome = await _setup.selectPoint(
       sel,
-      preset: _preset,
       argon2Iterations: _iterations,
       profile: _profile,
     );
@@ -493,7 +592,7 @@ class _SetupScreenState extends State<SetupScreen> {
           const Text(
             'Hold L and scroll over the canvas to adjust brightness; '
             'scroll to zoom, drag to pan; press R to recenter, T to cycle '
-            'stages, S to select.',
+            'stages, 0–8 to jump to a stage, S to select, K to copy the key.',
             textAlign: TextAlign.center,
           ),
           const SizedBox(height: 24),
@@ -534,32 +633,14 @@ class _SetupScreenState extends State<SetupScreen> {
       else ...<Widget>[
         if (_source == _SourceMode.recall) ...<Widget>[
           Text(
-            'Recall an existing setup: enter the same salt, size and Argon2 '
-            'settings you used, then click your memorised point on each stage. '
-            'Nothing is encoded — the seed is rebuilt from your clicks.',
+            'Recall an existing setup: enter the same salt, number of stages and '
+            'Argon2 settings you used, then click your memorised point on each '
+            'stage. Nothing is encoded — the seed is rebuilt from your clicks.',
             style: Theme.of(context).textTheme.bodySmall,
           ),
           const SizedBox(height: 8),
         ],
-        const Text('Size'),
-        DropdownButton<SizePreset>(
-          isExpanded: true,
-          value: _preset,
-          onChanged: _busy
-              ? null
-              : (SizePreset? v) {
-                  _sounds.play(UiSound.click);
-                  setState(() => _preset = v ?? _preset);
-                },
-          items: <DropdownMenuItem<SizePreset>>[
-            for (final SizePreset p in SizePreset.values)
-              DropdownMenuItem<SizePreset>(
-                value: p,
-                child: Text('${p.name} — ${p.bip39Words} words '
-                    '(${p.entropyBits}-bit)'),
-              ),
-          ],
-        ),
+        ..._stagesInput(),
       ],
       const SizedBox(height: 16),
       ..._stage0Input(),
@@ -604,14 +685,15 @@ class _SetupScreenState extends State<SetupScreen> {
       const SizedBox(height: 16),
       if (_source == _SourceMode.recall)
         FilledButton(
-          onPressed: _busy ? null : _beginRecall,
+          onPressed: (_busy || _pointStages == null) ? null : _beginRecall,
           child: const Text('Begin recall'),
         )
       else
         FilledButton(
           onPressed: (_busy ||
                   (_source == _SourceMode.import &&
-                      _mnemonic.text.trim().isEmpty))
+                      _mnemonic.text.trim().isEmpty) ||
+                  (_source == _SourceMode.fresh && _pointStages == null))
               ? null
               : _start,
           child: Text(
@@ -624,6 +706,48 @@ class _SetupScreenState extends State<SetupScreen> {
           style: const TextStyle(color: Colors.redAccent),
         ),
       ],
+    ];
+  }
+
+  /// Numeric input for N — the number of fractal point stages (1..8). A whole
+  /// number rather than a preset, since every count in that range is a valid
+  /// setup (`32 × N` bits / `3 × N` BIP39 words). The live hint shows the derived
+  /// width; an out-of-range entry is flagged and disables the action button.
+  List<Widget> _stagesInput() {
+    final int? n = _pointStages;
+    final String raw = _stagesField.text.trim();
+    final String? error = (raw.isNotEmpty && n == null)
+        ? 'Enter a whole number from 1 to ${SetupController.maxPointStages}.'
+        : null;
+    return <Widget>[
+      const Text('Number of stages (N)'),
+      const SizedBox(height: 4),
+      TextField(
+        controller: _stagesField,
+        enabled: !_busy,
+        maxLines: 1,
+        keyboardType: TextInputType.number,
+        inputFormatters: <TextInputFormatter>[
+          FilteringTextInputFormatter.digitsOnly,
+          LengthLimitingTextInputFormatter(1),
+        ],
+        decoration: InputDecoration(
+          isDense: true,
+          border: const OutlineInputBorder(),
+          hintText: '1–${SetupController.maxPointStages}',
+          helperText: n != null
+              ? '$n derived stage${n == 1 ? '' : 's'} — ${n * 32} bits, '
+                  '${n * 3} BIP39 words.'
+              : 'One fractal per stage; '
+                  '1–${SetupController.maxPointStages}.',
+          helperMaxLines: 2,
+          errorText: error,
+        ),
+        onChanged: (_) {
+          _sounds.play(UiSound.click);
+          setState(() {});
+        },
+      ),
     ];
   }
 
@@ -872,15 +996,16 @@ class _SetupScreenState extends State<SetupScreen> {
     final int idx = _setup.displayStageIndex;
     return <Widget>[
       Text(
-        'Master-secret export',
+        'Key (master-secret export)',
         style: Theme.of(context).textTheme.titleMedium,
       ),
       const SizedBox(height: 4),
       Text(
-        'Argon2id over your setup so far (stages 1–$idx). Paste the result into '
+        'Argon2id over your setup so far (stages 1–$idx). Paste this key into '
         'another wallet, derive a non-BIP39 secret, or use it as a downstream '
-        'pepper. The optional label versions this key (e.g. SIGNING-1) and is '
-        'mixed into the hash. Copied blind — never shown on screen.',
+        'pepper. The optional label versions the key (e.g. SIGNING-1) and is '
+        'mixed into the hash. Press K to derive and copy; copied blind — never '
+        'shown on screen.',
         style: Theme.of(context).textTheme.bodySmall,
       ),
       const SizedBox(height: 8),
@@ -944,7 +1069,7 @@ class _SetupScreenState extends State<SetupScreen> {
                 child: CircularProgressIndicator(strokeWidth: 2),
               )
             : const Icon(Icons.content_copy),
-        label: Text(_exporting ? 'Deriving…' : 'Copy master secret'),
+        label: Text(_exporting ? 'Deriving…' : 'Copy key (K)'),
       ),
     ];
   }
@@ -988,7 +1113,7 @@ class _SetupScreenState extends State<SetupScreen> {
     if (!mounted) return;
     _sounds.play(UiSound.confirm);
     // Confirmation never echoes the secret itself.
-    _toast('Master secret copied — paste it, then clear the clipboard.');
+    _toast('Key copied — paste it, then clear the clipboard.');
   }
 
   void _toast(String msg) {
@@ -1014,8 +1139,10 @@ class _SetupScreenState extends State<SetupScreen> {
       // user can fix it).
       if (_setup.phase != SetupPhase.error) _mnemonic.clear();
     } else {
+      final int? n = _pointStages;
+      if (n == null) return; // button is disabled in this state, but be safe
       await _setup.begin(
-        preset: _preset,
+        pointStages: n,
         text: text,
         argon2Iterations: _iterations,
         profile: _profile,
@@ -1034,10 +1161,12 @@ class _SetupScreenState extends State<SetupScreen> {
   /// Start a cold-start recall from the entered salt: derive Stage 1, then drop
   /// straight into select mode so the user can click their first point.
   Future<void> _beginRecall() async {
+    final int? n = _pointStages;
+    if (n == null) return; // button is disabled in this state, but be safe
     _sounds.play(UiSound.click);
     _brightness.reset();
     await _setup.beginRecall(
-      preset: _preset,
+      pointStages: n,
       text: _stage0.text,
       argon2Iterations: _iterations,
       profile: _profile,
@@ -1074,6 +1203,86 @@ class _SetupScreenState extends State<SetupScreen> {
 /// imported BIP39 phrase, or a cold-start recall of an existing setup (derive
 /// from the salt and reconstruct the seed from the user's clicks).
 enum _SourceMode { fresh, import, recall }
+
+/// Maps the number-row and numpad digit keys 0..8 to a stage index, so pressing
+/// a number focuses that stage (when no text field holds the keystroke). 9 is
+/// included so it produces the usual out-of-range cue rather than nothing.
+const Map<LogicalKeyboardKey, int> _digitKeys = <LogicalKeyboardKey, int>{
+  LogicalKeyboardKey.digit0: 0,
+  LogicalKeyboardKey.digit1: 1,
+  LogicalKeyboardKey.digit2: 2,
+  LogicalKeyboardKey.digit3: 3,
+  LogicalKeyboardKey.digit4: 4,
+  LogicalKeyboardKey.digit5: 5,
+  LogicalKeyboardKey.digit6: 6,
+  LogicalKeyboardKey.digit7: 7,
+  LogicalKeyboardKey.digit8: 8,
+  LogicalKeyboardKey.digit9: 9,
+  LogicalKeyboardKey.numpad0: 0,
+  LogicalKeyboardKey.numpad1: 1,
+  LogicalKeyboardKey.numpad2: 2,
+  LogicalKeyboardKey.numpad3: 3,
+  LogicalKeyboardKey.numpad4: 4,
+  LogicalKeyboardKey.numpad5: 5,
+  LogicalKeyboardKey.numpad6: 6,
+  LogicalKeyboardKey.numpad7: 7,
+  LogicalKeyboardKey.numpad8: 8,
+  LogicalKeyboardKey.numpad9: 9,
+};
+
+/// One numbered stage tab on the upper edge. Highlighted when it is the stage
+/// under focus, dimmed and non-interactive when not yet reachable.
+class _StageTab extends StatelessWidget {
+  const _StageTab({
+    required this.index,
+    required this.selected,
+    required this.available,
+    required this.onTap,
+  });
+
+  final int index;
+  final bool selected;
+  final bool available;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final ColorScheme scheme = Theme.of(context).colorScheme;
+    final Color fg = selected
+        ? scheme.onPrimary
+        : available
+            ? scheme.onSurface
+            : scheme.onSurface.withOpacity(0.35);
+    final Color bg = selected ? scheme.primary : Colors.transparent;
+    return Tooltip(
+      message: index == 0 ? 'Stage 0 — salt / pepper' : 'Stage $index',
+      child: InkWell(
+        onTap: available ? onTap : null,
+        borderRadius: BorderRadius.circular(6),
+        child: Container(
+          width: 32,
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: bg,
+            borderRadius: BorderRadius.circular(6),
+            border: Border.all(
+              color: selected ? scheme.primary : scheme.outlineVariant,
+            ),
+          ),
+          child: Text(
+            '$index',
+            style: TextStyle(
+              color: fg,
+              fontWeight: selected ? FontWeight.bold : FontWeight.normal,
+              fontFamily: GreatWallTypography.fontFamily,
+              fontFamilyFallback: const <String>['monospace'],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
 
 /// Constrains the Stage-0 salt/pepper to a safe, reproducible ASCII subset:
 /// uppercase letters, digits and hyphens. Lowercase is upper-cased; anything
