@@ -206,7 +206,7 @@ class _SetupScreenState extends State<SetupScreen> {
                             top: 12,
                             left: 12,
                             child: _Badge(
-                                'Select mode — click a point (S to exit)'),
+                                'Recall — click your point'),
                           ),
                       ],
                     ),
@@ -257,10 +257,6 @@ class _SetupScreenState extends State<SetupScreen> {
     // While a text field (salt, seed phrase, …) holds focus, let it consume the
     // keystroke — never fire canvas shortcuts like S / R.
     if (_textInputHasFocus) return KeyEventResult.ignored;
-    if (event.logicalKey == LogicalKeyboardKey.keyS) {
-      _setSelectMode(!_selectMode);
-      return KeyEventResult.handled;
-    }
     if (event.logicalKey == LogicalKeyboardKey.keyR) {
       _resetView();
       return KeyEventResult.handled;
@@ -373,17 +369,14 @@ class _SetupScreenState extends State<SetupScreen> {
 
   /// Toggle select (recall) mode. Entering it snaps the canvas to the stage the
   /// recall walk is on, so clicks land on the right fractal in chain order.
-  void _setSelectMode(bool v) {
-    // Practising points while later stages are still deriving is held off (the
-    // user asked for view/navigate only until the whole chain exists).
-    if (v && _setup.isGenerating) {
-      _sounds.play(UiSound.deny);
-      _toast('Select mode opens once every stage has finished deriving.');
-      return;
-    }
-    _sounds.play(v ? UiSound.select : UiSound.click);
-    setState(() => _selectMode = v);
-    if (v) _setup.showRecallStage();
+  /// Snap the canvas to the recall stage and turn on point selection. Select
+  /// mode is implicit in a cold-start recall (the points are hidden, so clicking
+  /// is how the seed comes back); a generated/imported setup shows its points,
+  /// so there is nothing to "practise" and the mode is never offered as a
+  /// toggle.
+  void _enterRecallSelect() {
+    setState(() => _selectMode = true);
+    _setup.showRecallStage();
   }
 
   Widget _canvas() {
@@ -616,28 +609,21 @@ class _SetupScreenState extends State<SetupScreen> {
             _generationNotice(),
           ],
 
-          const Divider(height: 32),
-          // Always available: entering select mode snaps to the next fractal to
-          // recall (Stage 0 is text, not selectable), and Reset returns to the
-          // configuration screen without restarting the app.
-          SwitchListTile(
-            contentPadding: EdgeInsets.zero,
-            title: const Text('Select mode'),
-            subtitle: Text(_setup.isGenerating
-                ? 'Available once every stage has finished deriving'
-                : 'Click your points to recall (or press S)'),
-            value: _selectMode,
-            onChanged:
-                (_busy || _setup.isGenerating) ? null : _setSelectMode,
-          ),
+          // The cold-start recall walk shows a per-stage hint while the user
+          // clicks their points back. There is no select-mode toggle: a recall
+          // session selects implicitly (the answer is hidden), and a
+          // generated/imported setup displays its points, so there is nothing to
+          // practise.
           if (_selectMode &&
               !_setup.isTextStage &&
-              _setup.phase != SetupPhase.recallComplete)
+              _setup.phase != SetupPhase.recallComplete) ...<Widget>[
+            const Divider(height: 32),
             Text(
               'Recalling Stage ${_setup.displayStageIndex}/'
               '${_setup.nStages - 1} — click your point to mark it, then select '
               'the next stage (tab or number key) to derive it.',
             ),
+          ],
 
           // Master-secret export — offered at every non-0 stage in every mode
           // (generation, import, recall) the moment the stage is resolved, not
@@ -692,7 +678,7 @@ class _SetupScreenState extends State<SetupScreen> {
           const Text(
             'Hold L and scroll over the canvas to adjust brightness; '
             'scroll to zoom, drag to pan; press R to recenter, T to cycle '
-            'stages, 0–8 to jump to a stage, S to select, K to copy the key.',
+            'stages, 0–8 to jump to a stage, K to copy the key.',
             textAlign: TextAlign.center,
           ),
           const SizedBox(height: 24),
@@ -1329,7 +1315,7 @@ class _SetupScreenState extends State<SetupScreen> {
     // The salt now lives in the controller for the in-session walk; clear the
     // field so it is not left on screen.
     _stage0.clear();
-    setState(() => _selectMode = true);
+    _enterRecallSelect();
     _sounds.play(UiSound.confirm);
   }
 
