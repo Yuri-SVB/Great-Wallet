@@ -455,6 +455,12 @@ class _SetupScreenState extends State<SetupScreen> {
       }
       return KeyEventResult.handled;
     }
+    // Z — reset, behind a console confirmation so a stray keypress cannot wipe a
+    // setup.
+    if (event.logicalKey == LogicalKeyboardKey.keyZ) {
+      _confirmReset();
+      return KeyEventResult.handled;
+    }
     // K — derive and copy the exported master secret ("the key") for the stage
     // under focus.
     if (event.logicalKey == LogicalKeyboardKey.keyK) {
@@ -793,7 +799,7 @@ class _SetupScreenState extends State<SetupScreen> {
   static const List<String> _manualLines = <String>[
     'F1 manual · F2 Setup · F3 Train · F4 Accelerate · F5 Inherit',
     'Esc  return to the fractal (leave a text field) · Tab cycles fields',
-    'H  show / hide this manual      M  minimize / restore chrome',
+    'H  manual   M  minimize / restore chrome   Z  reset (asks first)',
     '0–8  go to that stage (recenters); press again to zoom to its point',
     'N / I / R  New seed / Import / Recall (also focuses its input)',
     'S salt · P profile · D derivation steps · X export label · C colour',
@@ -1823,6 +1829,24 @@ class _SetupScreenState extends State<SetupScreen> {
     _stage0.clear();
     _enterRecallSelect();
     _sounds.play(UiSound.confirm);
+  }
+
+  /// Reset behind an inline console confirmation, so the Z hotkey (or a stray
+  /// keypress) cannot discard a setup by accident.
+  Future<void> _confirmReset() async {
+    final Completer<bool> completer = Completer<bool>();
+    _resolvePrompt(false); // clear any other pending prompt first
+    setState(() {
+      _chromeMinimized = false; // make sure the prompt is visible
+      _prompt = _ConsolePrompt(
+        message: 'Reset and discard the current setup? Un-memorised points and '
+            'any entered text will be lost.',
+        confirmLabel: 'Reset',
+        cancelLabel: 'Cancel',
+        completer: completer,
+      );
+    });
+    if (await completer.future && mounted) _reset();
   }
 
   void _reset() {
