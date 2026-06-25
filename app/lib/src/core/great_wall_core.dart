@@ -86,7 +86,8 @@ class GreatWallCore {
         i * EncodingConstants.bitsPerPoint,
         (i + 1) * EncodingConstants.bitsPerPoint,
       );
-      final ({int reRaw, int imRaw}) pt = bindings.encodePoint(
+      final ({int reRaw, int imRaw, FixedRect leafRect}) pt =
+          bindings.encodePoint(
         bits: chunk,
         area: area,
         params: params,
@@ -94,7 +95,9 @@ class GreatWallCore {
         p: p,
         q: q,
       );
-      points.add(EncodedPoint(reRaw: pt.reRaw, imRaw: pt.imRaw));
+      points.add(
+        EncodedPoint(reRaw: pt.reRaw, imRaw: pt.imRaw, leafRect: pt.leafRect),
+      );
     }
     return points;
   }
@@ -195,6 +198,47 @@ class GreatWallCore {
 
     return Argon2Job(completer.future, cancel);
   }
+
+  /// Run the master-secret export ([GreatWallCoreBindings.argon2idMaster]) — one
+  /// Argon2id pass over the [message] transcript — in a short-lived worker
+  /// isolate, so the heavy (64 MiB, 8-pass) blocking call never stalls the UI
+  /// isolate. Returns the [outLen]-byte output; the caller renders only the
+  /// conventional first 32 hex chars (`MasterSecret.displayHex`).
+  ///
+  /// Not cancellable (a single pass cannot be preempted mid-call), so unlike
+  /// [startStageDerivation] there is no [Argon2Job]; it simply completes.
+  Future<Uint8List> argon2idMaster(
+    Uint8List message, {
+    int outLen = 1024,
+  }) async {
+    final ReceivePort port = ReceivePort();
+    final Completer<Uint8List> completer = Completer<Uint8List>();
+    await Isolate.spawn<(SendPort, Uint8List, int)>(
+      _argon2idMasterIsolateEntry,
+      (port.sendPort, message, outLen),
+      onError: port.sendPort,
+      errorsAreFatal: true,
+    );
+    port.listen((dynamic msg) {
+      if (msg is Uint8List) {
+        if (!completer.isCompleted) completer.complete(msg);
+      } else if (!completer.isCompleted) {
+        // Error payload (from the isolate body or onError): [message, stack].
+        completer.completeError(StateError('Argon2id master export failed'));
+      }
+      port.close();
+    });
+    return completer.future;
+  }
+}
+
+/// Worker-isolate entry: open the engine, run the single Argon2id master pass
+/// over the transcript [message] and return its [outLen] bytes.
+void _argon2idMasterIsolateEntry((SendPort, Uint8List, int) args) {
+  final (SendPort send, Uint8List message, int outLen) = args;
+  final GreatWallCoreBindings bindings = GreatWallCoreBindings.open();
+  final Uint8List out = bindings.argon2idMaster(message, outLen: outLen);
+  send.send(out);
 }
 
 /// Worker-isolate entry: open the engine, run the Argon2 loop, stream progress
@@ -223,11 +267,18 @@ class Argon2Job {
   void cancel() => _cancel();
 }
 
-/// An encoded fractal point in raw I4F60 coordinates.
+/// An encoded fractal point in raw I4F60 coordinates, with the leaf rectangle
+/// the bisection settled on. The leaf's centre is this stage's coordinate in
+/// the master-secret export transcript (see `MasterSecret.leafCentreRaw`).
 class EncodedPoint {
-  const EncodedPoint({required this.reRaw, required this.imRaw});
+  const EncodedPoint({
+    required this.reRaw,
+    required this.imRaw,
+    required this.leafRect,
+  });
   final int reRaw;
   final int imRaw;
+  final FixedRect leafRect;
 
   /// `toString` is redacted: a point's coordinates are coercion-relevant
   /// material (SCOPE.md "no logs of fractal coordinates").

@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:great_wall_ux/great_wall_ux.dart';
@@ -40,9 +42,25 @@ class _SetupScreenState extends State<SetupScreen> {
   /// to it after the user has been typing in a text field.
   final FocusNode _hotkeys = FocusNode(debugLabel: 'setup-hotkeys');
 
-  /// Descriptive salt for the SHA-512 export at recall (e.g. "main wallet").
-  /// Domain-separates one setup from another — see ARCHITECTURE.md §"Stage 0".
-  final TextEditingController _salt = TextEditingController();
+  /// Per-stage **master-secret export label** (e.g. `SIGNING-1`). Appended to
+  /// the Argon2id transcript message at the exporting stage, versioning the
+  /// derived secret — DESIGN.md §"Master-Secret Export". Same restricted
+  /// `[A-Z0-9-]` widget as Stage 0; shown on every non-0 stage in all modes. A
+  /// single field applies to whichever stage is on screen when Copy is pressed.
+  final TextEditingController _exportLabel = TextEditingController();
+
+  /// True when the last edit to [_exportLabel] had characters up-cased or
+  /// dropped by the engine's canonicalisation (mirrors [_stage0Restricted]).
+  bool _exportLabelRestricted = false;
+
+  void _onExportLabelRestricted({required bool adjusted}) {
+    if (_exportLabelRestricted == adjusted) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _exportLabelRestricted != adjusted) {
+        setState(() => _exportLabelRestricted = adjusted);
+      }
+    });
+  }
 
   /// An existing BIP39 phrase to import instead of generating a fresh root.
   /// Secret material: obscured by default, cleared once it has been encoded.
@@ -78,9 +96,27 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   HueOffset _hue = HueOffset.red;
-  SizePreset _preset = SizePreset.defaultPreset;
   Argon2Profile _profile = Argon2Profile.basic;
+  /// N — the per-stage **Argon2 iteration count**, entered as a free number.
+  /// Essentially unbounded (0..∞): a deliberately heavy setup may take hours,
+  /// days, or weeks to derive, so N is a numeric field rather than a capped
+  /// slider. [_iterations] holds the last in-range value; [_iterationsValid]
+  /// gates the action buttons while the field is empty or malformed.
   int _iterations = 1;
+  final TextEditingController _iterationsField =
+      TextEditingController(text: '1');
+  bool get _iterationsValid {
+    final int? n = int.tryParse(_iterationsField.text.trim());
+    return n != null && n >= 0;
+  }
+
+  /// Number of fractal **point stages** for a fresh/recall setup, chosen on a
+  /// discrete slider with nine positions, 0..[SetupController.maxPointStages].
+  /// 0 is a Stage-0-text-only setup (no fractal points); each higher position
+  /// adds one 32-bit fractal stage (`32 × count` bits / `3 × count` BIP39
+  /// words). Every position is a valid setup, so the count needs no validity
+  /// gate. (N is reserved for the Argon2 iteration count, below.)
+  int _pointStages = 4;
 
   /// Configuration source: generate a fresh random seed, import an existing
   /// (possibly sub-standard) BIP39 phrase, or recall an existing setup from its
@@ -90,6 +126,32 @@ class _SetupScreenState extends State<SetupScreen> {
   /// Select mode: when on, tapping the canvas decodes the point under the
   /// cursor instead of panning. Toggled by the panel button or the `S` key.
   bool _selectMode = false;
+
+  /// True while a master-secret export's Argon2id pass is in flight, so a second
+  /// tap on "Copy master secret" is ignored until it finishes.
+  bool _exporting = false;
+
+  // --- Bottom console ---------------------------------------------------------
+  // The console at the foot of the screen is the app's single message surface:
+  // toasts, the help text of whatever control is under focus, and confirmation
+  // prompts all land here instead of as SnackBars / modal dialogs.
+
+  /// Recent console lines, most recent last (capped).
+  final List<String> _consoleLog = <String>[];
+
+  /// Help text for the control currently under focus, shown in the console.
+  String? _focusHelp;
+
+  /// Whether the hotkey manual is shown in the console. On at launch.
+  bool _manualVisible = true;
+
+  /// Whether the console and the stage-tab bar are collapsed to a thin status
+  /// line. Toggled by the console's button (and, later, a hotkey).
+  bool _chromeMinimized = false;
+
+  /// A confirmation awaiting an inline answer in the console (replaces modal
+  /// dialogs). Resolved by the console's action buttons.
+  _ConsolePrompt? _prompt;
 
   @override
   void initState() {
@@ -106,12 +168,17 @@ class _SetupScreenState extends State<SetupScreen> {
 
   @override
   void dispose() {
+    // Release any awaiter blocked on an unanswered console prompt.
+    if (_prompt != null && !_prompt!.completer.isCompleted) {
+      _prompt!.completer.complete(false);
+    }
     _setup.removeListener(_onSetupChanged);
     _setup.dispose();
     _viewport.dispose();
     _brightness.dispose();
     _sounds.dispose();
-    _salt.dispose();
+    _iterationsField.dispose();
+    _exportLabel.dispose();
     _mnemonic.dispose();
     _stage0.dispose();
     _hotkeys.dispose();
@@ -122,6 +189,14 @@ class _SetupScreenState extends State<SetupScreen> {
       _setup.phase == SetupPhase.encoding ||
       _setup.phase == SetupPhase.deriving;
 
+  /// Whether a setup session is live (stages exist to navigate / focus): not the
+  /// initial config screen, an error, or a finished/wiped session.
+  bool get _hasSession =>
+      _setup.phase == SetupPhase.encoding ||
+      _setup.phase == SetupPhase.deriving ||
+      _setup.phase == SetupPhase.memorise ||
+      _setup.phase == SetupPhase.recallComplete;
+
   @override
   Widget build(BuildContext context) {
     final bool hasResult = _setup.phase == SetupPhase.memorise;
@@ -129,34 +204,93 @@ class _SetupScreenState extends State<SetupScreen> {
       focusNode: _hotkeys,
       autofocus: true,
       onKeyEvent: _onKey,
-      child: Row(
+      child: Column(
         children: <Widget>[
+          // Upper edge: a fixed, full-width bar of stage tabs (0..8). Always
+          // present; unreachable tabs are greyed but stay in place. Tap or press
+          // 0–8 to jump. Hidden along with the console when the chrome is
+          // minimized.
+          if (!_chromeMinimized) _stageTabs(),
           Expanded(
-            // Clicking anywhere on the canvas returns keyboard focus to the
-            // hotkey handler, so S / R work again after the user has been
-            // typing in a text field (salt, seed phrase). Listener is passive,
-            // so it does not interfere with the canvas's own pan/zoom/select.
-            child: Listener(
-              onPointerDown: (_) => _hotkeys.requestFocus(),
-              child: Stack(
-                children: <Widget>[
-                  // Stage 0 has no fractal/point — show the salt/pepper panel.
-                  Positioned.fill(
-                    child: _setup.isTextStage ? _textStagePanel() : _canvas(),
-                  ),
-                  if (_busy) Positioned.fill(child: _progressOverlay()),
-                  if (_selectMode && !_setup.isTextStage)
-                    const Positioned(
-                      top: 12,
-                      left: 12,
-                      child: _Badge('Select mode — click a point (S to exit)'),
+            child: Row(
+              children: <Widget>[
+                Expanded(
+                  // Clicking anywhere on the canvas returns keyboard focus to the
+                  // hotkey handler, so the shortcuts work again after the user
+                  // has been typing in a text field (salt, seed phrase). Listener
+                  // is passive — it does not interfere with the canvas's own
+                  // pan/zoom/select.
+                  child: Listener(
+                    onPointerDown: (_) => _hotkeys.requestFocus(),
+                    child: Stack(
+                      children: <Widget>[
+                        // Stage 0 has no fractal/point — show the salt/pepper
+                        // panel.
+                        Positioned.fill(
+                          child:
+                              _setup.isTextStage ? _textStagePanel() : _canvas(),
+                        ),
+                        if (_busy) Positioned.fill(child: _progressOverlay()),
+                        if (_selectMode && !_setup.isTextStage)
+                          const Positioned(
+                            top: 12,
+                            left: 12,
+                            child: _Badge(
+                                'Recall — click your point'),
+                          ),
+                      ],
                     ),
-                ],
-              ),
+                  ),
+                ),
+                SizedBox(width: 260, child: _controlPanel(hasResult)),
+              ],
             ),
           ),
-          SizedBox(width: 260, child: _controlPanel(hasResult)),
+          // Foot of the screen: the console (single message surface).
+          _console(),
         ],
+      ),
+    );
+  }
+
+  /// The upper-edge stage tabs: a **fixed** bar of nine numbered tabs (0..8,
+  /// the protocol ceiling) that always span the full width. Stage 0 is the
+  /// salt/pepper text; 1..N-1 are the chain-derived fractals. The stage under
+  /// focus is highlighted; tabs that are not currently reachable — outside this
+  /// setup's stage count, not yet derived, or before any session — stay visible
+  /// but greyed out and inert. Tapping a reachable tab focuses it (the same as
+  /// pressing its number key).
+  Widget _stageTabs() {
+    const int maxTab = SetupController.maxPointStages; // 0..8 → nine fixed tabs
+    final int current = _setup.displayStageIndex;
+    return Material(
+      color: Theme.of(context).colorScheme.surface,
+      child: SizedBox(
+        height: 44,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 6),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              for (int i = 0; i <= maxTab; i++)
+                Expanded(
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 3),
+                    child: _StageTab(
+                      index: i,
+                      selected: _hasSession && i == current,
+                      available: _hasSession && _setup.isStageAvailable(i),
+                      // Tappable only for a stage that belongs to the active
+                      // setup; everything else is inert but still shown.
+                      onTap: (_hasSession && i < _setup.nStages)
+                          ? () => _selectStage(i)
+                          : null,
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -166,10 +300,6 @@ class _SetupScreenState extends State<SetupScreen> {
     // While a text field (salt, seed phrase, …) holds focus, let it consume the
     // keystroke — never fire canvas shortcuts like S / R.
     if (_textInputHasFocus) return KeyEventResult.ignored;
-    if (event.logicalKey == LogicalKeyboardKey.keyS) {
-      _setSelectMode(!_selectMode);
-      return KeyEventResult.handled;
-    }
     if (event.logicalKey == LogicalKeyboardKey.keyR) {
       _resetView();
       return KeyEventResult.handled;
@@ -179,7 +309,85 @@ class _SetupScreenState extends State<SetupScreen> {
       _setup.cycleStage();
       return KeyEventResult.handled;
     }
+    // K — derive and copy the exported master secret ("the key") for the stage
+    // under focus.
+    if (event.logicalKey == LogicalKeyboardKey.keyK) {
+      if (!_busy) _copyMasterSecret();
+      return KeyEventResult.handled;
+    }
+    // 0–8 — select that stage: focus it, or derive it if it is next.
+    final int? digit = _digitKeys[event.logicalKey];
+    if (digit != null) {
+      _selectStage(digit);
+      return KeyEventResult.handled;
+    }
     return KeyEventResult.ignored;
+  }
+
+  /// Select stage [index]: focus it if it is already available (Stage 0, or a
+  /// fractal already derived), or — if it is the first not-yet-derived stage —
+  /// trigger that stage's derivation. Anything else (out of range, or a gap
+  /// beyond the next stage) sounds a deny cue and explains why.
+  void _selectStage(int index) {
+    if (_busy || !_hasSession) {
+      _sounds.play(UiSound.deny);
+      return;
+    }
+    if (index == _setup.displayStageIndex) return; // already here — no-op
+    if (index < 0 || index >= _setup.nStages) {
+      _sounds.play(UiSound.deny);
+      _toast('This setup has ${_setup.nStages - 1} stage'
+          '${_setup.nStages - 1 == 1 ? '' : 's'} (0–${_setup.nStages - 1}).');
+      return;
+    }
+    // Already derived (or the Stage-0 text) — just focus it.
+    if (_setup.isStageAvailable(index)) {
+      _sounds.play(UiSound.select);
+      _setup.showStage(index);
+      return;
+    }
+    // Not derived yet because generation is still running in the background —
+    // it will open on its own when ready.
+    if (_setup.isGenerating) {
+      _sounds.play(UiSound.deny);
+      _toast('Stage $index is still deriving — it will open when ready.');
+      return;
+    }
+    // Not derived. Only the very next stage can be derived, and only once the
+    // previous stage carries a selected point.
+    if (index != _setup.firstUnderivedStage) {
+      _sounds.play(UiSound.deny);
+      _toast('Recall the earlier stages first.');
+      return;
+    }
+    if (!_setup.hasSelectedPoint(index - 1)) {
+      _sounds.play(UiSound.deny);
+      _toast('Select your point on Stage ${index - 1} first.');
+      return;
+    }
+    _deriveNextStage();
+  }
+
+  /// Derive the next stage's fractal (the explicit chain-advance step). Shows the
+  /// progress overlay while the Argon2 pass runs, then lands on the new fractal.
+  Future<void> _deriveNextStage() async {
+    final DeriveOutcome outcome = await _setup.deriveNextStage(
+      argon2Iterations: _iterations,
+      profile: _profile,
+    );
+    if (!mounted) return;
+    switch (outcome) {
+      case DeriveOutcome.derived:
+        _sounds.play(UiSound.select);
+        _toast('Stage ${_setup.displayStageIndex}/${_setup.nStages - 1} '
+            'derived — recall your point.');
+      case DeriveOutcome.noPriorPoint:
+        _sounds.play(UiSound.deny);
+        _toast('Select your point on the previous stage first.');
+      case DeriveOutcome.none:
+      case DeriveOutcome.busy:
+        break;
+    }
   }
 
   /// Whether the keyboard focus is currently inside an editable text field, so
@@ -204,10 +412,14 @@ class _SetupScreenState extends State<SetupScreen> {
 
   /// Toggle select (recall) mode. Entering it snaps the canvas to the stage the
   /// recall walk is on, so clicks land on the right fractal in chain order.
-  void _setSelectMode(bool v) {
-    _sounds.play(v ? UiSound.select : UiSound.click);
-    setState(() => _selectMode = v);
-    if (v) _setup.showRecallStage();
+  /// Snap the canvas to the recall stage and turn on point selection. Select
+  /// mode is implicit in a cold-start recall (the points are hidden, so clicking
+  /// is how the seed comes back); a generated/imported setup shows its points,
+  /// so there is nothing to "practise" and the mode is never offered as a
+  /// toggle.
+  void _enterRecallSelect() {
+    setState(() => _selectMode = true);
+    _setup.showRecallStage();
   }
 
   Widget _canvas() {
@@ -297,32 +509,58 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   Future<void> _onCanvasSelect(FractalSelection sel) async {
-    final SelectionOutcome outcome = await _setup.selectPoint(
-      sel,
-      preset: _preset,
-      argon2Iterations: _iterations,
-      profile: _profile,
-    );
-    if (!mounted) return;
+    SelectionOutcome outcome = _setup.selectPoint(sel);
+    // A valid click that would clobber a re-selected stage's later fractals asks
+    // for confirmation before discarding them.
+    if (outcome == SelectionOutcome.needsConfirm) {
+      final bool ok = await _confirmReselect();
+      if (!mounted || !ok) return;
+      outcome = _setup.selectPoint(sel, confirmedReselect: true);
+      if (!mounted) return;
+    }
     final String? msg;
     switch (outcome) {
       case SelectionOutcome.invalid:
         _sounds.play(UiSound.deny);
         msg = 'No encodable leaf there — zoom in and click closer.';
-      case SelectionOutcome.advancedStage:
+      case SelectionOutcome.marked:
         _sounds.play(UiSound.select);
-        msg = 'Recalled — now on Stage '
-            '${_setup.displayStageIndex}/${_setup.nStages - 1}.';
+        final int k = _setup.displayStageIndex;
+        msg = k < _setup.nStages - 1
+            ? 'Point marked on Stage $k/${_setup.nStages - 1} — '
+                'select Stage ${k + 1} to derive it.'
+            : 'Point marked on Stage $k/${_setup.nStages - 1}.';
       case SelectionOutcome.complete:
         _sounds.play(UiSound.confirm);
         msg = 'Recall complete — seed reconstructed.';
+      case SelectionOutcome.needsConfirm:
       case SelectionOutcome.busy:
         msg = null;
     }
     if (msg == null) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(duration: const Duration(milliseconds: 900), content: Text(msg)),
-    );
+    _toast(msg);
+  }
+
+  /// Confirm a point re-selection that will discard the later fractals already
+  /// derived from this stage. The confirmation is shown **inline in the
+  /// console** (not a modal dialog); the returned future completes when the user
+  /// presses one of the console's action buttons.
+  Future<bool> _confirmReselect() {
+    final Completer<bool> completer = Completer<bool>();
+    // If one is already pending (shouldn't happen), decline it first.
+    _resolvePrompt(false);
+    setState(() {
+      _chromeMinimized = false; // make sure the prompt is visible
+      _prompt = _ConsolePrompt(
+        message: 'Re-derive later stages? This stage already has a point and '
+            'later stages were derived from it. Choosing a new point discards '
+            'those later stages — you will re-derive and re-select them.',
+        confirmLabel: 'Discard & re-select',
+        cancelLabel: 'Cancel',
+        completer: completer,
+      );
+    });
+    return completer.future;
   }
 
   Widget _progressOverlay() {
@@ -367,6 +605,184 @@ class _SetupScreenState extends State<SetupScreen> {
     );
   }
 
+  // --- Console ----------------------------------------------------------------
+
+  /// The hotkey manual, shown in the console (on by default at launch, toggled
+  /// with `H`). Lists every shortcut the setup screen handles.
+  static const List<String> _manualLines = <String>[
+    '`  minimize / restore the console and the stage-tab bar',
+    'H  show / hide this manual',
+    'R  recenter the canvas      T  cycle through stages',
+    '0–8  jump to that stage (tab or number key)',
+    'K  copy the master secret ("the key") for the focused stage',
+    'Alt+S salt/pepper   Alt+N iterations   Alt+G stages   Alt+P profile',
+    'Alt+I import phrase   Alt+L export label',
+    'L+scroll brightness · scroll zoom · drag pan (over the canvas)',
+  ];
+
+  /// The bottom console — the single surface for toasts, focus help, and inline
+  /// confirmations. Collapses to a one-line status bar when minimized.
+  Widget _console() {
+    final ColorScheme scheme = Theme.of(context).colorScheme;
+    final String status = _prompt != null
+        ? _prompt!.message
+        : _focusHelp ?? (_consoleLog.isEmpty ? 'Ready.' : _consoleLog.last);
+    return Material(
+      color: scheme.surface,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          border: Border(top: BorderSide(color: scheme.outlineVariant)),
+        ),
+        child: SafeArea(
+          top: false,
+          child: _chromeMinimized
+              ? _consoleStatusBar(status, scheme)
+              : _consoleExpanded(scheme),
+        ),
+      ),
+    );
+  }
+
+  /// The collapsed console: one status line plus a restore button.
+  Widget _consoleStatusBar(String status, ColorScheme scheme) {
+    return Row(
+      children: <Widget>[
+        const SizedBox(width: 12),
+        Icon(Icons.terminal, size: 16, color: scheme.onSurfaceVariant),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            status,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+        ),
+        IconButton(
+          tooltip: 'Restore console (`)',
+          icon: const Icon(Icons.keyboard_arrow_up),
+          onPressed: () => setState(() => _chromeMinimized = false),
+        ),
+      ],
+    );
+  }
+
+  /// The expanded console: header, optional inline prompt, focus help, the
+  /// recent log, and the optional hotkey manual.
+  Widget _consoleExpanded(ColorScheme scheme) {
+    final TextStyle? mono = Theme.of(context).textTheme.bodySmall?.copyWith(
+          fontFamily: GreatWallTypography.fontFamily,
+          fontFamilyFallback: const <String>['monospace'],
+        );
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        // Header.
+        Row(
+          children: <Widget>[
+            const SizedBox(width: 12),
+            Icon(Icons.terminal, size: 16, color: scheme.onSurfaceVariant),
+            const SizedBox(width: 8),
+            Text('Console', style: Theme.of(context).textTheme.labelLarge),
+            const Spacer(),
+            IconButton(
+              tooltip: _manualVisible ? 'Hide manual (H)' : 'Show manual (H)',
+              icon: Icon(_manualVisible ? Icons.help : Icons.help_outline),
+              onPressed: () => setState(() => _manualVisible = !_manualVisible),
+            ),
+            IconButton(
+              tooltip: 'Minimize console & tabs (`)',
+              icon: const Icon(Icons.keyboard_arrow_down),
+              onPressed: () => setState(() => _chromeMinimized = true),
+            ),
+          ],
+        ),
+        const Divider(height: 1),
+        ConstrainedBox(
+          constraints: const BoxConstraints(maxHeight: 200),
+          child: SingleChildScrollView(
+            reverse: true,
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: <Widget>[
+                if (_prompt != null) _consolePromptBlock(scheme),
+                if (_focusHelp != null)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 6),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: <Widget>[
+                        Icon(Icons.info_outline,
+                            size: 14, color: scheme.onSurfaceVariant),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: Text(_focusHelp!,
+                              style: Theme.of(context).textTheme.bodySmall),
+                        ),
+                      ],
+                    ),
+                  ),
+                for (final String line in _consoleLog)
+                  Text('› $line', style: mono),
+                if (_manualVisible) ...<Widget>[
+                  const SizedBox(height: 8),
+                  Text('Hotkeys',
+                      style: Theme.of(context).textTheme.labelMedium),
+                  const SizedBox(height: 2),
+                  for (final String line in _manualLines)
+                    Text(line, style: mono),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// The inline confirmation block (replaces modal dialogs): the prompt message
+  /// plus Cancel / Confirm buttons that complete the pending future.
+  Widget _consolePromptBlock(ColorScheme scheme) {
+    final _ConsolePrompt p = _prompt!;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(8),
+      decoration: BoxDecoration(
+        color: scheme.secondaryContainer,
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: scheme.outline),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          Text(
+            p.message,
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: scheme.onSecondaryContainer,
+                ),
+          ),
+          const SizedBox(height: 8),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: <Widget>[
+              TextButton(
+                onPressed: () => _resolvePrompt(false),
+                child: Text(p.cancelLabel),
+              ),
+              const SizedBox(width: 8),
+              FilledButton(
+                onPressed: () => _resolvePrompt(true),
+                child: Text(p.confirmLabel),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _controlPanel(bool hasResult) {
     return Padding(
       padding: const EdgeInsets.all(16),
@@ -390,29 +806,52 @@ class _SetupScreenState extends State<SetupScreen> {
           else
             ..._memoriseControls(),
 
-          const Divider(height: 32),
-          // Always available: entering select mode snaps to the next fractal to
-          // recall (Stage 0 is text, not selectable), and Reset returns to the
-          // configuration screen without restarting the app.
-          SwitchListTile(
-            contentPadding: EdgeInsets.zero,
-            title: const Text('Select mode'),
-            subtitle: const Text('Click your points to recall (or press S)'),
-            value: _selectMode,
-            onChanged: _setSelectMode,
-          ),
+          // Stage navigation — available as soon as stages are loaded, in any
+          // mode (generation, import, recall): toggle between loaded stages and
+          // study each under the canvas (zoom / pan / brightness). Stages not
+          // yet reached during a recall walk stay disabled until recalled.
+          if ((hasResult || _setup.phase == SetupPhase.recallComplete) &&
+              _setup.nStages > 1) ...<Widget>[
+            const Divider(height: 32),
+            _stageNav(),
+          ],
+
+          // Background generation progress: later stages are still deriving
+          // while the user studies the ones already done.
+          if (_setup.isGenerating || _setup.generationError != null) ...<Widget>[
+            const Divider(height: 32),
+            _generationNotice(),
+          ],
+
+          // The cold-start recall walk shows a per-stage hint while the user
+          // clicks their points back. There is no select-mode toggle: a recall
+          // session selects implicitly (the answer is hidden), and a
+          // generated/imported setup displays its points, so there is nothing to
+          // practise.
           if (_selectMode &&
               !_setup.isTextStage &&
-              _setup.phase != SetupPhase.recallComplete)
+              _setup.phase != SetupPhase.recallComplete) ...<Widget>[
+            const Divider(height: 32),
             Text(
               'Recalling Stage ${_setup.displayStageIndex}/'
-              '${_setup.nStages - 1} — click your one point to advance the '
-              'chain.',
+              '${_setup.nStages - 1} — click your point to mark it, then select '
+              'the next stage (tab or number key) to derive it.',
             ),
+          ],
 
-          // Blind export of the seed recalled so far — available at every stage
-          // once a point has been recalled, not only at the end. Before the
-          // final stage it is a partial, shorter-than-standard seed.
+          // Master-secret export — offered at every non-0 stage in every mode
+          // (generation, import, recall) the moment the stage is resolved, not
+          // only at the end. Exports exactly the prefix fixed so far.
+          if (_setup.canExportMasterAt(_setup.displayStageIndex) &&
+              _setup.phase != SetupPhase.recallComplete) ...<Widget>[
+            const Divider(height: 32),
+            ..._masterExportControls(),
+          ],
+
+          // Blind BIP39 export of the seed recalled so far — recall only (it
+          // needs the decoded points). Available at every recall stage once a
+          // point is back; before the final stage it is a partial,
+          // shorter-than-standard seed.
           if (_setup.canExport &&
               _setup.phase != SetupPhase.recallComplete) ...<Widget>[
             const Divider(height: 32),
@@ -428,7 +867,7 @@ class _SetupScreenState extends State<SetupScreen> {
               style: Theme.of(context).textTheme.bodySmall,
             ),
             const SizedBox(height: 12),
-            ..._exportControls(),
+            _bip39CopyButton(),
           ],
 
           OutlinedButton.icon(
@@ -453,7 +892,7 @@ class _SetupScreenState extends State<SetupScreen> {
           const Text(
             'Hold L and scroll over the canvas to adjust brightness; '
             'scroll to zoom, drag to pan; press R to recenter, T to cycle '
-            'stages, S to select.',
+            'stages, 0–8 to jump to a stage, K to copy the key.',
             textAlign: TextAlign.center,
           ),
           const SizedBox(height: 24),
@@ -494,82 +933,31 @@ class _SetupScreenState extends State<SetupScreen> {
       else ...<Widget>[
         if (_source == _SourceMode.recall) ...<Widget>[
           Text(
-            'Recall an existing setup: enter the same salt, size and Argon2 '
-            'settings you used, then click your memorised point on each stage. '
-            'Nothing is encoded — the seed is rebuilt from your clicks.',
+            'Recall an existing setup: enter the same salt, number of stages and '
+            'Argon2 settings you used, then click your memorised point on each '
+            'stage. Nothing is encoded — the seed is rebuilt from your clicks.',
             style: Theme.of(context).textTheme.bodySmall,
           ),
           const SizedBox(height: 8),
         ],
-        const Text('Size'),
-        DropdownButton<SizePreset>(
-          isExpanded: true,
-          value: _preset,
-          onChanged: _busy
-              ? null
-              : (SizePreset? v) {
-                  _sounds.play(UiSound.click);
-                  setState(() => _preset = v ?? _preset);
-                },
-          items: <DropdownMenuItem<SizePreset>>[
-            for (final SizePreset p in SizePreset.values)
-              DropdownMenuItem<SizePreset>(
-                value: p,
-                child: Text('${p.name} — ${p.bip39Words} words '
-                    '(${p.entropyBits}-bit)'),
-              ),
-          ],
-        ),
+        ..._stagesInput(),
       ],
       const SizedBox(height: 16),
       ..._stage0Input(),
       const SizedBox(height: 16),
-      const Text('Argon2 profile'),
-      DropdownButton<Argon2Profile>(
-        isExpanded: true,
-        value: _profile,
-        onChanged: _busy
-            ? null
-            : (Argon2Profile? v) {
-                _sounds.play(UiSound.click);
-                setState(() => _profile = v ?? _profile);
-              },
-        items: const <DropdownMenuItem<Argon2Profile>>[
-          DropdownMenuItem<Argon2Profile>(
-            value: Argon2Profile.basic,
-            child: Text('Basic (1 GiB)'),
-          ),
-          DropdownMenuItem<Argon2Profile>(
-            value: Argon2Profile.advanced,
-            child: Text('Advanced (32 GiB)'),
-          ),
-          DropdownMenuItem<Argon2Profile>(
-            value: Argon2Profile.greatWall,
-            child: Text('Great Wall (128 GiB)'),
-          ),
-        ],
-      ),
+      _argon2ProfileSlider(),
       const SizedBox(height: 16),
-      Text('Argon2 iterations: $_iterations'),
-      Slider(
-        value: _iterations.toDouble(),
-        min: 0,
-        max: 20,
-        divisions: 20,
-        label: '$_iterations',
-        onChanged: _busy
-            ? null
-            : (double v) => setState(() => _iterations = v.round()),
-      ),
+      ..._iterationsInput(),
       const SizedBox(height: 16),
       if (_source == _SourceMode.recall)
         FilledButton(
-          onPressed: _busy ? null : _beginRecall,
+          onPressed: (_busy || !_iterationsValid) ? null : _beginRecall,
           child: const Text('Begin recall'),
         )
       else
         FilledButton(
           onPressed: (_busy ||
+                  !_iterationsValid ||
                   (_source == _SourceMode.import &&
                       _mnemonic.text.trim().isEmpty))
               ? null
@@ -585,6 +973,135 @@ class _SetupScreenState extends State<SetupScreen> {
         ),
       ],
     ];
+  }
+
+  /// Discrete slider for the number of fractal **point stages**, with nine
+  /// positions `0..maxPointStages` (0..8). `divisions` snaps to whole stages so
+  /// there is no ambiguous in-between value. 0 is a Stage-0-text-only setup; each
+  /// higher position adds one 32-bit fractal stage (`32 × count` bits / `3 ×
+  /// count` BIP39 words). Every position is valid, so — unlike the old free-text
+  /// field — there is nothing to flag and the action button stays enabled across
+  /// the range. (N denotes the Argon2 iteration count, set separately.)
+  List<Widget> _stagesInput() {
+    final int n = _pointStages;
+    final int maxN = SetupController.maxPointStages;
+    final String summary = n == 0
+        ? 'Stage-0 text only — no fractal points.'
+        : '$n fractal stage${n == 1 ? '' : 's'} — ${n * 32} bits, '
+            '${n * 3} BIP39 words.';
+    return <Widget>[
+      Text('Number of stages: $n'),
+      _withHelp(
+        'Number of stages (0–8): how many fractal points your seed has. '
+        '0 = Stage-0 text only; 8 = 24 words / 256 bits.',
+        Slider(
+          value: n.toDouble(),
+          min: 0,
+          max: maxN.toDouble(),
+          divisions: maxN,
+          label: '$n',
+          onChanged: _busy
+              ? null
+              : (double v) {
+                  final int next = v.round();
+                  if (next == _pointStages) return;
+                  _sounds.play(UiSound.click);
+                  setState(() => _pointStages = next);
+                },
+        ),
+      ),
+      Text(summary, style: Theme.of(context).textTheme.bodySmall),
+    ];
+  }
+
+  /// Free numeric input for **N**, the per-stage Argon2 iteration count. The
+  /// range is essentially 0..∞ — a deliberately heavy setup may take hours,
+  /// days, or weeks to derive — so there is no upper cap, only a digit limit
+  /// guarding the int parse. Larger N ⇒ proportionally longer derivation. (The
+  /// time a given N takes drifts with hardware; N itself is exact and
+  /// reproducible — see docs §"time is a perishable label on a durable
+  /// parameter".)
+  List<Widget> _iterationsInput() {
+    final String raw = _iterationsField.text.trim();
+    final bool invalid = raw.isNotEmpty && !_iterationsValid;
+    return <Widget>[
+      const Text('Argon2 iterations (N)'),
+      const SizedBox(height: 4),
+      _withHelp(
+        'Argon2 iterations (N): per-stage memory-hard passes. Unbounded — a '
+        'higher N means a longer, stronger derivation (hours to weeks).',
+        TextField(
+          controller: _iterationsField,
+          enabled: !_busy,
+          maxLines: 1,
+          keyboardType: TextInputType.number,
+          inputFormatters: <TextInputFormatter>[
+            FilteringTextInputFormatter.digitsOnly,
+            LengthLimitingTextInputFormatter(12),
+          ],
+          decoration: InputDecoration(
+            isDense: true,
+            border: const OutlineInputBorder(),
+            hintText: 'e.g. 1',
+            helperText: 'Per-stage Argon2 passes — no upper limit; a high N can '
+                'take hours, days, even weeks to derive.',
+            helperMaxLines: 2,
+            errorText: invalid ? 'Enter a whole number (0 or more).' : null,
+          ),
+          onChanged: (_) {
+            _sounds.play(UiSound.click);
+            final int? v = int.tryParse(_iterationsField.text.trim());
+            if (v != null && v >= 0) _iterations = v;
+            setState(() {});
+          },
+        ),
+      ),
+    ];
+  }
+
+  /// The three Argon2 memory profiles in ascending cost, paired with their
+  /// slider labels (`Argon2Profile` order == ascending GiB).
+  static const List<Argon2Profile> _profiles = <Argon2Profile>[
+    Argon2Profile.basic,
+    Argon2Profile.advanced,
+    Argon2Profile.greatWall,
+  ];
+  static const List<String> _profileLabels = <String>[
+    'Basic — 1 GiB',
+    'Advanced — 32 GiB',
+    'Great Wall — 128 GiB',
+  ];
+
+  /// The Argon2 memory profile, chosen on a three-stop slider rather than a
+  /// dropdown so the memory cost reads as one escalating axis next to the
+  /// iteration-count (N) field.
+  Widget _argon2ProfileSlider() {
+    final int idx = _profiles.indexOf(_profile).clamp(0, _profiles.length - 1);
+    return _withHelp(
+      'Argon2 profile: memory per pass — Basic 1 GiB, Advanced 32 GiB, '
+      'Great Wall 128 GiB. Higher resists parallel attack harder.',
+      Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          Text('Argon2 profile: ${_profileLabels[idx]}'),
+          Slider(
+            value: idx.toDouble(),
+            min: 0,
+            max: (_profiles.length - 1).toDouble(),
+            divisions: _profiles.length - 1,
+            label: _profileLabels[idx],
+            onChanged: _busy
+                ? null
+                : (double v) {
+                    final Argon2Profile next = _profiles[v.round()];
+                    if (next == _profile) return;
+                    _sounds.play(UiSound.click);
+                    setState(() => _profile = next);
+                  },
+          ),
+        ],
+      ),
+    );
   }
 
   /// The obscured BIP39 import field plus a live word-count hint. The phrase is
@@ -717,51 +1234,22 @@ class _SetupScreenState extends State<SetupScreen> {
       const Text('Recall your points'),
       const SizedBox(height: 8),
       Text(
-        'Select mode is on. Click your memorised point on each stage in turn; '
-        'each correct point derives the next fractal (the same Argon2 cost as '
-        'setup). Nothing is shown — the seed is rebuilt only from your clicks.',
+        'Select mode is on. Click your memorised point to mark it, then select '
+        'the next stage (its tab or number key) to derive that fractal (the '
+        'same Argon2 cost as setup). Nothing is shown — the seed is rebuilt only '
+        'from your clicks.',
         style: Theme.of(context).textTheme.bodySmall,
       ),
     ];
   }
 
   List<Widget> _memoriseControls() {
-    final int idx = _setup.displayStageIndex;
-    final int n = _setup.nStages;
     return <Widget>[
       const Text('Memorise your points'),
-      const SizedBox(height: 8),
-      // Stage 0 is the salt/pepper text (no point); stages 1..N-1 are the
-      // chain-derived fractals, one point each. Step through with the arrows / T.
-      Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: <Widget>[
-          IconButton(
-            tooltip: 'Previous stage',
-            onPressed: idx > 0
-                ? () {
-                    _sounds.play(UiSound.select);
-                    _setup.showStage(idx - 1);
-                  }
-                : null,
-            icon: const Icon(Icons.chevron_left),
-          ),
-          Text(idx == 0
-              ? 'Stage 0 — salt / pepper'
-              : 'Stage $idx / ${n - 1}'),
-          IconButton(
-            tooltip: 'Next stage',
-            onPressed: idx < n - 1
-                ? () {
-                    _sounds.play(UiSound.select);
-                    _setup.showStage(idx + 1);
-                  }
-                : null,
-            icon: const Icon(Icons.chevron_right),
-          ),
-        ],
-      ),
       const SizedBox(height: 16),
+      // Stage 0 is the salt/pepper text (no point); stages 1..N-1 are the
+      // chain-derived fractals, one point each. Step through with the stage
+      // navigator below (or the arrows / T).
       Text(
         'Stage 0 is the salt/pepper you entered; each later stage is its own '
         'fractal carrying one point. Study the marked location on every fractal '
@@ -803,45 +1291,166 @@ class _SetupScreenState extends State<SetupScreen> {
         style: Theme.of(context).textTheme.bodySmall,
       ),
       const SizedBox(height: 16),
-      ..._exportControls(),
+      _bip39CopyButton(),
+      const SizedBox(height: 24),
+      ..._masterExportControls(),
       const SizedBox(height: 24),
       FilledButton(onPressed: _reset, child: const Text('Done')),
     ];
   }
 
-  /// The blind-copy affordances (BIP39 phrase + SHA-512(seed + salt)). Shared by
-  /// the per-stage partial export and the recall-complete panel; both operate on
-  /// whatever has been recalled so far via [SetupController.exportMnemonic].
-  List<Widget> _exportControls() {
+  /// Step between stages of the active session. The left arrow focuses the
+  /// previous (always-loaded) stage; the right arrow focuses the next stage if
+  /// it is derived, or — when it is the first not-yet-derived stage — triggers
+  /// its derivation (the same as selecting it by tab or number key). Disabled at
+  /// the ends or while a derivation is running.
+  Widget _stageNav() {
+    final int idx = _setup.displayStageIndex;
+    final int n = _setup.nStages;
+    final bool canPrev = idx > 0;
+    final bool canNext = !_busy &&
+        idx + 1 < n &&
+        (_setup.isStageAvailable(idx + 1) ||
+            // Only a recall walk derives the next stage on demand; during
+            // background generation the next stage arrives on its own.
+            (_setup.isRecallSession &&
+                idx + 1 == _setup.firstUnderivedStage));
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: <Widget>[
+        IconButton(
+          tooltip: 'Previous stage',
+          onPressed: canPrev ? () => _selectStage(idx - 1) : null,
+          icon: const Icon(Icons.chevron_left),
+        ),
+        Text(idx == 0 ? 'Stage 0 — salt / pepper' : 'Stage $idx / ${n - 1}'),
+        IconButton(
+          tooltip: 'Next stage',
+          onPressed: canNext ? () => _selectStage(idx + 1) : null,
+          icon: const Icon(Icons.chevron_right),
+        ),
+      ],
+    );
+  }
+
+  /// A subtle, non-blocking notice while later stages derive in the background
+  /// (or a one-line warning if a background derivation failed). The stages
+  /// already derived are fully navigable meanwhile; focus stays put.
+  Widget _generationNotice() {
+    final String? err = _setup.generationError;
+    if (err != null) {
+      return Text(err, style: const TextStyle(color: Colors.orangeAccent));
+    }
+    final int total = _setup.nStages - 1;
+    final double? progress =
+        _setup.argon2Total > 0 ? _setup.argon2Done / _setup.argon2Total : null;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Text(
+          'Deriving stage ${_setup.generatingStage}/$total in the background — '
+          'the stages already done are ready to study now.',
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
+        const SizedBox(height: 8),
+        LinearProgressIndicator(value: progress),
+      ],
+    );
+  }
+
+  /// The blind BIP39 seed-phrase copy. Operates on whatever has been recalled so
+  /// far via [SetupController.exportMnemonic]; shown only where a decoded seed
+  /// exists (the recall partial export and the recall-complete panel).
+  Widget _bip39CopyButton() {
+    return OutlinedButton.icon(
+      onPressed: _copyMnemonic,
+      icon: const Icon(Icons.content_copy),
+      label: const Text('Copy seed phrase (BIP39)'),
+    );
+  }
+
+  /// The master-secret export affordances for the **currently displayed** stage:
+  /// an explanation, the optional per-stage export-label field (restricted
+  /// `[A-Z0-9-]`, versioning the key), and the blind copy. The Argon2id pass
+  /// covers stages `1..displayStageIndex` (DESIGN.md §"Master-Secret Export").
+  List<Widget> _masterExportControls() {
+    final int idx = _setup.displayStageIndex;
     return <Widget>[
-      OutlinedButton.icon(
-        onPressed: _copyMnemonic,
-        icon: const Icon(Icons.content_copy),
-        label: const Text('Copy seed phrase (BIP39)'),
-      ),
-      const SizedBox(height: 16),
       Text(
-        'Or, for an app that accepts a non-BIP39 seed, copy '
-        'SHA-512(seed + salt). The salt labels this setup (e.g. "main '
-        'wallet") and keeps it distinct from your others; the long hex '
-        'string is also far harder to memorise by accident.',
+        'Key (master-secret export)',
+        style: Theme.of(context).textTheme.titleMedium,
+      ),
+      const SizedBox(height: 4),
+      Text(
+        'Argon2id over your setup so far (stages 1–$idx). Paste this key into '
+        'another wallet, derive a non-BIP39 secret, or use it as a downstream '
+        'pepper. The optional label versions the key (e.g. SIGNING-1) and is '
+        'mixed into the hash. Press K to derive and copy; copied blind — never '
+        'shown on screen.',
         style: Theme.of(context).textTheme.bodySmall,
       ),
       const SizedBox(height: 8),
       TextField(
-        controller: _salt,
+        controller: _exportLabel,
+        enabled: !_busy,
+        maxLines: 1,
+        autocorrect: false,
+        enableSuggestions: false,
+        inputFormatters: <TextInputFormatter>[
+          _SaltPepperFormatter(widget.core, _onExportLabelRestricted),
+        ],
         decoration: const InputDecoration(
           isDense: true,
           border: OutlineInputBorder(),
-          labelText: 'Descriptive salt',
-          hintText: 'e.g. main wallet',
+          labelText: 'Export label (optional)',
+          hintText: 'e.g. SIGNING-1',
+          helperText: 'Uppercase letters, digits and hyphens; any length.',
+          helperMaxLines: 2,
         ),
+        style: const TextStyle(
+          fontFamily: GreatWallTypography.fontFamily,
+          fontFamilyFallback: <String>['monospace'],
+        ),
+        onChanged: (_) {
+          _sounds.play(UiSound.click);
+          setState(() {});
+        },
       ),
+      if (_exportLabelRestricted)
+        Padding(
+          padding: const EdgeInsets.only(top: 6),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              Icon(
+                Icons.warning_amber_rounded,
+                size: 16,
+                color: Theme.of(context).colorScheme.error,
+              ),
+              const SizedBox(width: 4),
+              Expanded(
+                child: Text(
+                  'Adjusted to A–Z, 0–9 and "-" so it stays reproducible.',
+                  style: TextStyle(
+                    color: Theme.of(context).colorScheme.error,
+                    fontSize: 12,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
       const SizedBox(height: 8),
       OutlinedButton.icon(
-        onPressed: _copySaltedDigest,
-        icon: const Icon(Icons.content_copy),
-        label: const Text('Copy SHA-512(seed + salt)'),
+        onPressed: (_busy || _exporting) ? null : _copyMasterSecret,
+        icon: _exporting
+            ? const SizedBox(
+                width: 16,
+                height: 16,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              )
+            : const Icon(Icons.content_copy),
+        label: Text(_exporting ? 'Deriving…' : 'Copy key (K)'),
       ),
     ];
   }
@@ -860,22 +1469,80 @@ class _SetupScreenState extends State<SetupScreen> {
         'clipboard.');
   }
 
-  Future<void> _copySaltedDigest() async {
-    final String? digest = _setup.exportSaltedDigest(_salt.text);
-    if (digest == null) {
+  Future<void> _copyMasterSecret() async {
+    if (_exporting) return;
+    final int idx = _setup.displayStageIndex;
+    setState(() => _exporting = true);
+    // The Argon2id pass runs off the UI isolate, so this awaits; the finally
+    // clears the in-flight flag even if it fails, and we re-check `mounted`
+    // after the await before touching the clipboard or UI.
+    String? secret;
+    try {
+      secret = await _setup.exportMasterSecret(
+        stageIndex: idx,
+        label: _exportLabel.text,
+      );
+    } finally {
+      if (mounted) setState(() => _exporting = false);
+    }
+    if (!mounted) return;
+    if (secret == null) {
       _sounds.play(UiSound.deny);
       return;
     }
-    await Clipboard.setData(ClipboardData(text: digest));
+    await Clipboard.setData(ClipboardData(text: secret));
     if (!mounted) return;
     _sounds.play(UiSound.confirm);
-    _toast('SHA-512 digest copied — paste it, then clear the clipboard.');
+    // Confirmation never echoes the secret itself.
+    _toast('Key copied — paste it, then clear the clipboard.');
   }
 
+  /// Append a line to the console log (the app's toast surface).
   void _toast(String msg) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(duration: const Duration(milliseconds: 1400), content: Text(msg)),
+    if (!mounted) return;
+    setState(() {
+      _consoleLog.add(msg);
+      if (_consoleLog.length > 50) _consoleLog.removeRange(0, _consoleLog.length - 50);
+    });
+  }
+
+  /// Set the focus-help line when a control gains focus. Deferred to a
+  /// post-frame callback so it never runs mid-build (focus changes fire during
+  /// layout).
+  void _gainHelp(String help) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _focusHelp == help) return;
+      setState(() => _focusHelp = help);
+    });
+  }
+
+  /// Clear the focus-help line when a control loses focus — but only if it is
+  /// still showing this control's help (so the gain of the next control wins
+  /// regardless of callback order).
+  void _loseHelp(String help) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _focusHelp != help) return;
+      setState(() => _focusHelp = null);
+    });
+  }
+
+  /// Wrap [child] so that, while it (or a descendant, e.g. a text field) holds
+  /// focus, [help] is shown in the console. The wrapper is not itself a tab stop.
+  Widget _withHelp(String help, Widget child) {
+    return Focus(
+      canRequestFocus: false,
+      skipTraversal: true,
+      onFocusChange: (bool has) => has ? _gainHelp(help) : _loseHelp(help),
+      child: child,
     );
+  }
+
+  /// Answer the pending console confirmation, completing its future.
+  void _resolvePrompt(bool ok) {
+    final _ConsolePrompt? p = _prompt;
+    if (p == null) return;
+    setState(() => _prompt = null);
+    if (!p.completer.isCompleted) p.completer.complete(ok);
   }
 
   Future<void> _start() async {
@@ -895,8 +1562,9 @@ class _SetupScreenState extends State<SetupScreen> {
       // user can fix it).
       if (_setup.phase != SetupPhase.error) _mnemonic.clear();
     } else {
+      final int n = _pointStages;
       await _setup.begin(
-        preset: _preset,
+        pointStages: n,
         text: text,
         argon2Iterations: _iterations,
         profile: _profile,
@@ -915,10 +1583,11 @@ class _SetupScreenState extends State<SetupScreen> {
   /// Start a cold-start recall from the entered salt: derive Stage 1, then drop
   /// straight into select mode so the user can click their first point.
   Future<void> _beginRecall() async {
+    final int n = _pointStages;
     _sounds.play(UiSound.click);
     _brightness.reset();
     await _setup.beginRecall(
-      preset: _preset,
+      pointStages: n,
       text: _stage0.text,
       argon2Iterations: _iterations,
       profile: _profile,
@@ -931,20 +1600,23 @@ class _SetupScreenState extends State<SetupScreen> {
     // The salt now lives in the controller for the in-session walk; clear the
     // field so it is not left on screen.
     _stage0.clear();
-    setState(() => _selectMode = true);
+    _enterRecallSelect();
     _sounds.play(UiSound.confirm);
   }
 
   void _reset() {
     _sounds.play(UiSound.click);
+    _resolvePrompt(false); // drop any pending console confirmation
     _setup.reset();
     _brightness.reset();
     _viewport.viewport = _initialViewport;
     _mnemonic.clear();
     _stage0.clear();
+    _exportLabel.clear();
     setState(() {
       _selectMode = false;
       _stage0Hidden = true;
+      _exportLabelRestricted = false;
     });
   }
 }
@@ -953,6 +1625,107 @@ class _SetupScreenState extends State<SetupScreen> {
 /// imported BIP39 phrase, or a cold-start recall of an existing setup (derive
 /// from the salt and reconstruct the seed from the user's clicks).
 enum _SourceMode { fresh, import, recall }
+
+/// A confirmation rendered inline in the console (instead of a modal dialog).
+/// The console's action buttons complete [completer] with the user's choice.
+class _ConsolePrompt {
+  _ConsolePrompt({
+    required this.message,
+    required this.confirmLabel,
+    required this.cancelLabel,
+    required this.completer,
+  });
+
+  final String message;
+  final String confirmLabel;
+  final String cancelLabel;
+  final Completer<bool> completer;
+}
+
+/// Maps the number-row and numpad digit keys 0..8 to a stage index, so pressing
+/// a number focuses that stage (when no text field holds the keystroke). 9 is
+/// included so it produces the usual out-of-range cue rather than nothing.
+///
+/// Not `const`: [LogicalKeyboardKey] has no primitive `==`, so it cannot be a
+/// constant map key — a lazily-initialised `final` map is the idiomatic form.
+final Map<LogicalKeyboardKey, int> _digitKeys = <LogicalKeyboardKey, int>{
+  LogicalKeyboardKey.digit0: 0,
+  LogicalKeyboardKey.digit1: 1,
+  LogicalKeyboardKey.digit2: 2,
+  LogicalKeyboardKey.digit3: 3,
+  LogicalKeyboardKey.digit4: 4,
+  LogicalKeyboardKey.digit5: 5,
+  LogicalKeyboardKey.digit6: 6,
+  LogicalKeyboardKey.digit7: 7,
+  LogicalKeyboardKey.digit8: 8,
+  LogicalKeyboardKey.digit9: 9,
+  LogicalKeyboardKey.numpad0: 0,
+  LogicalKeyboardKey.numpad1: 1,
+  LogicalKeyboardKey.numpad2: 2,
+  LogicalKeyboardKey.numpad3: 3,
+  LogicalKeyboardKey.numpad4: 4,
+  LogicalKeyboardKey.numpad5: 5,
+  LogicalKeyboardKey.numpad6: 6,
+  LogicalKeyboardKey.numpad7: 7,
+  LogicalKeyboardKey.numpad8: 8,
+  LogicalKeyboardKey.numpad9: 9,
+};
+
+/// One numbered stage tab on the upper edge. Highlighted when it is the stage
+/// under focus, dimmed and non-interactive when not yet reachable.
+class _StageTab extends StatelessWidget {
+  const _StageTab({
+    required this.index,
+    required this.selected,
+    required this.available,
+    required this.onTap,
+  });
+
+  final int index;
+  final bool selected;
+  final bool available;
+
+  /// `null` when the tab is not reachable (outside the setup, or before a
+  /// session): the tab stays visible but greyed out and non-interactive.
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final ColorScheme scheme = Theme.of(context).colorScheme;
+    final Color fg = selected
+        ? scheme.onPrimary
+        : available
+            ? scheme.onSurface
+            : scheme.onSurface.withOpacity(0.35);
+    final Color bg = selected ? scheme.primary : Colors.transparent;
+    return Tooltip(
+      message: index == 0 ? 'Stage 0 — salt / pepper' : 'Stage $index',
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(6),
+        child: Container(
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: bg,
+            borderRadius: BorderRadius.circular(6),
+            border: Border.all(
+              color: selected ? scheme.primary : scheme.outlineVariant,
+            ),
+          ),
+          child: Text(
+            '$index',
+            style: TextStyle(
+              color: fg,
+              fontWeight: selected ? FontWeight.bold : FontWeight.normal,
+              fontFamily: GreatWallTypography.fontFamily,
+              fontFamilyFallback: const <String>['monospace'],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
 
 /// Constrains the Stage-0 salt/pepper to a safe, reproducible ASCII subset:
 /// uppercase letters, digits and hyphens. Lowercase is upper-cased; anything

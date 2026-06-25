@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
@@ -8,6 +9,7 @@ import '../core/bip39.dart';
 import '../core/encoding_constants.dart';
 import '../core/entropy.dart';
 import '../core/great_wall_core.dart';
+import '../core/master_secret.dart';
 import '../ffi/core_bindings.dart';
 import '../ffi/fixed.dart';
 import '../core/stage_params.dart';
@@ -37,18 +39,45 @@ enum SetupPhase {
   error,
 }
 
-/// Outcome of a select-mode click.
+/// Outcome of a select-mode click. Selecting a point only **marks** it on the
+/// displayed stage; deriving the next fractal is a separate step (selecting the
+/// next stage — see [deriveNextStage]).
 enum SelectionOutcome {
   /// The click did not land on an encodable leaf.
   invalid,
 
-  /// This stage's point was decoded and the chain advanced to the next stage.
-  advancedStage,
+  /// The point was marked on the displayed stage. The chain does not advance —
+  /// select the next stage to derive its fractal.
+  marked,
 
-  /// The final stage was selected; the seed has been reconstructed.
+  /// The final stage's point was marked; every stage is selected and the seed
+  /// has been reconstructed.
   complete,
 
-  /// A derivation is in progress, or the click was out of order; ignored.
+  /// A valid click that would overwrite a stage already selected **and** discard
+  /// the later fractals derived from it. The caller must confirm with the user,
+  /// then re-call with `confirmedReselect: true`.
+  needsConfirm,
+
+  /// A derivation is in progress, the stage is not a derived fractal, or the
+  /// walk is already complete; ignored.
+  busy,
+}
+
+/// Outcome of a [SetupController.deriveNextStage] request — triggered by
+/// selecting the first not-yet-derived stage.
+enum DeriveOutcome {
+  /// The next fractal was derived; the canvas is now on it, ready for its point.
+  derived,
+
+  /// The previous stage has no selected point yet, so there is nothing to derive
+  /// from — the caller surfaces an error to the user.
+  noPriorPoint,
+
+  /// There is no next stage to derive (every stage is already derived).
+  none,
+
+  /// A derivation is already in progress, or it was cancelled; ignored.
   busy,
 }
 
@@ -84,15 +113,25 @@ class SetupController extends ChangeNotifier {
   String? _errorMessage;
   String? get errorMessage => _errorMessage;
 
-  SizePreset _preset = SizePreset.defaultPreset;
-  SizePreset get preset => _preset;
+  /// Configured number of fractal **point stages** for a fresh/recall session
+  /// (1..[maxPointStages]). Each point stage is one 32-bit chunk, so this fixes
+  /// the entropy width (`32 ×`) — every value 1..8 is a valid setup, not just the
+  /// old mini/default/large presets. An imported seed phrase overrides it with
+  /// its own word count. Used only as the pre-session fallback for [nStages].
+  int _pointStages = 4;
+  int get configuredPointStages => _pointStages;
+
+  /// The largest number of point stages a setup may have: 8 (256-bit / 24-word
+  /// BIP39), the BIP39 ceiling. Stage 0 (text) sits on top, so the displayed
+  /// stages run 0..8 at most.
+  static const int maxPointStages = 8;
 
   /// Total number of displayed stages of the active session: the Stage-0 text
   /// stage plus one per 32-bit fractal point (`pointStageCount + 1`). For an
-  /// imported seed phrase the point count may be any 3..24-word size, not one of
-  /// the presets. Falls back to the configured preset before a session starts.
+  /// imported seed phrase the point count may be any 3..24-word size. Falls back
+  /// to the configured point-stage count before a session starts.
   int _stageCount = 0;
-  int get nStages => _stageCount > 0 ? _stageCount : _preset.nStages + 1;
+  int get nStages => _stageCount > 0 ? _stageCount : _pointStages + 1;
 
   /// Number of fractal point stages (`nStages - 1`): Stage 0 carries no point.
   int get pointStageCount => nStages - 1;
@@ -138,6 +177,19 @@ class SetupController extends ChangeNotifier {
   /// `null`. Every later stage is derived from the text + all preceding points.
   List<StageReservoirs?> _reservoirs = const <StageReservoirs?>[];
 
+  /// Each resolved stage's master-secret export record `(o, p, q, leaf-centre)`;
+  /// index 0 (the text stage) is always `null`. A fractal stage's record exists
+  /// once its **point** is known: at encode time for a fresh/imported setup
+  /// (every stage up-front), or as each point is decoded during a recall walk
+  /// (stages 1..k as they come back). Drives [canExportMasterAt] — see
+  /// [exportMasterSecret] and MasterSecret.
+  List<StageRecord?> _stageRecords = const <StageRecord?>[];
+
+  /// The Argon2 GUI iteration count of the active session — part of the export
+  /// transcript, so it is held for the session and must match across setup and
+  /// recall (see DESIGN.md §"Master-Secret Export").
+  int _iterations = 0;
+
   /// The displayed stage's perturbation as great-wall-ux's display surrogate
   /// (`null` for the Stage-0 text stage). The authoritative reservoirs live on
   /// [GreatWallCore.source]; see CoreEscapeCountSource.reservoirs.
@@ -146,29 +198,68 @@ class SetupController extends ChangeNotifier {
 
   Argon2Job? _argon2Job;
 
-  // --- Select-mode recall state ---
-  // The point selected on the stage being recalled (coercion-relevant; held
-  // only for the session). With one point per stage, selecting it advances the
-  // chain immediately, so this is only kept to mark the final stage's choice.
-  ({double re, double im})? _selectedMark;
+  /// The Argon2 memory profile of the active session, kept so the background
+  /// generation of later stages uses the same profile as Stage 1.
+  Argon2Profile _profile = Argon2Profile.basic;
 
-  // The 32-bit chunks decoded back so far, one per recalled stage, in order.
-  final List<List<int>> _recalledChunks = <List<int>>[];
+  /// True while stages **after Stage 1** are still deriving in the background.
+  /// The session is already interactive (phase `memorise`) by then; this only
+  /// drives the subtle progress notice and (via the UI) holds select-mode
+  /// practice off until the whole chain exists.
+  bool _isGenerating = false;
+  bool get isGenerating => _isGenerating;
+
+  /// The stage (1..N) currently deriving in the background, or 0 when not
+  /// generating. Drives the "Deriving stage k/N…" notice.
+  int _generatingStage = 0;
+  int get generatingStage => _generatingStage;
+
+  /// Set if a background stage derivation failed; the already-derived stages
+  /// stay usable, so this is surfaced as a non-fatal notice rather than the
+  /// error phase.
+  String? _generationError;
+  String? get generationError => _generationError;
+
+  // --- Select-mode recall state ---
+  // One per stage (index 0 — the text stage — is always null; 1..N hold each
+  // fractal's selection). A stage's point is **marked** by a click and the next
+  // fractal is derived as a separate step; navigating the chain is therefore
+  // decoupled from deriving it. Coercion-relevant; held only for the session.
+
+  /// The green marker the user placed on each stage (the recalled point), or
+  /// null where no point has been selected yet.
+  List<({double re, double im})?> _selectedMarks =
+      const <({double re, double im})?>[];
+
+  /// The decoded 32-bit chunk selected on each stage, or null. The recalled seed
+  /// is the concatenation of the contiguous run from stage 1.
+  List<List<int>?> _selectedChunks = const <List<int>?>[];
+
+  /// The reconstructed entropy root, set once every stage carries a point.
   List<int>? _recalledEntropyBits;
 
-  // The reservoirs for the fractal currently being recalled. The first fractal
-  // reuses the value derived at setup; every later fractal is re-derived from
-  // the text + recalled points when the previous point is selected, so the user
-  // sees the Argon2 work happen (the chain link by link, as protocol.py decode).
-  StageReservoirs? _recallReservoirs;
+  /// The lowest point stage (1..N) whose fractal is **not** yet derived — the one
+  /// a "select the next stage" action would derive. Equals [nStages] (a sentinel
+  /// past the last stage) when every fractal is already derived.
+  int get firstUnderivedStage {
+    for (int k = 1; k < nStages; k++) {
+      if (k >= _reservoirs.length || _reservoirs[k] == null) return k;
+    }
+    return nStages;
+  }
 
-  /// Display index of the next fractal a select-mode click should recall. Stage
-  /// 0 is the text stage, so the first fractal to recall is stage 1; it advances
-  /// as points come back (`recalled points + 1`).
-  int get recallStageIndex => _recalledChunks.length + 1;
+  /// Whether stage [k] (1..N) has a selected point.
+  bool hasSelectedPoint(int k) =>
+      k >= 1 && k < _selectedChunks.length && _selectedChunks[k] != null;
 
-  /// Points selected on the stage currently being recalled (0 or 1).
-  int get selectedCount => _selectedMark == null ? 0 : 1;
+  /// The green marker selected on stage [index], if any (for the canvas overlay).
+  ({double re, double im})? selectedMarkAt(int index) =>
+      (index >= 0 && index < _selectedMarks.length)
+          ? _selectedMarks[index]
+          : null;
+
+  /// Points selected on the stage currently displayed (0 or 1).
+  int get selectedCount => selectedMarkAt(_displayStageIndex) == null ? 0 : 1;
 
   /// Points required to complete a stage — always one under the chained
   /// protocol (one point = one stage).
@@ -177,18 +268,30 @@ class SetupController extends ChangeNotifier {
   /// True once every stage has been selected back and the seed reconstructed.
   bool get isRecallComplete => _recalledEntropyBits != null;
 
-  /// Stages recalled (decoded back) so far — equivalently, the number of
+  /// The contiguous run of selected chunks from stage 1 — the seed recalled so
+  /// far. Stops at the first stage without a point.
+  List<List<int>> _orderedSelectedChunks() {
+    final List<List<int>> out = <List<int>>[];
+    for (int k = 1; k < _selectedChunks.length; k++) {
+      final List<int>? chunk = _selectedChunks[k];
+      if (chunk == null) break;
+      out.add(chunk);
+    }
+    return out;
+  }
+
+  /// Stages recalled (points selected back) so far — equivalently, the number of
   /// 32-bit points making up the seed available for blind export right now.
-  int get recalledStageCount => _recalledChunks.length;
+  int get recalledStageCount => _orderedSelectedChunks().length;
 
   /// Bits available for blind export so far (`32 ×` [recalledStageCount]).
   int get recalledBitCount =>
-      _recalledChunks.length * EncodingConstants.bitsPerPoint;
+      recalledStageCount * EncodingConstants.bitsPerPoint;
 
   /// Whether any seed material has been recalled (so a blind export is
   /// possible). Below the final stage this is a partial, shorter-than-standard
   /// seed; at completion it is the full entropy root.
-  bool get canExport => _recalledChunks.isNotEmpty;
+  bool get canExport => recalledStageCount > 0;
 
   /// The seed recalled **so far** as a BIP39 mnemonic, for an explicit
   /// user-initiated **blind** export (copy → paste into another wallet's
@@ -202,24 +305,76 @@ class SetupController extends ChangeNotifier {
   /// is handed to the clipboard, never rendered on screen (ARCHITECTURE.md
   /// §"Stage 0" / §"Invariants"). It is computed on demand and not retained.
   String? exportMnemonic() {
-    if (_recalledChunks.isEmpty) return null;
+    final List<List<int>> chunks = _orderedSelectedChunks();
+    if (chunks.isEmpty) return null;
     final List<int> bits = <int>[
-      for (final List<int> chunk in _recalledChunks) ...chunk,
+      for (final List<int> chunk in chunks) ...chunk,
     ];
     final String mnemonic = Bip39.entropyBitsToMnemonic(bits);
     Entropy.wipe(bits);
     return mnemonic;
   }
 
-  /// `SHA-512(seed-phrase + salt)` as hex, for target apps that accept a
-  /// non-BIP39 high-entropy seed. The descriptive [salt] domain-separates one
-  /// setup from another, and the 128-hex-char digest is far harder to memorise
-  /// from a stray glance than the word list. Returns null until recall is
-  /// complete. Mirrors great-wall-core's standalone "Salt & SHA512" button.
-  String? exportSaltedDigest(String salt) {
-    final String? mnemonic = exportMnemonic();
-    if (mnemonic == null) return null;
-    return Bip39.saltedDigestHex(mnemonic, salt);
+  /// Whether the **master-secret export** is available at stage [stageIndex].
+  ///
+  /// True for any non-0 stage whose point is resolved (so its export record
+  /// exists) and whose every preceding stage is resolved too — i.e. the prefix
+  /// `1..stageIndex` is complete. For a fresh/imported setup that holds for all
+  /// stages once encoded; during a recall walk it holds for each stage as its
+  /// point is decoded. The export at stage `k` covers exactly that prefix and is
+  /// **not** contingent on later stages (DESIGN.md §"Master-Secret Export":
+  /// available at every non-0 stage).
+  bool canExportMasterAt(int stageIndex) {
+    if (stageIndex < 1 || stageIndex >= _stageRecords.length) return false;
+    for (int k = 1; k <= stageIndex; k++) {
+      if (_stageRecords[k] == null) return false;
+    }
+    return true;
+  }
+
+  /// Run the **master-secret export** at stage [stageIndex] (protocol 0.3.0):
+  /// one Argon2id pass over the reproducible setup transcript of stages
+  /// `1..stageIndex`, with the exporting stage's own [label] appended to the
+  /// message. Returns the conventional 32-hex-char display string, or null if
+  /// the stage is not exportable ([canExportMasterAt]).
+  ///
+  /// This **replaces** the `0.2.0` `SHA512(seed-phrase + salt)` export: the
+  /// transcript (stage-0 text, iteration count, and each stage's params +
+  /// leaf-centre) is an order-preserving function of the setup, so it tolerates
+  /// large peppers/outputs without entropy collapse and reproduces bit-for-bit
+  /// on recovery. It needs only the per-stage params and points the app already
+  /// holds to render the fractals — **not** the plaintext seed — so it honours
+  /// "the master secret is never shown" (the digest goes straight to the
+  /// clipboard, never to the screen).
+  ///
+  /// The heavy Argon2id pass runs off the UI isolate ([GreatWallCore
+  /// .argon2idMaster]). Coercion-relevant intermediates (the transcript message
+  /// and raw output) are wiped before returning.
+  Future<String?> exportMasterSecret({
+    required int stageIndex,
+    required String label,
+  }) async {
+    if (!canExportMasterAt(stageIndex)) return null;
+    final List<StageRecord> records = <StageRecord>[
+      for (int k = 1; k <= stageIndex; k++) _stageRecords[k]!,
+    ];
+    // Canonicalise the label through the engine — the same [A-Z0-9-] rule the
+    // input field enforces — so the transcript byte layout matches the protocol.
+    final Uint8List message = MasterSecret.buildExportTranscript(
+      stage0Text: _chainText,
+      iterations: _iterations,
+      records: records,
+      exportLabel: _core.canonicalizeSaltPepper(label),
+    );
+    final Uint8List raw = await _core.argon2idMaster(
+      message,
+      outLen: MasterSecret.outputBytes,
+    );
+    final String display = MasterSecret.displayHex(raw);
+    // Wipe the coercion-relevant transcript and raw output.
+    message.fillRange(0, message.length, 0);
+    raw.fillRange(0, raw.length, 0);
+    return display;
   }
 
   /// The point markers to overlay for the currently displayed stage: the single
@@ -229,6 +384,7 @@ class SetupController extends ChangeNotifier {
     final EncodedPoint? pt = _displayStageIndex < _points.length
         ? _points[_displayStageIndex]
         : null;
+    final ({double re, double im})? mark = selectedMarkAt(_displayStageIndex);
     return CanvasOverlays(
       points: <PointMarker>[
         if (pt != null)
@@ -238,10 +394,10 @@ class SetupController extends ChangeNotifier {
             colour: const Color(0xFFFFFFFF),
             radiusPx: 6,
           ),
-        if (_selectedMark != null)
+        if (mark != null)
           PointMarker(
-            re: _selectedMark!.re,
-            im: _selectedMark!.im,
+            re: mark.re,
+            im: mark.im,
             colour: const Color(0xFF00E676),
             radiusPx: 7,
           ),
@@ -252,18 +408,18 @@ class SetupController extends ChangeNotifier {
     );
   }
 
-  /// Run the full chained Setup pipeline on a **freshly generated** entropy
-  /// root of the configured [preset] size. [text] is the Stage-0 salt/pepper
-  /// that seeds the fractal chain.
+  /// Run the full chained Setup pipeline on a **freshly generated** entropy root
+  /// of [pointStages] fractal stages (each one 32-bit point, so `32 × pointStages`
+  /// bits). [text] is the Stage-0 salt/pepper that seeds the fractal chain.
   Future<void> begin({
-    required SizePreset preset,
+    required int pointStages,
     required String text,
     required int argon2Iterations,
     Argon2Profile profile = Argon2Profile.basic,
   }) {
-    _preset = preset;
+    _pointStages = pointStages;
     return _encodeRoot(
-      Entropy.randomBits(preset.entropyBits),
+      Entropy.randomBits(pointStages * EncodingConstants.bitsPerPoint),
       text: text,
       argon2Iterations: argon2Iterations,
       profile: profile,
@@ -319,6 +475,7 @@ class SetupController extends ChangeNotifier {
       return; // a run is already in progress
     }
     _errorMessage = null;
+    _generationError = null;
     _clearRecall();
     _isRecallSession = false;
     final int pointStages = bits.length ~/ EncodingConstants.bitsPerPoint;
@@ -326,62 +483,51 @@ class SetupController extends ChangeNotifier {
     // Canonicalise through the engine so the stored/displayed text is exactly
     // what gets hashed (the protocol rule lives in core, not here).
     _chainText = _core.canonicalizeSaltPepper(text);
+    _iterations = argon2Iterations;
+    _profile = profile;
     try {
       _entropyBits = bits;
       _points = List<EncodedPoint?>.filled(pointStages + 1, null);
       _reservoirs = List<StageReservoirs?>.filled(pointStages + 1, null);
+      _stageRecords = List<StageRecord?>.filled(pointStages + 1, null);
+      // Sized for the in-session practice recall (clicking your points back on
+      // the already-derived fractals); empty until a point is marked.
+      _selectedChunks = List<List<int>?>.filled(pointStages + 1, null);
+      _selectedMarks =
+          List<({double re, double im})?>.filled(pointStages + 1, null);
 
-      const int bpp = EncodingConstants.bitsPerPoint;
-      for (int k = 1; k <= pointStages; k++) {
-        _workingStageIndex = k;
-        // Stage k's fractal derives from the text + every preceding point
-        // (chunks 0..k-2) — one link of the memory-hard chain. Stage 1 derives
-        // from the text alone.
-        final List<int> priorPointBits = bits.sublist(0, (k - 1) * bpp);
-        final Uint8List input = _core.chainInput(_chainText, priorPointBits);
-        _setPhase(SetupPhase.deriving);
-        _argon2Total = argon2Iterations < 1 ? 1 : argon2Iterations;
-        _argon2Done = 0;
-        final Argon2Job job = await _core.startStageDerivation(
-          input,
-          iterations: argon2Iterations,
-          profile: profile,
-          onProgress: (int done, int total) {
-            _argon2Done = done;
-            _argon2Total = total;
-            notifyListeners();
-          },
-        );
-        _argon2Job = job;
-        final StageReservoirs reservoirs = await job.result;
-        _argon2Job = null;
-        Entropy.wipe(priorPointBits);
-        _reservoirs[k] = reservoirs;
-
-        // Encode this stage's single 32-bit point (entropy chunk k-1).
-        _setPhase(SetupPhase.encoding);
-        final List<int> chunk = bits.sublist((k - 1) * bpp, k * bpp);
-        final List<EncodedPoint> pts = _core.encodeStage(
-          chunk,
-          o: reservoirs.o,
-          p: reservoirs.p,
-          q: reservoirs.q,
-        );
-        _points[k] = pts.first;
-        Entropy.wipe(chunk);
-        notifyListeners();
+      // A text-only setup (0 point stages) has nothing to derive — land on the
+      // Stage-0 view straight away.
+      if (pointStages < 1) {
+        Entropy.wipe(bits);
+        _entropyBits = null;
+        _applyDisplayStage(0);
+        _setPhase(SetupPhase.memorise);
+        return;
       }
 
-      // Memorise. Plaintext entropy is no longer needed once it lives on the
-      // fractals as points — wipe it; keep only the points (and the Stage-0
-      // text, which recall needs to re-derive the chain) to display.
-      Entropy.wipe(bits);
-      _entropyBits = null;
-
-      // Land on the first fractal (Stage 1) to memorise; Stage 0 (text) is
-      // reachable with the stage navigation / T.
-      _applyDisplayStage(pointStages >= 1 ? 1 : 0);
+      // Derive Stage 1 in the foreground (full-screen progress): there is
+      // nothing to study until the first fractal exists. Hand control back the
+      // moment it is ready so the user can begin memorising it…
+      final bool ok = await _deriveAndEncodeStage(1, bits, foreground: true);
+      if (!ok) return; // aborted mid-derivation (session torn down)
+      _applyDisplayStage(1);
       _setPhase(SetupPhase.memorise);
+
+      if (pointStages == 1) {
+        Entropy.wipe(bits);
+        _entropyBits = null;
+        return;
+      }
+
+      // …while the remaining stages derive in the background. Each becomes
+      // navigable the moment it is encoded ([isStageAvailable]); the entropy
+      // root is kept alive until the last one is done, then wiped. The UI holds
+      // select-mode practice off until [isGenerating] clears.
+      _isGenerating = true;
+      _generatingStage = 2;
+      notifyListeners();
+      unawaited(_generateRemaining(bits, pointStages));
     } on Argon2Cancelled {
       _resetSecrets();
       _setPhase(SetupPhase.idle);
@@ -390,6 +536,114 @@ class SetupController extends ChangeNotifier {
       // Error text is deliberately generic — never include coordinates/bits.
       _errorMessage = 'Setup failed: ${e.runtimeType}';
       _setPhase(SetupPhase.error);
+    }
+  }
+
+  /// Derive and encode a single fractal stage [k] over the entropy [bits].
+  ///
+  /// [foreground] drives the full-screen progress overlay (phase deriving →
+  /// encoding) for the blocking Stage-1 derivation; background stages leave the
+  /// phase at `memorise` and report progress only through [generatingStage] and
+  /// the Argon2 counters, so the canvas stays interactive. The reservoirs and
+  /// the encoded point are stored as soon as they exist, so the stage is
+  /// navigable immediately after this returns. Returns `false` if the session
+  /// was torn down (Reset/abort) while the derivation was in flight, in which
+  /// case nothing was stored.
+  Future<bool> _deriveAndEncodeStage(
+    int k,
+    List<int> bits, {
+    required bool foreground,
+  }) async {
+    const int bpp = EncodingConstants.bitsPerPoint;
+    _workingStageIndex = k;
+    // Stage k's fractal derives from the text + every preceding point
+    // (chunks 0..k-2) — one link of the memory-hard chain. Stage 1 derives
+    // from the text alone.
+    final List<int> priorPointBits = bits.sublist(0, (k - 1) * bpp);
+    final Uint8List input = _core.chainInput(_chainText, priorPointBits);
+    if (foreground) _setPhase(SetupPhase.deriving);
+    _argon2Total = _iterations < 1 ? 1 : _iterations;
+    _argon2Done = 0;
+    notifyListeners();
+    final Argon2Job job = await _core.startStageDerivation(
+      input,
+      iterations: _iterations,
+      profile: _profile,
+      onProgress: (int done, int total) {
+        _argon2Done = done;
+        _argon2Total = total;
+        notifyListeners();
+      },
+    );
+    _argon2Job = job;
+    final StageReservoirs reservoirs = await job.result;
+    _argon2Job = null;
+    Entropy.wipe(priorPointBits);
+    // Drop the result if the session was reset/aborted mid-flight, rather than
+    // writing into the torn-down arrays.
+    if (_entropyBits == null || k >= _reservoirs.length) {
+      reservoirs.clear();
+      return false;
+    }
+    _reservoirs[k] = reservoirs;
+
+    // Encode this stage's single 32-bit point (entropy chunk k-1).
+    if (foreground) _setPhase(SetupPhase.encoding);
+    final List<int> chunk = bits.sublist((k - 1) * bpp, k * bpp);
+    final List<EncodedPoint> pts = _core.encodeStage(
+      chunk,
+      o: reservoirs.o,
+      p: reservoirs.p,
+      q: reservoirs.q,
+    );
+    _points[k] = pts.first;
+    // Record this stage's export contribution: its params and the centre of
+    // the encoded point's leaf rectangle (DESIGN.md §"Master-Secret Export").
+    final ({int re, int im}) leaf =
+        MasterSecret.leafCentreRaw(pts.first.leafRect);
+    _stageRecords[k] = StageRecord(
+      o: reservoirs.o,
+      p: reservoirs.p,
+      q: reservoirs.q,
+      leafReRaw: leaf.re,
+      leafImRaw: leaf.im,
+    );
+    Entropy.wipe(chunk);
+    notifyListeners();
+    return true;
+  }
+
+  /// Derive the stages after Stage 1 in the background, one at a time, while the
+  /// user studies the stages already done. Owns [bits] for the duration and
+  /// wipes the entropy root once the last stage is encoded (or on abort). A
+  /// failure leaves the stages derived so far intact and surfaces
+  /// [generationError].
+  Future<void> _generateRemaining(List<int> bits, int pointStages) async {
+    try {
+      for (int k = 2; k <= pointStages; k++) {
+        _generatingStage = k;
+        notifyListeners();
+        final bool ok = await _deriveAndEncodeStage(k, bits, foreground: false);
+        if (!ok) return; // session torn down — finally cleans up
+      }
+    } on Argon2Cancelled {
+      // Aborted (e.g. Reset) — the stages already derived stay valid; the rest
+      // simply never appear. _resetSecrets has wiped the session.
+      return;
+    } catch (e) {
+      _generationError =
+          'Stage $_generatingStage failed to derive (${e.runtimeType}); '
+          'the earlier stages are still usable.';
+    } finally {
+      _isGenerating = false;
+      _generatingStage = 0;
+      // The entropy root is no longer needed once every stage carries its point
+      // (skip if a reset already wiped it).
+      if (_entropyBits != null) {
+        Entropy.wipe(bits);
+        _entropyBits = null;
+      }
+      notifyListeners();
     }
   }
 
@@ -418,14 +672,14 @@ class SetupController extends ChangeNotifier {
   /// their memorised point on each stage in turn — exactly as [selectPoint]
   /// continues the chain.
   ///
-  /// [preset] fixes how many point stages the seed has (so the walk knows when
-  /// it is complete); [argon2Iterations] and [profile] MUST match the original
-  /// setup or every derived fractal will differ and no point will decode.
-  /// Nothing is encoded and no target markers are shown — recall reconstructs
-  /// the seed purely from the user's clicks. Secrets stay in-session and are
-  /// never logged (SCOPE.md invariants).
+  /// [pointStages] fixes how many point stages the seed has (so the walk knows
+  /// when it is complete); [argon2Iterations] and [profile] MUST match the
+  /// original setup or every derived fractal will differ and no point will
+  /// decode. Nothing is encoded and no target markers are shown — recall
+  /// reconstructs the seed purely from the user's clicks. Secrets stay
+  /// in-session and are never logged (SCOPE.md invariants).
   Future<void> beginRecall({
-    required SizePreset preset,
+    required int pointStages,
     required String text,
     required int argon2Iterations,
     Argon2Profile profile = Argon2Profile.basic,
@@ -437,11 +691,15 @@ class SetupController extends ChangeNotifier {
     // Start from a clean session; no encoded points exist in a recall.
     _resetSecrets();
     _errorMessage = null;
-    _preset = preset;
-    _stageCount = preset.nStages + 1; // Stage-0 text + one per point stage
+    _pointStages = pointStages;
+    _stageCount = pointStages + 1; // Stage-0 text + one per point stage
     _chainText = _core.canonicalizeSaltPepper(text);
+    _iterations = argon2Iterations;
     _points = List<EncodedPoint?>.filled(_stageCount, null);
     _reservoirs = List<StageReservoirs?>.filled(_stageCount, null);
+    _stageRecords = List<StageRecord?>.filled(_stageCount, null);
+    _selectedChunks = List<List<int>?>.filled(_stageCount, null);
+    _selectedMarks = List<({double re, double im})?>.filled(_stageCount, null);
     try {
       _workingStageIndex = 1;
       _setPhase(SetupPhase.deriving);
@@ -461,10 +719,11 @@ class SetupController extends ChangeNotifier {
       _argon2Job = job;
       final StageReservoirs reservoirs = await job.result;
       _argon2Job = null;
-      // Land on Stage 1, ready for the first select-mode click.
-      _recallReservoirs = reservoirs;
+      // Land on Stage 1, the first fractal, ready for its point. Only Stage 1 is
+      // derived (it needs no prior point); the rest derive one at a time as the
+      // user selects each next stage.
+      _reservoirs[1] = reservoirs;
       _applyReservoirs(1, reservoirs);
-      _selectedMark = null;
       _isRecallSession = true;
       _setPhase(SetupPhase.memorise);
     } on Argon2Cancelled {
@@ -477,53 +736,59 @@ class SetupController extends ChangeNotifier {
     }
   }
 
-  /// Snap the canvas to the fractal stage the recall walk is on. Called when the
-  /// user enters select mode so the click lands on the right fractal (the chain
-  /// must be recalled in order). The first fractal reuses the setup-derived
-  /// reservoirs (Stage 0 — the text — is reused in-session, not re-entered; its
-  /// recall verification belongs to CPNF). No-op once recall is complete.
+  /// Snap the canvas to the first stage still awaiting a point — where a
+  /// select-mode click should land. Called when the user enters select mode. The
+  /// first such stage is the lowest derived fractal without a selected point;
+  /// if every derived fractal already has a point, it snaps to the first
+  /// not-yet-derived stage (so selecting it derives the next link). No-op once
+  /// recall is complete or before a session exists.
   void showRecallStage() {
     if (isRecallComplete || _stageCount == 0) return;
-    final int target = recallStageIndex; // 1..N
-    _recallReservoirs ??=
-        (target < _reservoirs.length) ? _reservoirs[target] : null;
-    _applyReservoirs(target, _recallReservoirs);
-    notifyListeners();
+    final int target = _focusStageForRecall();
+    if (target >= 1 && target < nStages) {
+      _applyDisplayStage(target);
+      notifyListeners();
+    }
+  }
+
+  /// The stage the recall walk should focus: the lowest derived fractal without
+  /// a point, else the first not-yet-derived stage (capped at the last stage).
+  int _focusStageForRecall() {
+    for (int k = 1; k < nStages; k++) {
+      final bool derived = k < _reservoirs.length && _reservoirs[k] != null;
+      if (derived && !hasSelectedPoint(k)) return k;
+    }
+    final int next = firstUnderivedStage;
+    return next < nStages ? next : nStages - 1;
   }
 
   /// Handle a select-mode click: decode the point under the cursor on the
-  /// fractal currently shown, then walk the chain forward, **re-running the
-  /// chained Argon2 derivation** to form the next stage's fractal.
+  /// fractal currently shown and **mark** it as this stage's recalled point. The
+  /// chain does **not** advance here — deriving the next fractal is a separate,
+  /// explicit step ([deriveNextStage]), triggered by selecting the next stage.
   ///
-  /// The recall mirrors encoding (protocol.py `decode_entropy`): the first
-  /// fractal (Stage 1) is derived from the Stage-0 text; decoding its point
-  /// feeds the recalled bits + text to a memory-hard Argon2 pass that derives
-  /// Stage 2's `(o,p,q)`; and so on. Each link hashes the text plus every point
-  /// recalled so far, so a stage's fractal does not exist until its derivation
-  /// finishes — the wall-clock cost the protocol is built on. The last stage
-  /// completes the full entropy (concatenated per-point bits).
+  /// Marking is synchronous (no Argon2). Decoding mirrors encoding (protocol.py
+  /// `decode_entropy`): the point is decoded under this stage's reservoirs into
+  /// its 32-bit chunk. When the marked point belongs to a stage that already had
+  /// one **and** later fractals were derived from it, those later fractals are
+  /// now stale; the caller must confirm (the click returns [SelectionOutcome
+  /// .needsConfirm]) and re-call with [confirmedReselect] to discard them.
   ///
   /// Decoded bits and coordinates stay inside the session and are never logged
   /// (SCOPE.md invariants).
-  Future<SelectionOutcome> selectPoint(
+  SelectionOutcome selectPoint(
     FractalSelection selection, {
-    required SizePreset preset,
-    required int argon2Iterations,
-    Argon2Profile profile = Argon2Profile.basic,
-  }) async {
+    bool confirmedReselect = false,
+  }) {
     if (_phase == SetupPhase.deriving ||
         _phase == SetupPhase.recallComplete) {
       return SelectionOutcome.busy;
     }
-    _preset = preset;
 
     final int k = _displayStageIndex;
-    // Recall must proceed in order: the displayed fractal must be the next one
-    // to recall. Stage 0 (text) has no point to select.
-    if (k == 0 || k != recallStageIndex) return SelectionOutcome.busy;
-
-    // Decode under the reservoirs for the fractal being recalled.
-    final StageReservoirs? r = _recallReservoirs;
+    // Only a derived fractal stage can carry a point. Stage 0 (text) cannot.
+    if (k < 1 || k >= _reservoirs.length) return SelectionOutcome.busy;
+    final StageReservoirs? r = _reservoirs[k];
     if (r == null) return SelectionOutcome.busy;
 
     final CoreDecodeResult result = _core.decodePoint(
@@ -535,29 +800,69 @@ class SetupController extends ChangeNotifier {
     );
     if (!result.valid) return SelectionOutcome.invalid;
 
-    _selectedMark = (re: selection.re, im: selection.im);
-    notifyListeners();
+    // Re-selecting a stage whose later fractals were derived **from its point**
+    // discards them — confirm first. Only in a recall walk are later fractals a
+    // function of this point; in a generated setup every fractal already exists
+    // (from the real entropy), so re-clicking is just a practice correction.
+    final bool discardsDownstream =
+        _isRecallSession && hasSelectedPoint(k) && _hasDerivedAfter(k);
+    if (discardsDownstream && !confirmedReselect) {
+      return SelectionOutcome.needsConfirm;
+    }
 
-    if (k == nStages - 1) {
-      // Final fractal recalled: reconstruct the full entropy root. No further
-      // derivation — there is no next fractal to form.
-      _recalledChunks.add(result.bits);
+    // Record this stage's point and its master-secret export record (its
+    // reservoirs + the centre of the decoded point's leaf rectangle).
+    _selectedMarks[k] = (re: selection.re, im: selection.im);
+    _setSelectedChunk(k, result.bits);
+    final ({int re, int im}) leaf = MasterSecret.leafCentreRaw(result.leafRect);
+    _stageRecords[k] = StageRecord(
+      o: r.o,
+      p: r.p,
+      q: r.q,
+      leafReRaw: leaf.re,
+      leafImRaw: leaf.im,
+    );
+
+    // Any later fractals were derived from this stage's previous point; they are
+    // now invalid. Discard them so the chain stays consistent.
+    if (discardsDownstream) _discardAfter(k);
+
+    // Reaching a full set of points reconstructs the seed.
+    if (_allPointsSelected()) {
       _recalledEntropyBits = <int>[
-        for (final List<int> chunk in _recalledChunks) ...chunk,
+        for (int j = 1; j < nStages; j++) ..._selectedChunks[j]!,
       ];
       _setPhase(SetupPhase.recallComplete);
       return SelectionOutcome.complete;
     }
+    notifyListeners();
+    return SelectionOutcome.marked;
+  }
 
-    // Derive the next fractal by hashing the text + every point recalled so far
-    // (points 0..k-1, i.e. all prior chunks and this one) — one chain link.
+  /// Derive the **first not-yet-derived** stage's fractal — the explicit step
+  /// that advances the chain, triggered by selecting that stage. The fractal is
+  /// the memory-hard hash of the Stage-0 text plus every preceding point
+  /// (protocol.py `decode_entropy`), so the previous stage MUST already carry a
+  /// selected point ([DeriveOutcome.noPriorPoint] otherwise). On success the
+  /// canvas lands on the new fractal, ready for its point.
+  Future<DeriveOutcome> deriveNextStage({
+    required int argon2Iterations,
+    Argon2Profile profile = Argon2Profile.basic,
+  }) async {
+    if (_phase == SetupPhase.deriving) return DeriveOutcome.busy;
+    final int target = firstUnderivedStage;
+    if (target >= nStages) return DeriveOutcome.none; // all derived
+    // The next fractal hashes the points of every prior stage; they must exist.
+    for (int k = 1; k < target; k++) {
+      if (!hasSelectedPoint(k)) return DeriveOutcome.noPriorPoint;
+    }
+
     final List<int> priorPointBits = <int>[
-      for (final List<int> chunk in _recalledChunks) ...chunk,
-      ...result.bits,
+      for (int k = 1; k < target; k++) ..._selectedChunks[k]!,
     ];
     final Uint8List input = _core.chainInput(_chainText, priorPointBits);
     try {
-      _workingStageIndex = k + 1;
+      _workingStageIndex = target;
       _setPhase(SetupPhase.deriving);
       _argon2Total = argon2Iterations < 1 ? 1 : argon2Iterations;
       _argon2Done = 0;
@@ -576,21 +881,56 @@ class SetupController extends ChangeNotifier {
       _argon2Job = null;
       Entropy.wipe(priorPointBits);
 
-      // Commit: record this stage's point and advance to the new fractal.
-      _recalledChunks.add(result.bits);
-      _recallReservoirs = reservoirs;
-      _applyReservoirs(k + 1, reservoirs);
-      _selectedMark = null;
+      _reservoirs[target] = reservoirs;
+      _applyDisplayStage(target);
       _setPhase(SetupPhase.memorise);
-      return SelectionOutcome.advancedStage;
+      return DeriveOutcome.derived;
     } on Argon2Cancelled {
-      // Roll back: stage k is not advanced, so the user can retry the click.
       Entropy.wipe(priorPointBits);
       _argon2Job = null;
-      _selectedMark = null;
       _setPhase(SetupPhase.memorise);
-      return SelectionOutcome.busy;
+      return DeriveOutcome.busy;
     }
+  }
+
+  /// Whether any stage after [k] currently holds a derived fractal.
+  bool _hasDerivedAfter(int k) {
+    for (int j = k + 1; j < nStages; j++) {
+      if (j < _reservoirs.length && _reservoirs[j] != null) return true;
+    }
+    return false;
+  }
+
+  /// Store stage [k]'s selected chunk, wiping any previous one.
+  void _setSelectedChunk(int k, List<int> bits) {
+    final List<int>? old = _selectedChunks[k];
+    if (old != null) Entropy.wipe(old);
+    _selectedChunks[k] = bits;
+  }
+
+  /// Discard every stage after [k] — their derived fractals and any selected
+  /// points (now stale because stage [k]'s point changed).
+  void _discardAfter(int k) {
+    for (int j = k + 1; j < nStages; j++) {
+      _reservoirs[j]?.clear();
+      _reservoirs[j] = null;
+      final List<int>? chunk = _selectedChunks[j];
+      if (chunk != null) Entropy.wipe(chunk);
+      _selectedChunks[j] = null;
+      _selectedMarks[j] = null;
+      _stageRecords[j] = null;
+    }
+    final List<int>? rec = _recalledEntropyBits;
+    if (rec != null) Entropy.wipe(rec);
+    _recalledEntropyBits = null;
+  }
+
+  /// True once every point stage (1..N) carries a selected point.
+  bool _allPointsSelected() {
+    for (int k = 1; k < nStages; k++) {
+      if (!hasSelectedPoint(k)) return false;
+    }
+    return nStages > 1;
   }
 
   /// Point the canvas + render source at [index] using explicit [res] reservoirs
@@ -606,11 +946,26 @@ class SetupController extends ChangeNotifier {
     }
   }
 
-  /// Clear the current stage's pending selection mark.
+  /// Clear the displayed stage's selected point (mark, chunk and export record).
   void clearSelection() {
-    if (_selectedMark == null) return;
-    _selectedMark = null;
+    final int k = _displayStageIndex;
+    if (selectedMarkAt(k) == null) return;
+    _selectedMarks[k] = null;
+    final List<int>? old = _selectedChunks[k];
+    if (old != null) Entropy.wipe(old);
+    _selectedChunks[k] = null;
+    _stageRecords[k] = null;
     notifyListeners();
+  }
+
+  /// Whether stage [index] can currently be shown: the Stage-0 text stage, or a
+  /// fractal already derived this session. In generation / import every stage is
+  /// available once the setup is encoded; during a recall walk it becomes
+  /// available as its fractal is reached. Drives the stage-navigation arrows.
+  bool isStageAvailable(int index) {
+    if (index < 0 || index >= nStages) return false;
+    if (index == 0) return true;
+    return index < _reservoirs.length && _reservoirs[index] != null;
   }
 
   /// Switch the displayed stage during memorisation. Only stages that can be
@@ -670,16 +1025,14 @@ class SetupController extends ChangeNotifier {
   }
 
   void _clearRecall() {
-    _selectedMark = null;
-    for (final List<int> chunk in _recalledChunks) {
-      Entropy.wipe(chunk);
+    for (final List<int>? chunk in _selectedChunks) {
+      if (chunk != null) Entropy.wipe(chunk);
     }
-    _recalledChunks.clear();
+    _selectedChunks = const <List<int>?>[];
+    _selectedMarks = const <({double re, double im})?>[];
     final List<int>? rec = _recalledEntropyBits;
     if (rec != null) Entropy.wipe(rec);
     _recalledEntropyBits = null;
-    _recallReservoirs?.clear();
-    _recallReservoirs = null;
   }
 
   void _resetSecrets() {
@@ -691,10 +1044,15 @@ class SetupController extends ChangeNotifier {
       r?.clear();
     }
     _reservoirs = const <StageReservoirs?>[];
+    _stageRecords = const <StageRecord?>[];
+    _iterations = 0;
     _displayParams = null;
     _stageCount = 0;
     _chainText = '';
     _isRecallSession = false;
+    _isGenerating = false;
+    _generatingStage = 0;
+    _generationError = null;
     _core.source.reservoirs?.clear();
     _core.source.reservoirs = null;
     _clearRecall();

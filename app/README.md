@@ -55,6 +55,31 @@ encoded onto the fractals as points to memorise, then wiped (`ARCHITECTURE.md`
 finish/reset; verifying its recall on a fresh device belongs to the trainer
 (CPNF), which will store only a hash of it. Nothing is persisted or logged.
 
+### Stage navigation and the master-secret export
+
+Once a session has loaded stages — in generation, import, **or** recall — the
+control panel offers a **stage navigator** (`◂ Stage k / N-1 ▸`, or `T`) that
+toggles between the loaded stages so each fractal can be studied under focus
+(zoom / pan / brightness). Stages not yet reached during a recall walk stay
+disabled until they are recalled.
+
+Every **non-0** stage also offers the **master-secret export**
+(`lib/src/core/master_secret.dart`, `SetupController.exportMasterSecret`): one
+**Argon2id** pass over the reproducible setup transcript of stages
+`1..displayStage` — the Stage-0 text, the iteration count, and each stage's
+`(o, p, q)` and encoded-point leaf-centre — with that stage's own optional,
+restricted (`[A-Z0-9-]`) **export label** appended to the message and the fixed
+salt `b"greatwall"`. This **replaces** the `0.2.0` `SHA512(seed + salt)` button
+(great-wall-core `DESIGN.md` §"Master-Secret Export"; engine
+`bs_argon2id_master`). It is available at every non-0 stage and is **not**
+contingent on completing later stages — the convenience primitive behind
+amendable setups (truncate-early / extend-later). Because the transcript is
+built only from the params and points the app already holds to render the
+fractals — never the plaintext seed — the digest goes straight to the clipboard,
+blind: the master secret is still never shown on screen. The heavy Argon2id pass
+runs off the UI isolate; only the conventional first 32 hex characters are
+surfaced (the full 1024-byte output is a deferred TODO).
+
 > Protocol ownership: the Stage-0 byte operations — salt/pepper canonicalization
 > (uppercase ASCII `A-Z0-9-`) and the chain-input layout
 > (`canonicalize(text) ‖ bits_to_bytes(prior_points)`) — are **protocol** and

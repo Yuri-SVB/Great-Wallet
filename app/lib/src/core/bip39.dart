@@ -1,4 +1,3 @@
-import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
@@ -64,19 +63,6 @@ class Bip39 {
       out.write(bip39English[idx]);
     }
     return out.toString();
-  }
-
-  /// `SHA-512(utf8(mnemonic + salt))` as a lowercase hex string.
-  ///
-  /// Matches great-wall-core's standalone "Salt & SHA512" button exactly
-  /// (viewer.py: `hashlib.sha512((mnemonic + salt).encode("utf-8")).hexdigest()`).
-  /// Intended for target wallets / apps that accept a non-BIP39 high-entropy
-  /// seed: a 128-hex-char digest is far harder to accidentally memorise from a
-  /// stray glance than the word list, and the descriptive salt domain-separates
-  /// one setup from another (see ARCHITECTURE.md §"Stage 0").
-  static String saltedDigestHex(String mnemonic, String salt) {
-    final Uint8List data = Uint8List.fromList(utf8.encode(mnemonic + salt));
-    return sha512.convert(data).toString();
   }
 
   /// Hard cap: 24 words / 256 entropy bits (constants.MAX_ENTROPY_BITS).
