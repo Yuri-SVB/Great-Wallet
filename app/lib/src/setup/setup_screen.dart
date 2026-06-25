@@ -42,6 +42,27 @@ class _SetupScreenState extends State<SetupScreen> {
   /// to it after the user has been typing in a text field.
   final FocusNode _hotkeys = FocusNode(debugLabel: 'setup-hotkeys');
 
+  // Focus nodes for the input controls, so an Alt+key shortcut can jump focus
+  // straight to each one (and so the salt/import/export fields can drive the
+  // console focus-help, which the sliders/N field get via _withHelp). A node
+  // whose `context` is null is simply not on screen in the current mode.
+  final FocusNode _stage0Focus = FocusNode(debugLabel: 'salt');
+  final FocusNode _iterationsFocus = FocusNode(debugLabel: 'iterations');
+  final FocusNode _stagesFocus = FocusNode(debugLabel: 'stages');
+  final FocusNode _profileFocus = FocusNode(debugLabel: 'profile');
+  final FocusNode _mnemonicFocus = FocusNode(debugLabel: 'import');
+  final FocusNode _exportLabelFocus = FocusNode(debugLabel: 'export-label');
+
+  static const String _saltHelp =
+      'Stage 0 salt/pepper: seeds the fractal chain. A public label or a '
+      'secret pasted pepper (uppercase letters, digits, hyphen).';
+  static const String _importHelp =
+      'Import phrase: an existing BIP39 mnemonic to encode onto the fractals '
+      '(kept hidden).';
+  static const String _exportHelp =
+      'Export label: appended to the master-secret transcript to version the '
+      'derived key (uppercase letters, digits, hyphen).';
+
   /// Per-stage **master-secret export label** (e.g. `SIGNING-1`). Appended to
   /// the Argon2id transcript message at the exporting stage, versioning the
   /// derived secret — DESIGN.md §"Master-Secret Export". Same restricted
@@ -157,7 +178,15 @@ class _SetupScreenState extends State<SetupScreen> {
   void initState() {
     super.initState();
     _setup.addListener(_onSetupChanged);
+    // Drive the console focus-help for the fields not wrapped in _withHelp.
+    _stage0Focus.addListener(() => _focusHelpFor(_stage0Focus, _saltHelp));
+    _mnemonicFocus.addListener(() => _focusHelpFor(_mnemonicFocus, _importHelp));
+    _exportLabelFocus
+        .addListener(() => _focusHelpFor(_exportLabelFocus, _exportHelp));
   }
+
+  void _focusHelpFor(FocusNode node, String help) =>
+      node.hasFocus ? _gainHelp(help) : _loseHelp(help);
 
   void _onSetupChanged() {
     if (!mounted) return;
@@ -182,6 +211,12 @@ class _SetupScreenState extends State<SetupScreen> {
     _mnemonic.dispose();
     _stage0.dispose();
     _hotkeys.dispose();
+    _stage0Focus.dispose();
+    _iterationsFocus.dispose();
+    _stagesFocus.dispose();
+    _profileFocus.dispose();
+    _mnemonicFocus.dispose();
+    _exportLabelFocus.dispose();
     super.dispose();
   }
 
@@ -197,10 +232,43 @@ class _SetupScreenState extends State<SetupScreen> {
       _setup.phase == SetupPhase.memorise ||
       _setup.phase == SetupPhase.recallComplete;
 
+  /// Move keyboard focus to an input field by its node. If the field is not on
+  /// screen in the current mode (`context == null`), say so in the console
+  /// instead of silently doing nothing.
+  void _focusField(FocusNode node, String label) {
+    if (node.context == null) {
+      _toast('The $label field is not available in this mode.');
+      return;
+    }
+    _sounds.play(UiSound.click);
+    node.requestFocus();
+  }
+
+  /// Alt+key shortcuts that jump focus to each input field. Handled by
+  /// [CallbackShortcuts] so they fire even while another text field has focus
+  /// (where the raw [_onKey] handler defers to the field).
+  Map<ShortcutActivator, VoidCallback> get _focusShortcuts =>
+      <ShortcutActivator, VoidCallback>{
+        const SingleActivator(LogicalKeyboardKey.keyS, alt: true): () =>
+            _focusField(_stage0Focus, 'salt / pepper'),
+        const SingleActivator(LogicalKeyboardKey.keyN, alt: true): () =>
+            _focusField(_iterationsFocus, 'Argon2 iterations'),
+        const SingleActivator(LogicalKeyboardKey.keyG, alt: true): () =>
+            _focusField(_stagesFocus, 'number of stages'),
+        const SingleActivator(LogicalKeyboardKey.keyP, alt: true): () =>
+            _focusField(_profileFocus, 'Argon2 profile'),
+        const SingleActivator(LogicalKeyboardKey.keyI, alt: true): () =>
+            _focusField(_mnemonicFocus, 'import phrase'),
+        const SingleActivator(LogicalKeyboardKey.keyL, alt: true): () =>
+            _focusField(_exportLabelFocus, 'export label'),
+      };
+
   @override
   Widget build(BuildContext context) {
     final bool hasResult = _setup.phase == SetupPhase.memorise;
-    return Focus(
+    return CallbackShortcuts(
+      bindings: _focusShortcuts,
+      child: Focus(
       focusNode: _hotkeys,
       autofocus: true,
       onKeyEvent: _onKey,
@@ -249,6 +317,7 @@ class _SetupScreenState extends State<SetupScreen> {
           // Foot of the screen: the console (single message surface).
           _console(),
         ],
+      ),
       ),
     );
   }
@@ -1011,6 +1080,7 @@ class _SetupScreenState extends State<SetupScreen> {
         'Number of stages (0–8): how many fractal points your seed has. '
         '0 = Stage-0 text only; 8 = 24 words / 256 bits.',
         Slider(
+          focusNode: _stagesFocus,
           value: n.toDouble(),
           min: 0,
           max: maxN.toDouble(),
@@ -1048,6 +1118,7 @@ class _SetupScreenState extends State<SetupScreen> {
         'higher N means a longer, stronger derivation (hours to weeks).',
         TextField(
           controller: _iterationsField,
+          focusNode: _iterationsFocus,
           enabled: !_busy,
           maxLines: 1,
           keyboardType: TextInputType.number,
@@ -1101,6 +1172,7 @@ class _SetupScreenState extends State<SetupScreen> {
         children: <Widget>[
           Text('Argon2 profile: ${_profileLabels[idx]}'),
           Slider(
+            focusNode: _profileFocus,
             value: idx.toDouble(),
             min: 0,
             max: (_profiles.length - 1).toDouble(),
@@ -1144,6 +1216,7 @@ class _SetupScreenState extends State<SetupScreen> {
       const SizedBox(height: 4),
       TextField(
         controller: _mnemonic,
+        focusNode: _mnemonicFocus,
         obscureText: _mnemonicHidden,
         enabled: !_busy,
         maxLines: 1,
@@ -1182,6 +1255,7 @@ class _SetupScreenState extends State<SetupScreen> {
       const SizedBox(height: 4),
       TextField(
         controller: _stage0,
+        focusNode: _stage0Focus,
         obscureText: _stage0Hidden,
         enabled: !_busy,
         maxLines: 1,
@@ -1408,6 +1482,7 @@ class _SetupScreenState extends State<SetupScreen> {
       const SizedBox(height: 8),
       TextField(
         controller: _exportLabel,
+        focusNode: _exportLabelFocus,
         enabled: !_busy,
         maxLines: 1,
         autocorrect: false,
