@@ -917,15 +917,8 @@ class _SetupScreenState extends State<SetupScreen> {
           else
             ..._memoriseControls(),
 
-          // Stage navigation — available as soon as stages are loaded, in any
-          // mode (generation, import, recall): toggle between loaded stages and
-          // study each under the canvas (zoom / pan / brightness). Stages not
-          // yet reached during a recall walk stay disabled until recalled.
-          if ((hasResult || _setup.phase == SetupPhase.recallComplete) &&
-              _setup.nStages > 1) ...<Widget>[
-            const Divider(height: 32),
-            _stageNav(),
-          ],
+          // (Stage navigation lives in the fixed 0–8 tab bar above the canvas;
+          // the redundant "< Stage k / N >" row was dropped.)
 
           // Background generation progress: later stages are still deriving
           // while the user studies the ones already done.
@@ -1345,8 +1338,8 @@ class _SetupScreenState extends State<SetupScreen> {
       const Text('Memorise your points'),
       const SizedBox(height: 16),
       // Stage 0 is the salt/pepper text (no point); stages 1..N-1 are the
-      // chain-derived fractals, one point each. Step through with the stage
-      // navigator below (or the arrows / T).
+      // chain-derived fractals, one point each. Step through with the 0–8 tab
+      // bar or number keys (press a stage again to zoom to its point).
       Text(
         'Stage 0 is the salt/pepper you entered; each later stage is its own '
         'fractal carrying one point. Study the marked location on every fractal '
@@ -1396,40 +1389,6 @@ class _SetupScreenState extends State<SetupScreen> {
     ];
   }
 
-  /// Step between stages of the active session. The left arrow focuses the
-  /// previous (always-loaded) stage; the right arrow focuses the next stage if
-  /// it is derived, or — when it is the first not-yet-derived stage — triggers
-  /// its derivation (the same as selecting it by tab or number key). Disabled at
-  /// the ends or while a derivation is running.
-  Widget _stageNav() {
-    final int idx = _setup.displayStageIndex;
-    final int n = _setup.nStages;
-    final bool canPrev = idx > 0;
-    final bool canNext = !_busy &&
-        idx + 1 < n &&
-        (_setup.isStageAvailable(idx + 1) ||
-            // Only a recall walk derives the next stage on demand; during
-            // background generation the next stage arrives on its own.
-            (_setup.isRecallSession &&
-                idx + 1 == _setup.firstUnderivedStage));
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-      children: <Widget>[
-        IconButton(
-          tooltip: 'Previous stage',
-          onPressed: canPrev ? () => _selectStage(idx - 1) : null,
-          icon: const Icon(Icons.chevron_left),
-        ),
-        Text(idx == 0 ? 'Stage 0 — salt / pepper' : 'Stage $idx / ${n - 1}'),
-        IconButton(
-          tooltip: 'Next stage',
-          onPressed: canNext ? () => _selectStage(idx + 1) : null,
-          icon: const Icon(Icons.chevron_right),
-        ),
-      ],
-    );
-  }
-
   /// A subtle, non-blocking notice while later stages derive in the background
   /// (or a one-line warning if a background derivation failed). The stages
   /// already derived are fully navigable meanwhile; focus stays put.
@@ -1471,22 +1430,8 @@ class _SetupScreenState extends State<SetupScreen> {
   /// `[A-Z0-9-]`, versioning the key), and the blind copy. The Argon2id pass
   /// covers stages `1..displayStageIndex` (DESIGN.md §"Master-Secret Export").
   List<Widget> _masterExportControls() {
-    final int idx = _setup.displayStageIndex;
+    // Heading + explanation live in the console (focus _Field.exportLabel).
     return <Widget>[
-      Text(
-        'Key (master-secret export)',
-        style: Theme.of(context).textTheme.titleMedium,
-      ),
-      const SizedBox(height: 4),
-      Text(
-        'Argon2id over your setup so far (stages 1–$idx). Paste this key into '
-        'another wallet, derive a non-BIP39 secret, or use it as a downstream '
-        'pepper. The optional label versions the key (e.g. SIGNING-1) and is '
-        'mixed into the hash. Press K to derive and copy; copied blind — never '
-        'shown on screen.',
-        style: Theme.of(context).textTheme.bodySmall,
-      ),
-      const SizedBox(height: 8),
       _track(
         _Field.exportLabel,
         TextField(
@@ -1673,8 +1618,12 @@ class _SetupScreenState extends State<SetupScreen> {
         return 'Import phrase: $wc words → ${wc ~/ 3} stages'
             '${standard ? '' : ' (sub-standard length)'}.';
       case _Field.exportLabel:
-        return 'Export label: versions the derived master secret (uppercase '
-            'letters, digits, hyphen).';
+        final int idx = _setup.displayStageIndex;
+        return 'Key (master-secret export): Argon2id over your setup so far '
+            '(stages 1–$idx). Paste into another wallet or use as a downstream '
+            'pepper. This optional label versions the key (e.g. SIGNING-1, '
+            'uppercase/digits/hyphen). Press K to derive and copy — blind, '
+            'never shown.';
       case _Field.hue:
         return 'Colour scheme: ${_hue.name}. ← → to cycle through the six hues.';
     }
