@@ -424,11 +424,16 @@ class _SetupScreenState extends State<SetupScreen> {
       _setSource(_SourceMode.recall, focusInput: true);
       return KeyEventResult.handled;
     }
-    // Field focus (uniform coverage): S salt · P profile · D derivation steps ·
-    // X export label. Each no-ops with a console note if its field is not in the
-    // current mode.
+    // Field focus (uniform coverage): S salt/export · P profile · D derivation
+    // steps. The salt (config) and export-label (session) fields never coexist,
+    // so S covers whichever is on screen. Each no-ops with a console note if its
+    // field is not in the current mode.
     if (event.logicalKey == LogicalKeyboardKey.keyS) {
-      _focusField(_stage0Focus, 'salt / pepper');
+      if (_stage0Focus.context != null) {
+        _focusField(_stage0Focus, 'salt / pepper');
+      } else {
+        _focusField(_exportLabelFocus, 'export label');
+      }
       return KeyEventResult.handled;
     }
     if (event.logicalKey == LogicalKeyboardKey.keyP) {
@@ -437,10 +442,6 @@ class _SetupScreenState extends State<SetupScreen> {
     }
     if (event.logicalKey == LogicalKeyboardKey.keyD) {
       _focusField(_iterationsFocus, 'derivation steps');
-      return KeyEventResult.handled;
-    }
-    if (event.logicalKey == LogicalKeyboardKey.keyX) {
-      _focusField(_exportLabelFocus, 'export label');
       return KeyEventResult.handled;
     }
     // A — abort an in-progress derivation, behind a console confirmation
@@ -788,7 +789,7 @@ class _SetupScreenState extends State<SetupScreen> {
               const SizedBox(height: 12),
               TextButton(
                 onPressed: _setup.requestStop,
-                child: const Text('Stop'),
+                child: const Text('Abort'),
               ),
             ],
           ],
@@ -807,7 +808,7 @@ class _SetupScreenState extends State<SetupScreen> {
     'H  manual   M  minimize / restore chrome   Z  reset (asks first)',
     '0–8  go to that stage (recenters); press again to zoom to its point',
     'N / I / R  New seed / Import / Recall (also focuses its input)',
-    'S salt · P profile · D derivation steps · X export label · C colour',
+    'S salt / export label · P profile · D derivation steps · C colour',
     'Enter  start (Generate / Encode / Begin recall) from a field',
     'K  copy the master secret ("the key")    A  abort a running derivation',
     'L+scroll brightness · scroll zoom · drag pan (over the canvas)',
@@ -1284,7 +1285,7 @@ class _SetupScreenState extends State<SetupScreen> {
           decoration: InputDecoration(
             isDense: true,
             border: const OutlineInputBorder(),
-            labelText: 'Derivation steps between stages',
+            labelText: 'Derivation steps / stage',
             hintText: 'e.g. 1',
             errorText: invalid ? 'Enter a whole number (0 or more).' : null,
           ),
