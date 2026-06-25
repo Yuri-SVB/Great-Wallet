@@ -300,6 +300,12 @@ class _SetupScreenState extends State<SetupScreen> {
     // While a text field (salt, seed phrase, …) holds focus, let it consume the
     // keystroke — never fire canvas shortcuts like S / R.
     if (_textInputHasFocus) return KeyEventResult.ignored;
+    // ` — minimize / restore the console and the stage-tab bar together.
+    if (event.logicalKey == LogicalKeyboardKey.backquote) {
+      _sounds.play(UiSound.click);
+      setState(() => _chromeMinimized = !_chromeMinimized);
+      return KeyEventResult.handled;
+    }
     if (event.logicalKey == LogicalKeyboardKey.keyR) {
       _resetView();
       return KeyEventResult.handled;
