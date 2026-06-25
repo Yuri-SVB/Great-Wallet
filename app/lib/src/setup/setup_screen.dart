@@ -443,6 +443,18 @@ class _SetupScreenState extends State<SetupScreen> {
       _focusField(_exportLabelFocus, 'export label');
       return KeyEventResult.handled;
     }
+    // A — abort an in-progress derivation (foreground Stage-1 or background
+    // generation of later stages). (TLP solving will hook in here too.)
+    if (event.logicalKey == LogicalKeyboardKey.keyA) {
+      if (_busy || _setup.isGenerating) {
+        _sounds.play(UiSound.click);
+        _setup.requestStop();
+        _toast('Derivation aborted.');
+      } else {
+        _sounds.play(UiSound.deny);
+      }
+      return KeyEventResult.handled;
+    }
     // K — derive and copy the exported master secret ("the key") for the stage
     // under focus.
     if (event.logicalKey == LogicalKeyboardKey.keyK) {
@@ -786,7 +798,7 @@ class _SetupScreenState extends State<SetupScreen> {
     'N / I / R  New seed / Import / Recall (also focuses its input)',
     'S salt · P profile · D derivation steps · X export label · C colour',
     'Enter  start (Generate / Encode / Begin recall) from a field',
-    'K  copy the master secret ("the key") for the focused stage',
+    'K  copy the master secret ("the key")    A  abort a running derivation',
     'L+scroll brightness · scroll zoom · drag pan (over the canvas)',
   ];
 
