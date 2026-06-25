@@ -95,19 +95,26 @@ class _SetupScreenState extends State<SetupScreen> {
 
   HueOffset _hue = HueOffset.red;
   Argon2Profile _profile = Argon2Profile.basic;
+  /// N — the per-stage **Argon2 iteration count**, entered as a free number.
+  /// Essentially unbounded (0..∞): a deliberately heavy setup may take hours,
+  /// days, or weeks to derive, so N is a numeric field rather than a capped
+  /// slider. [_iterations] holds the last in-range value; [_iterationsValid]
+  /// gates the action buttons while the field is empty or malformed.
   int _iterations = 1;
-
-  /// Number of fractal **point stages** (N) for a fresh/recall setup, set by a
-  /// numeric text field. Every value 1..[SetupController.maxPointStages] is a
-  /// valid setup (`32 × N` bits), not just the old mini/default/large presets.
-  /// Held as text so the field can show an out-of-range hint; [_pointStages]
-  /// returns the parsed value when it is in range, else null.
-  final TextEditingController _stagesField = TextEditingController(text: '4');
-  int? get _pointStages {
-    final int? n = int.tryParse(_stagesField.text.trim());
-    if (n == null || n < 1 || n > SetupController.maxPointStages) return null;
-    return n;
+  final TextEditingController _iterationsField =
+      TextEditingController(text: '1');
+  bool get _iterationsValid {
+    final int? n = int.tryParse(_iterationsField.text.trim());
+    return n != null && n >= 0;
   }
+
+  /// Number of fractal **point stages** for a fresh/recall setup, chosen on a
+  /// discrete slider with nine positions, 0..[SetupController.maxPointStages].
+  /// 0 is a Stage-0-text-only setup (no fractal points); each higher position
+  /// adds one 32-bit fractal stage (`32 × count` bits / `3 × count` BIP39
+  /// words). Every position is a valid setup, so the count needs no validity
+  /// gate. (N is reserved for the Argon2 iteration count, below.)
+  int _pointStages = 4;
 
   /// Configuration source: generate a fresh random seed, import an existing
   /// (possibly sub-standard) BIP39 phrase, or recall an existing setup from its
@@ -142,7 +149,7 @@ class _SetupScreenState extends State<SetupScreen> {
     _viewport.dispose();
     _brightness.dispose();
     _sounds.dispose();
-    _stagesField.dispose();
+    _iterationsField.dispose();
     _exportLabel.dispose();
     _mnemonic.dispose();
     _stage0.dispose();
@@ -740,29 +747,19 @@ class _SetupScreenState extends State<SetupScreen> {
         ],
       ),
       const SizedBox(height: 16),
-      Text('Argon2 iterations: $_iterations'),
-      Slider(
-        value: _iterations.toDouble(),
-        min: 0,
-        max: 20,
-        divisions: 20,
-        label: '$_iterations',
-        onChanged: _busy
-            ? null
-            : (double v) => setState(() => _iterations = v.round()),
-      ),
+      ..._iterationsInput(),
       const SizedBox(height: 16),
       if (_source == _SourceMode.recall)
         FilledButton(
-          onPressed: (_busy || _pointStages == null) ? null : _beginRecall,
+          onPressed: (_busy || !_iterationsValid) ? null : _beginRecall,
           child: const Text('Begin recall'),
         )
       else
         FilledButton(
           onPressed: (_busy ||
+                  !_iterationsValid ||
                   (_source == _SourceMode.import &&
-                      _mnemonic.text.trim().isEmpty) ||
-                  (_source == _SourceMode.fresh && _pointStages == null))
+                      _mnemonic.text.trim().isEmpty))
               ? null
               : _start,
           child: Text(
@@ -778,42 +775,76 @@ class _SetupScreenState extends State<SetupScreen> {
     ];
   }
 
-  /// Numeric input for N — the number of fractal point stages (1..8). A whole
-  /// number rather than a preset, since every count in that range is a valid
-  /// setup (`32 × N` bits / `3 × N` BIP39 words). The live hint shows the derived
-  /// width; an out-of-range entry is flagged and disables the action button.
+  /// Discrete slider for the number of fractal **point stages**, with nine
+  /// positions `0..maxPointStages` (0..8). `divisions` snaps to whole stages so
+  /// there is no ambiguous in-between value. 0 is a Stage-0-text-only setup; each
+  /// higher position adds one 32-bit fractal stage (`32 × count` bits / `3 ×
+  /// count` BIP39 words). Every position is valid, so — unlike the old free-text
+  /// field — there is nothing to flag and the action button stays enabled across
+  /// the range. (N denotes the Argon2 iteration count, set separately.)
   List<Widget> _stagesInput() {
-    final int? n = _pointStages;
-    final String raw = _stagesField.text.trim();
-    final String? error = (raw.isNotEmpty && n == null)
-        ? 'Enter a whole number from 1 to ${SetupController.maxPointStages}.'
-        : null;
+    final int n = _pointStages;
+    final int maxN = SetupController.maxPointStages;
+    final String summary = n == 0
+        ? 'Stage-0 text only — no fractal points.'
+        : '$n fractal stage${n == 1 ? '' : 's'} — ${n * 32} bits, '
+            '${n * 3} BIP39 words.';
     return <Widget>[
-      const Text('Number of stages (N)'),
+      Text('Number of stages: $n'),
+      Slider(
+        value: n.toDouble(),
+        min: 0,
+        max: maxN.toDouble(),
+        divisions: maxN,
+        label: '$n',
+        onChanged: _busy
+            ? null
+            : (double v) {
+                final int next = v.round();
+                if (next == _pointStages) return;
+                _sounds.play(UiSound.click);
+                setState(() => _pointStages = next);
+              },
+      ),
+      Text(summary, style: Theme.of(context).textTheme.bodySmall),
+    ];
+  }
+
+  /// Free numeric input for **N**, the per-stage Argon2 iteration count. The
+  /// range is essentially 0..∞ — a deliberately heavy setup may take hours,
+  /// days, or weeks to derive — so there is no upper cap, only a digit limit
+  /// guarding the int parse. Larger N ⇒ proportionally longer derivation. (The
+  /// time a given N takes drifts with hardware; N itself is exact and
+  /// reproducible — see docs §"time is a perishable label on a durable
+  /// parameter".)
+  List<Widget> _iterationsInput() {
+    final String raw = _iterationsField.text.trim();
+    final bool invalid = raw.isNotEmpty && !_iterationsValid;
+    return <Widget>[
+      const Text('Argon2 iterations (N)'),
       const SizedBox(height: 4),
       TextField(
-        controller: _stagesField,
+        controller: _iterationsField,
         enabled: !_busy,
         maxLines: 1,
         keyboardType: TextInputType.number,
         inputFormatters: <TextInputFormatter>[
           FilteringTextInputFormatter.digitsOnly,
-          LengthLimitingTextInputFormatter(1),
+          LengthLimitingTextInputFormatter(12),
         ],
         decoration: InputDecoration(
           isDense: true,
           border: const OutlineInputBorder(),
-          hintText: '1–${SetupController.maxPointStages}',
-          helperText: n != null
-              ? '$n derived stage${n == 1 ? '' : 's'} — ${n * 32} bits, '
-                  '${n * 3} BIP39 words.'
-              : 'One fractal per stage; '
-                  '1–${SetupController.maxPointStages}.',
+          hintText: 'e.g. 1',
+          helperText: 'Per-stage Argon2 passes — no upper limit; a high N can '
+              'take hours, days, even weeks to derive.',
           helperMaxLines: 2,
-          errorText: error,
+          errorText: invalid ? 'Enter a whole number (0 or more).' : null,
         ),
         onChanged: (_) {
           _sounds.play(UiSound.click);
+          final int? v = int.tryParse(_iterationsField.text.trim());
+          if (v != null && v >= 0) _iterations = v;
           setState(() {});
         },
       ),
@@ -1208,8 +1239,7 @@ class _SetupScreenState extends State<SetupScreen> {
       // user can fix it).
       if (_setup.phase != SetupPhase.error) _mnemonic.clear();
     } else {
-      final int? n = _pointStages;
-      if (n == null) return; // button is disabled in this state, but be safe
+      final int n = _pointStages;
       await _setup.begin(
         pointStages: n,
         text: text,
@@ -1230,8 +1260,7 @@ class _SetupScreenState extends State<SetupScreen> {
   /// Start a cold-start recall from the entered salt: derive Stage 1, then drop
   /// straight into select mode so the user can click their first point.
   Future<void> _beginRecall() async {
-    final int? n = _pointStages;
-    if (n == null) return; // button is disabled in this state, but be safe
+    final int n = _pointStages;
     _sounds.play(UiSound.click);
     _brightness.reset();
     await _setup.beginRecall(
