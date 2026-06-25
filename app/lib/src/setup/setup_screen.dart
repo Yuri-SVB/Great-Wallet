@@ -306,6 +306,16 @@ class _SetupScreenState extends State<SetupScreen> {
       setState(() => _chromeMinimized = !_chromeMinimized);
       return KeyEventResult.handled;
     }
+    // H — show / hide the hotkey manual in the console (and restore the console
+    // if it was minimized, so the manual is actually visible).
+    if (event.logicalKey == LogicalKeyboardKey.keyH) {
+      _sounds.play(UiSound.click);
+      setState(() {
+        _manualVisible = !_manualVisible;
+        if (_manualVisible) _chromeMinimized = false;
+      });
+      return KeyEventResult.handled;
+    }
     if (event.logicalKey == LogicalKeyboardKey.keyR) {
       _resetView();
       return KeyEventResult.handled;
