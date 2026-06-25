@@ -230,13 +230,33 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   /// Global shortcuts that fire even while a text field has focus (text fields
-  /// do not consume these keys, so they bubble up to here). Esc leaves a field
-  /// for the viewer; F1 is an alias for the manual.
+  /// do not consume these keys, so they bubble up to here): Esc leaves a field
+  /// for the viewer, F1 is the manual, and F2–F5 switch top-level mode.
   Map<ShortcutActivator, VoidCallback> get _globalShortcuts =>
       <ShortcutActivator, VoidCallback>{
         const SingleActivator(LogicalKeyboardKey.escape): _focusViewer,
         const SingleActivator(LogicalKeyboardKey.f1): _toggleManual,
+        const SingleActivator(LogicalKeyboardKey.f2): () =>
+            _gotoMode('Setup', here: true),
+        const SingleActivator(LogicalKeyboardKey.f3): () =>
+            _gotoMode('Train', here: false),
+        const SingleActivator(LogicalKeyboardKey.f4): () =>
+            _gotoMode('Accelerate', here: false),
+        const SingleActivator(LogicalKeyboardKey.f5): () =>
+            _gotoMode('Inherit', here: false),
       };
+
+  /// Switch top-level mode (F2 Setup · F3 Train · F4 Accelerate · F5 Inherit).
+  /// Only Setup exists in this app today; the others announce themselves so the
+  /// keys (and muscle memory) are correct from the start.
+  void _gotoMode(String name, {required bool here}) {
+    if (here) {
+      _toast('$name (current mode).');
+    } else {
+      _sounds.play(UiSound.deny);
+      _toast('$name mode is not available yet.');
+    }
+  }
 
   /// Return keyboard focus to the fractal viewer (and so out of any text field),
   /// re-enabling the single-key hotkeys. The non-directional counterpart to Tab.
@@ -740,8 +760,9 @@ class _SetupScreenState extends State<SetupScreen> {
   /// The hotkey manual, shown in the console (on by default at launch, toggled
   /// with `H`). Lists every shortcut the setup screen handles.
   static const List<String> _manualLines = <String>[
+    'F1 manual · F2 Setup · F3 Train · F4 Accelerate · F5 Inherit',
     'Esc  return to the fractal (leave a text field) · Tab cycles fields',
-    'H / F1  show / hide this manual      M  minimize / restore chrome',
+    'H  show / hide this manual      M  minimize / restore chrome',
     '0–8  go to that stage (recenters); press again to zoom to its point',
     'N / I / R  New seed / Import / Recall (also focuses its input)',
     'Enter  start (Generate / Encode / Begin recall) from a field',
