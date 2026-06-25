@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -14,7 +15,7 @@ import 'setup_controller.dart';
 ///
 /// This is the concrete `great-wall-core + great-wall-ux` integration the
 /// architecture assigns to Setup (ARCHITECTURE.md §"7. great-wallet", mode 1):
-/// great-wall-ux's [FractalCanvas] / [HueWheel] / brightness drive the visuals,
+/// great-wall-ux's [FractalCanvas] / palette / brightness drive the visuals,
 /// while a [SetupController] runs the engine's encode/Argon2 pipeline and feeds
 /// the canvas its [EscapeCountSource] and overlays.
 class SetupScreen extends StatefulWidget {
@@ -43,25 +44,16 @@ class _SetupScreenState extends State<SetupScreen> {
   final FocusNode _hotkeys = FocusNode(debugLabel: 'setup-hotkeys');
 
   // Focus nodes for the input controls, so an Alt+key shortcut can jump focus
-  // straight to each one (and so the salt/import/export fields can drive the
-  // console focus-help, which the sliders/N field get via _withHelp). A node
-  // whose `context` is null is simply not on screen in the current mode.
+  // straight to each one. Each field is wrapped in _track(_Field…) so focus also
+  // drives the console help. A node whose `context` is null is simply not on
+  // screen in the current mode.
   final FocusNode _stage0Focus = FocusNode(debugLabel: 'salt');
   final FocusNode _iterationsFocus = FocusNode(debugLabel: 'iterations');
   final FocusNode _stagesFocus = FocusNode(debugLabel: 'stages');
   final FocusNode _profileFocus = FocusNode(debugLabel: 'profile');
   final FocusNode _mnemonicFocus = FocusNode(debugLabel: 'import');
   final FocusNode _exportLabelFocus = FocusNode(debugLabel: 'export-label');
-
-  static const String _saltHelp =
-      'Stage 0 salt/pepper: seeds the fractal chain. A public label or a '
-      'secret pasted pepper (uppercase letters, digits, hyphen).';
-  static const String _importHelp =
-      'Import phrase: an existing BIP39 mnemonic to encode onto the fractals '
-      '(kept hidden).';
-  static const String _exportHelp =
-      'Export label: appended to the master-secret transcript to version the '
-      'derived key (uppercase letters, digits, hyphen).';
+  final FocusNode _hueFocus = FocusNode(debugLabel: 'hue');
 
   /// Per-stage **master-secret export label** (e.g. `SIGNING-1`). Appended to
   /// the Argon2id transcript message at the exporting stage, versioning the
@@ -160,8 +152,9 @@ class _SetupScreenState extends State<SetupScreen> {
   /// Recent console lines, most recent last (capped).
   final List<String> _consoleLog = <String>[];
 
-  /// Help text for the control currently under focus, shown in the console.
-  String? _focusHelp;
+  /// The input control currently under focus; the console renders its help
+  /// (label + live value) so the panel itself can stay label-free.
+  _Field? _focusedField;
 
   /// Whether the hotkey manual is shown in the console. On at launch.
   bool _manualVisible = true;
@@ -178,15 +171,7 @@ class _SetupScreenState extends State<SetupScreen> {
   void initState() {
     super.initState();
     _setup.addListener(_onSetupChanged);
-    // Drive the console focus-help for the fields not wrapped in _withHelp.
-    _stage0Focus.addListener(() => _focusHelpFor(_stage0Focus, _saltHelp));
-    _mnemonicFocus.addListener(() => _focusHelpFor(_mnemonicFocus, _importHelp));
-    _exportLabelFocus
-        .addListener(() => _focusHelpFor(_exportLabelFocus, _exportHelp));
   }
-
-  void _focusHelpFor(FocusNode node, String help) =>
-      node.hasFocus ? _gainHelp(help) : _loseHelp(help);
 
   void _onSetupChanged() {
     if (!mounted) return;
@@ -217,6 +202,7 @@ class _SetupScreenState extends State<SetupScreen> {
     _profileFocus.dispose();
     _mnemonicFocus.dispose();
     _exportLabelFocus.dispose();
+    _hueFocus.dispose();
     super.dispose();
   }
 
@@ -385,6 +371,11 @@ class _SetupScreenState extends State<SetupScreen> {
     }
     if (event.logicalKey == LogicalKeyboardKey.keyR) {
       _resetView();
+      return KeyEventResult.handled;
+    }
+    // C — focus the colour wheel (then ← → cycle hues).
+    if (event.logicalKey == LogicalKeyboardKey.keyC) {
+      _focusField(_hueFocus, 'colour wheel');
       return KeyEventResult.handled;
     }
     if (event.logicalKey == LogicalKeyboardKey.keyT) {
@@ -698,6 +689,7 @@ class _SetupScreenState extends State<SetupScreen> {
     'R  recenter the canvas      T  cycle through stages',
     '0–8  jump to that stage (tab or number key)',
     'K  copy the master secret ("the key") for the focused stage',
+    'C  focus the colour wheel, then ← → to cycle hues',
     'Alt+S salt/pepper   Alt+N iterations   Alt+G stages   Alt+P profile',
     'Alt+I import phrase   Alt+L export label',
     'L+scroll brightness · scroll zoom · drag pan (over the canvas)',
@@ -707,9 +699,11 @@ class _SetupScreenState extends State<SetupScreen> {
   /// confirmations. Collapses to a one-line status bar when minimized.
   Widget _console() {
     final ColorScheme scheme = Theme.of(context).colorScheme;
+    final String? focusHelp =
+        _focusedField != null ? _fieldHelp(_focusedField!) : null;
     final String status = _prompt != null
         ? _prompt!.message
-        : _focusHelp ?? (_consoleLog.isEmpty ? 'Ready.' : _consoleLog.last);
+        : focusHelp ?? (_consoleLog.isEmpty ? 'Ready.' : _consoleLog.last);
     return Material(
       color: scheme.surface,
       child: DecoratedBox(
@@ -791,7 +785,7 @@ class _SetupScreenState extends State<SetupScreen> {
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: <Widget>[
                 if (_prompt != null) _consolePromptBlock(scheme),
-                if (_focusHelp != null)
+                if (_focusedField != null)
                   Padding(
                     padding: const EdgeInsets.only(bottom: 6),
                     child: Row(
@@ -801,7 +795,7 @@ class _SetupScreenState extends State<SetupScreen> {
                             size: 14, color: scheme.onSurfaceVariant),
                         const SizedBox(width: 6),
                         Expanded(
-                          child: Text(_focusHelp!,
+                          child: Text(_fieldHelp(_focusedField!),
                               style: Theme.of(context).textTheme.bodySmall),
                         ),
                       ],
@@ -872,13 +866,7 @@ class _SetupScreenState extends State<SetupScreen> {
       child: ListView(
         children: <Widget>[
           Text('Setup', style: Theme.of(context).textTheme.titleLarge),
-          const SizedBox(height: 4),
-          Text(
-            'Encode a fresh seed onto a fractal you will learn to remember. '
-            'Nothing is written down.',
-            style: Theme.of(context).textTheme.bodySmall,
-          ),
-          const Divider(height: 32),
+          const Divider(height: 24),
 
           if (_setup.phase == SetupPhase.recallComplete)
             ..._recallCompleteControls()
@@ -960,25 +948,23 @@ class _SetupScreenState extends State<SetupScreen> {
           ),
 
           const Divider(height: 32),
-          const Text('Palette'),
-          const SizedBox(height: 8),
+          // Colour wheel: focus with C, cycle hues with ← →. The scheme name is
+          // shown in the console (focus _Field.hue), not labelled here. No rotate
+          // buttons — the arrows replace them.
           Center(
-            child: HueWheel(
-              value: _hue,
-              onChanged: (HueOffset h) {
-                _sounds.play(UiSound.click);
-                setState(() => _hue = h);
-              },
+            child: _track(
+              _Field.hue,
+              _HueWheelControl(
+                value: _hue,
+                focusNode: _hueFocus,
+                onChanged: (HueOffset h) {
+                  _sounds.play(UiSound.click);
+                  setState(() => _hue = h);
+                },
+              ),
             ),
           ),
           const SizedBox(height: 16),
-          const Text(
-            'Hold L and scroll over the canvas to adjust brightness; '
-            'scroll to zoom, drag to pan; press R to recenter, T to cycle '
-            'stages, 0–8 to jump to a stage, K to copy the key.',
-            textAlign: TextAlign.center,
-          ),
-          const SizedBox(height: 24),
           Text(
             'engine ${widget.core.engineVersion}',
             style: Theme.of(context).textTheme.bodySmall,
@@ -1068,15 +1054,11 @@ class _SetupScreenState extends State<SetupScreen> {
   List<Widget> _stagesInput() {
     final int n = _pointStages;
     final int maxN = SetupController.maxPointStages;
-    final String summary = n == 0
-        ? 'Stage-0 text only — no fractal points.'
-        : '$n fractal stage${n == 1 ? '' : 's'} — ${n * 32} bits, '
-            '${n * 3} BIP39 words.';
+    // Label and value live in the console (focus _Field.stages); the panel keeps
+    // only the slider to save vertical space.
     return <Widget>[
-      Text('Number of stages: $n'),
-      _withHelp(
-        'Number of stages (0–8): how many fractal points your seed has. '
-        '0 = Stage-0 text only; 8 = 24 words / 256 bits.',
+      _track(
+        _Field.stages,
         Slider(
           focusNode: _stagesFocus,
           value: n.toDouble(),
@@ -1094,7 +1076,6 @@ class _SetupScreenState extends State<SetupScreen> {
                 },
         ),
       ),
-      Text(summary, style: Theme.of(context).textTheme.bodySmall),
     ];
   }
 
@@ -1108,12 +1089,11 @@ class _SetupScreenState extends State<SetupScreen> {
   List<Widget> _iterationsInput() {
     final String raw = _iterationsField.text.trim();
     final bool invalid = raw.isNotEmpty && !_iterationsValid;
+    // Label/help live in the console (focus _Field.iterations); keep only the
+    // field (with its validation error) in the panel.
     return <Widget>[
-      const Text('Argon2 iterations (N)'),
-      const SizedBox(height: 4),
-      _withHelp(
-        'Argon2 iterations (N): per-stage memory-hard passes. Unbounded — a '
-        'higher N means a longer, stronger derivation (hours to weeks).',
+      _track(
+        _Field.iterations,
         TextField(
           controller: _iterationsField,
           focusNode: _iterationsFocus,
@@ -1127,10 +1107,8 @@ class _SetupScreenState extends State<SetupScreen> {
           decoration: InputDecoration(
             isDense: true,
             border: const OutlineInputBorder(),
-            hintText: 'e.g. 1',
-            helperText: 'Per-stage Argon2 passes — no upper limit; a high N can '
-                'take hours, days, even weeks to derive.',
-            helperMaxLines: 2,
+            labelText: 'N',
+            hintText: 'iterations, e.g. 1',
             errorText: invalid ? 'Enter a whole number (0 or more).' : null,
           ),
           onChanged: (_) {
@@ -1162,30 +1140,25 @@ class _SetupScreenState extends State<SetupScreen> {
   /// iteration-count (N) field.
   Widget _argon2ProfileSlider() {
     final int idx = _profiles.indexOf(_profile).clamp(0, _profiles.length - 1);
-    return _withHelp(
-      'Argon2 profile: memory per pass — Basic 1 GiB, Advanced 32 GiB, '
-      'Great Wall 128 GiB. Higher resists parallel attack harder.',
-      Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: <Widget>[
-          Text('Argon2 profile: ${_profileLabels[idx]}'),
-          Slider(
-            focusNode: _profileFocus,
-            value: idx.toDouble(),
-            min: 0,
-            max: (_profiles.length - 1).toDouble(),
-            divisions: _profiles.length - 1,
-            label: _profileLabels[idx],
-            onChanged: _busy
-                ? null
-                : (double v) {
-                    final Argon2Profile next = _profiles[v.round()];
-                    if (next == _profile) return;
-                    _sounds.play(UiSound.click);
-                    setState(() => _profile = next);
-                  },
-          ),
-        ],
+    // Profile name lives in the console (focus _Field.profile); the slider thumb
+    // label still shows it on drag.
+    return _track(
+      _Field.profile,
+      Slider(
+        focusNode: _profileFocus,
+        value: idx.toDouble(),
+        min: 0,
+        max: (_profiles.length - 1).toDouble(),
+        divisions: _profiles.length - 1,
+        label: _profileLabels[idx],
+        onChanged: _busy
+            ? null
+            : (double v) {
+                final Argon2Profile next = _profiles[v.round()];
+                if (next == _profile) return;
+                _sounds.play(UiSound.click);
+                setState(() => _profile = next);
+              },
       ),
     );
   }
@@ -1210,35 +1183,38 @@ class _SetupScreenState extends State<SetupScreen> {
           '${standard ? "" : " (sub-standard length)"}.';
     }
     return <Widget>[
-      const Text('Seed phrase (BIP39)'),
-      const SizedBox(height: 4),
-      TextField(
-        controller: _mnemonic,
-        focusNode: _mnemonicFocus,
-        obscureText: _mnemonicHidden,
-        enabled: !_busy,
-        maxLines: 1,
-        autocorrect: false,
-        enableSuggestions: false,
-        decoration: InputDecoration(
-          isDense: true,
-          border: const OutlineInputBorder(),
-          hintText: 'word1 word2 …',
-          helperText: hint,
-          helperMaxLines: 2,
-          suffixIcon: IconButton(
-            tooltip: _mnemonicHidden ? 'Show phrase' : 'Hide phrase',
-            icon: Icon(
-              _mnemonicHidden ? Icons.visibility : Icons.visibility_off,
+      _track(
+        _Field.mnemonic,
+        TextField(
+          controller: _mnemonic,
+          focusNode: _mnemonicFocus,
+          obscureText: _mnemonicHidden,
+          enabled: !_busy,
+          maxLines: 1,
+          autocorrect: false,
+          enableSuggestions: false,
+          decoration: InputDecoration(
+            isDense: true,
+            border: const OutlineInputBorder(),
+            labelText: 'Import phrase (BIP39)',
+            hintText: 'word1 word2 …',
+            // Live word-count validity stays inline (it is status, not a label).
+            helperText: hint,
+            helperMaxLines: 2,
+            suffixIcon: IconButton(
+              tooltip: _mnemonicHidden ? 'Show phrase' : 'Hide phrase',
+              icon: Icon(
+                _mnemonicHidden ? Icons.visibility : Icons.visibility_off,
+              ),
+              onPressed: () =>
+                  setState(() => _mnemonicHidden = !_mnemonicHidden),
             ),
-            onPressed: () =>
-                setState(() => _mnemonicHidden = !_mnemonicHidden),
           ),
+          onChanged: (_) {
+            _sounds.play(UiSound.click);
+            setState(() {});
+          },
         ),
-        onChanged: (_) {
-          _sounds.play(UiSound.click);
-          setState(() {});
-        },
       ),
     ];
   }
@@ -1248,44 +1224,44 @@ class _SetupScreenState extends State<SetupScreen> {
   /// One field, one scheme — the user decides whether it is a public label or a
   /// secret pepper. The restriction (and why it exists) is explained inline.
   List<Widget> _stage0Input() {
+    // Label/help live in the console (focus _Field.salt). The reveal toggle and
+    // the restriction warning stay on the field.
     return <Widget>[
-      const Text('Stage 0 — salt / pepper'),
-      const SizedBox(height: 4),
-      TextField(
-        controller: _stage0,
-        focusNode: _stage0Focus,
-        obscureText: _stage0Hidden,
-        enabled: !_busy,
-        maxLines: 1,
-        autocorrect: false,
-        enableSuggestions: false,
-        inputFormatters: <TextInputFormatter>[
-          _SaltPepperFormatter(widget.core, _onStage0Restricted),
-        ],
-        decoration: InputDecoration(
-          isDense: true,
-          border: const OutlineInputBorder(),
-          hintText: 'e.g. MAIN-STASH',
-          helperText: 'Seeds your fractals. A label (MAIN-STASH) or a pasted '
-              'secret pepper — your call. Uppercase letters, digits and '
-              'hyphens only (kept unambiguous so it is reproducible).',
-          helperMaxLines: 3,
-          suffixIcon: IconButton(
-            tooltip: _stage0Hidden ? 'Show text' : 'Hide text',
-            icon: Icon(
-              _stage0Hidden ? Icons.visibility : Icons.visibility_off,
+      _track(
+        _Field.salt,
+        TextField(
+          controller: _stage0,
+          focusNode: _stage0Focus,
+          obscureText: _stage0Hidden,
+          enabled: !_busy,
+          maxLines: 1,
+          autocorrect: false,
+          enableSuggestions: false,
+          inputFormatters: <TextInputFormatter>[
+            _SaltPepperFormatter(widget.core, _onStage0Restricted),
+          ],
+          decoration: InputDecoration(
+            isDense: true,
+            border: const OutlineInputBorder(),
+            labelText: 'Stage 0 — salt / pepper',
+            hintText: 'e.g. MAIN-STASH',
+            suffixIcon: IconButton(
+              tooltip: _stage0Hidden ? 'Show text' : 'Hide text',
+              icon: Icon(
+                _stage0Hidden ? Icons.visibility : Icons.visibility_off,
+              ),
+              onPressed: () => setState(() => _stage0Hidden = !_stage0Hidden),
             ),
-            onPressed: () => setState(() => _stage0Hidden = !_stage0Hidden),
           ),
+          style: const TextStyle(
+            fontFamily: GreatWallTypography.fontFamily,
+            fontFamilyFallback: <String>['monospace'],
+          ),
+          onChanged: (_) {
+            _sounds.play(UiSound.click);
+            setState(() {});
+          },
         ),
-        style: const TextStyle(
-          fontFamily: GreatWallTypography.fontFamily,
-          fontFamilyFallback: <String>['monospace'],
-        ),
-        onChanged: (_) {
-          _sounds.play(UiSound.click);
-          setState(() {});
-        },
       ),
       if (_stage0Restricted)
         Padding(
@@ -1478,32 +1454,33 @@ class _SetupScreenState extends State<SetupScreen> {
         style: Theme.of(context).textTheme.bodySmall,
       ),
       const SizedBox(height: 8),
-      TextField(
-        controller: _exportLabel,
-        focusNode: _exportLabelFocus,
-        enabled: !_busy,
-        maxLines: 1,
-        autocorrect: false,
-        enableSuggestions: false,
-        inputFormatters: <TextInputFormatter>[
-          _SaltPepperFormatter(widget.core, _onExportLabelRestricted),
-        ],
-        decoration: const InputDecoration(
-          isDense: true,
-          border: OutlineInputBorder(),
-          labelText: 'Export label (optional)',
-          hintText: 'e.g. SIGNING-1',
-          helperText: 'Uppercase letters, digits and hyphens; any length.',
-          helperMaxLines: 2,
+      _track(
+        _Field.exportLabel,
+        TextField(
+          controller: _exportLabel,
+          focusNode: _exportLabelFocus,
+          enabled: !_busy,
+          maxLines: 1,
+          autocorrect: false,
+          enableSuggestions: false,
+          inputFormatters: <TextInputFormatter>[
+            _SaltPepperFormatter(widget.core, _onExportLabelRestricted),
+          ],
+          decoration: const InputDecoration(
+            isDense: true,
+            border: OutlineInputBorder(),
+            labelText: 'Export label (optional)',
+            hintText: 'e.g. SIGNING-1',
+          ),
+          style: const TextStyle(
+            fontFamily: GreatWallTypography.fontFamily,
+            fontFamilyFallback: <String>['monospace'],
+          ),
+          onChanged: (_) {
+            _sounds.play(UiSound.click);
+            setState(() {});
+          },
         ),
-        style: const TextStyle(
-          fontFamily: GreatWallTypography.fontFamily,
-          fontFamilyFallback: <String>['monospace'],
-        ),
-        onChanged: (_) {
-          _sounds.play(UiSound.click);
-          setState(() {});
-        },
       ),
       if (_exportLabelRestricted)
         Padding(
@@ -1598,32 +1575,63 @@ class _SetupScreenState extends State<SetupScreen> {
   /// Set the focus-help line when a control gains focus. Deferred to a
   /// post-frame callback so it never runs mid-build (focus changes fire during
   /// layout).
-  void _gainHelp(String help) {
+  void _gainFocus(_Field f) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted || _focusHelp == help) return;
-      setState(() => _focusHelp = help);
+      if (!mounted || _focusedField == f) return;
+      setState(() => _focusedField = f);
     });
   }
 
-  /// Clear the focus-help line when a control loses focus — but only if it is
-  /// still showing this control's help (so the gain of the next control wins
-  /// regardless of callback order).
-  void _loseHelp(String help) {
+  /// Clear the focused-field marker when a control loses focus — but only if it
+  /// is still this control (so the gain of the next control wins regardless of
+  /// callback order).
+  void _loseFocus(_Field f) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted || _focusHelp != help) return;
-      setState(() => _focusHelp = null);
+      if (!mounted || _focusedField != f) return;
+      setState(() => _focusedField = null);
     });
   }
 
-  /// Wrap [child] so that, while it (or a descendant, e.g. a text field) holds
-  /// focus, [help] is shown in the console. The wrapper is not itself a tab stop.
-  Widget _withHelp(String help, Widget child) {
+  /// Wrap [child] so that, while it (or a descendant text field/slider) holds
+  /// focus, the console shows field [f]'s help. The wrapper is not a tab stop.
+  Widget _track(_Field f, Widget child) {
     return Focus(
       canRequestFocus: false,
       skipTraversal: true,
-      onFocusChange: (bool has) => has ? _gainHelp(help) : _loseHelp(help),
+      onFocusChange: (bool has) => has ? _gainFocus(f) : _loseFocus(f),
       child: child,
     );
+  }
+
+  /// The console help for an input field: its label plus the current value, so
+  /// the panel itself can omit both. Computed live, so it tracks edits while the
+  /// field stays focused.
+  String _fieldHelp(_Field f) {
+    switch (f) {
+      case _Field.stages:
+        return 'Number of stages: $_pointStages (0–8). 0 = Stage-0 text only; '
+            '8 = 24 words / 256 bits. ← → or drag to change.';
+      case _Field.iterations:
+        final String n = _iterationsField.text.trim();
+        return 'Argon2 iterations N = ${n.isEmpty ? '—' : n} (0…∞). Higher = a '
+            'longer, stronger derivation (hours to weeks).';
+      case _Field.profile:
+        final int idx =
+            _profiles.indexOf(_profile).clamp(0, _profiles.length - 1);
+        return 'Argon2 profile: ${_profileLabels[idx]} — memory per pass. '
+            '← → or drag to change.';
+      case _Field.salt:
+        return 'Stage 0 salt/pepper: seeds the fractal chain. A public label or '
+            'a secret pasted pepper (uppercase letters, digits, hyphen).';
+      case _Field.mnemonic:
+        return 'Import phrase: an existing BIP39 mnemonic to encode onto the '
+            'fractals (kept hidden).';
+      case _Field.exportLabel:
+        return 'Export label: versions the derived master secret (uppercase '
+            'letters, digits, hyphen).';
+      case _Field.hue:
+        return 'Colour scheme: ${_hue.name}. ← → to cycle through the six hues.';
+    }
   }
 
   /// Answer the pending console confirmation, completing its future.
@@ -1714,6 +1722,135 @@ class _SetupScreenState extends State<SetupScreen> {
 /// imported BIP39 phrase, or a cold-start recall of an existing setup (derive
 /// from the salt and reconstruct the seed from the user's clicks).
 enum _SourceMode { fresh, import, recall }
+
+/// The input controls whose label + live value are conveyed in the console while
+/// focused (so the panel itself can stay label-free).
+enum _Field { stages, iterations, profile, salt, mnemonic, exportLabel, hue }
+
+/// A compact, focusable colour wheel: six hue sectors, no rotate buttons (←/→
+/// cycle while focused) and no inline name (it is shown in the console). Tapping
+/// a sector selects it and focuses the wheel.
+class _HueWheelControl extends StatelessWidget {
+  const _HueWheelControl({
+    required this.value,
+    required this.onChanged,
+    required this.focusNode,
+    this.diameter = 84,
+  });
+
+  final HueOffset value;
+  final ValueChanged<HueOffset> onChanged;
+  final FocusNode focusNode;
+  final double diameter;
+
+  void _step(int dir) {
+    final List<HueOffset> order = HueOffset.values;
+    final int i = (value.index + dir) % order.length;
+    onChanged(order[i < 0 ? i + order.length : i]);
+  }
+
+  KeyEventResult _onKey(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    final LogicalKeyboardKey k = event.logicalKey;
+    if (k == LogicalKeyboardKey.arrowRight || k == LogicalKeyboardKey.arrowUp) {
+      _step(1);
+      return KeyEventResult.handled;
+    }
+    if (k == LogicalKeyboardKey.arrowLeft || k == LogicalKeyboardKey.arrowDown) {
+      _step(-1);
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  void _handleTapDown(TapDownDetails details) {
+    final double r = diameter / 2;
+    final Offset v = details.localPosition - Offset(r, r);
+    if (v.distance < r * 0.25) return; // ignore the hub
+    double angle = math.atan2(v.dx, -v.dy);
+    if (angle < 0) angle += 2 * math.pi;
+    final int n = HueOffset.values.length;
+    final int sector = (angle / (2 * math.pi) * n).floor() % n;
+    onChanged(HueOffset.values[sector]);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Focus(
+      focusNode: focusNode,
+      onKeyEvent: _onKey,
+      child: Semantics(
+        label: 'Colour wheel: ${value.name}',
+        button: true,
+        child: GestureDetector(
+          onTapDown: (TapDownDetails d) {
+            focusNode.requestFocus();
+            _handleTapDown(d);
+          },
+          child: CustomPaint(
+            size: Size.square(diameter),
+            painter: _HuePainter(value, focusNode.hasFocus),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _HuePainter extends CustomPainter {
+  _HuePainter(this.selected, this.focused);
+
+  final HueOffset selected;
+  final bool focused;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final double r = size.width / 2;
+    final Offset c = Offset(r, r);
+    final int n = HueOffset.values.length;
+    final double sweep = 2 * math.pi / n;
+    for (int i = 0; i < n; i++) {
+      final double start = -math.pi / 2 + i * sweep;
+      final Paint fill = Paint()
+        ..style = PaintingStyle.fill
+        ..color = HSVColor.fromAHSV(
+          1.0,
+          HueOffset.values[i].degrees.toDouble() % 360.0,
+          1.0,
+          1.0,
+        ).toColor();
+      canvas.drawArc(
+          Rect.fromCircle(center: c, radius: r), start, sweep, true, fill);
+      if (HueOffset.values[i] == selected) {
+        canvas.drawArc(
+          Rect.fromCircle(center: c, radius: r - 2),
+          start,
+          sweep,
+          true,
+          Paint()
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = 4.0
+            ..color = Colors.white,
+        );
+      }
+    }
+    if (focused) {
+      canvas.drawCircle(
+        c,
+        r - 1,
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2.0
+          ..color = Colors.white70,
+      );
+    }
+    canvas.drawCircle(c, r * 0.22, Paint()..color = Colors.black87);
+  }
+
+  @override
+  bool shouldRepaint(_HuePainter old) =>
+      old.selected != selected || old.focused != focused;
+}
 
 /// A confirmation rendered inline in the console (instead of a modal dialog).
 /// The console's action buttons complete [completer] with the user's choice.
