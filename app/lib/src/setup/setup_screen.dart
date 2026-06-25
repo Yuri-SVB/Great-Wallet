@@ -178,9 +178,10 @@ class _SetupScreenState extends State<SetupScreen> {
       onKeyEvent: _onKey,
       child: Column(
         children: <Widget>[
-          // Upper edge: numbered stage tabs (0..N-1) marking the stage under
-          // focus. Shown once a session has stages; tap or press 0–8 to jump.
-          if (_hasSession) _stageTabs(),
+          // Upper edge: a fixed, full-width bar of stage tabs (0..8). Always
+          // present; unreachable tabs are greyed but stay in place. Tap or press
+          // 0–8 to jump.
+          _stageTabs(),
           Expanded(
             child: Row(
               children: <Widget>[
@@ -221,32 +222,43 @@ class _SetupScreenState extends State<SetupScreen> {
     );
   }
 
-  /// The upper-edge stage tabs: one numbered chip per displayed stage
-  /// (`0..nStages-1`). Stage 0 is the salt/pepper text; 1..N-1 are the
-  /// chain-derived fractals. The stage under focus is highlighted; stages not
-  /// yet reached (during a recall walk) are disabled. Tapping an available stage
-  /// focuses it — the same as pressing its number key.
+  /// The upper-edge stage tabs: a **fixed** bar of nine numbered tabs (0..8,
+  /// the protocol ceiling) that always span the full width. Stage 0 is the
+  /// salt/pepper text; 1..N-1 are the chain-derived fractals. The stage under
+  /// focus is highlighted; tabs that are not currently reachable — outside this
+  /// setup's stage count, not yet derived, or before any session — stay visible
+  /// but greyed out and inert. Tapping a reachable tab focuses it (the same as
+  /// pressing its number key).
   Widget _stageTabs() {
-    final int n = _setup.nStages;
+    const int maxTab = SetupController.maxPointStages; // 0..8 → nine fixed tabs
     final int current = _setup.displayStageIndex;
     return Material(
       color: Theme.of(context).colorScheme.surface,
       child: SizedBox(
         height: 44,
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: <Widget>[
-            for (int i = 0; i < n; i++)
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 6),
-                child: _StageTab(
-                  index: i,
-                  selected: i == current,
-                  available: _setup.isStageAvailable(i),
-                  onTap: () => _selectStage(i),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 6),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              for (int i = 0; i <= maxTab; i++)
+                Expanded(
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 3),
+                    child: _StageTab(
+                      index: i,
+                      selected: _hasSession && i == current,
+                      available: _hasSession && _setup.isStageAvailable(i),
+                      // Tappable only for a stage that belongs to the active
+                      // setup; everything else is inert but still shown.
+                      onTap: (_hasSession && i < _setup.nStages)
+                          ? () => _selectStage(i)
+                          : null,
+                    ),
+                  ),
                 ),
-              ),
-          ],
+            ],
+          ),
         ),
       ),
     );
@@ -1399,7 +1411,10 @@ class _StageTab extends StatelessWidget {
   final int index;
   final bool selected;
   final bool available;
-  final VoidCallback onTap;
+
+  /// `null` when the tab is not reachable (outside the setup, or before a
+  /// session): the tab stays visible but greyed out and non-interactive.
+  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {
@@ -1413,12 +1428,9 @@ class _StageTab extends StatelessWidget {
     return Tooltip(
       message: index == 0 ? 'Stage 0 — salt / pepper' : 'Stage $index',
       child: InkWell(
-        // Always tappable: the handler navigates to a derived stage, derives the
-        // next one, or sounds a deny cue for an out-of-reach stage.
         onTap: onTap,
         borderRadius: BorderRadius.circular(6),
         child: Container(
-          width: 32,
           alignment: Alignment.center,
           decoration: BoxDecoration(
             color: bg,
