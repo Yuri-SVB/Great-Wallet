@@ -268,16 +268,9 @@ class _SetupScreenState extends State<SetupScreen> {
             child: Row(
               children: <Widget>[
                 Expanded(
-                  child: Column(
-                    children: <Widget>[
-                      // Stage tabs span only the fractal-view width and sit just
-                      // above the canvas, so the right panel keeps full height.
-                      if (!_chromeMinimized) _stageTabs(),
-                      Expanded(
-                        // Clicking anywhere on the canvas returns keyboard focus
-                        // to the hotkey handler, so shortcuts work again after
-                        // typing in a text field. The Listener is passive.
-                        child: Listener(
+                  // Clicking anywhere on the canvas returns keyboard focus to the
+                  // hotkey handler; the Listener is passive.
+                  child: Listener(
                     onPointerDown: (_) => _hotkeys.requestFocus(),
                     child: Stack(
                       children: <Widget>[
@@ -290,24 +283,40 @@ class _SetupScreenState extends State<SetupScreen> {
                         if (_busy) Positioned.fill(child: _progressOverlay()),
                         if (_selectMode && !_setup.isTextStage)
                           const Positioned(
-                            top: 12,
+                            top: 56,
                             left: 12,
-                            child: _Badge(
-                                'Recall — click your point'),
+                            child: _Badge('Recall — click your point'),
+                          ),
+                        // Stage tabs hover over the top of the viewer with a
+                        // transparent background, so they never squeeze the
+                        // canvas. Hidden when the chrome is minimized.
+                        if (!_chromeMinimized)
+                          Positioned(
+                            top: 0,
+                            left: 0,
+                            right: 0,
+                            child: _stageTabs(),
+                          ),
+                        // When minimized, the console floats as a thin bar at the
+                        // foot of the viewer instead of taking its own row.
+                        if (_chromeMinimized)
+                          Positioned(
+                            bottom: 0,
+                            left: 0,
+                            right: 0,
+                            child: _console(),
                           ),
                       ],
                     ),
                   ),
-                        ),
-                      ],
-                    ),
-                  ),
+                ),
                 SizedBox(width: 260, child: _controlPanel(hasResult)),
               ],
             ),
           ),
-          // Foot of the screen: the console (single message surface).
-          _console(),
+          // Expanded: the console takes the foot row. Minimized: it floats over
+          // the canvas (above), leaving the view unsqueezed.
+          if (!_chromeMinimized) _console(),
         ],
       ),
       ),
@@ -324,8 +333,9 @@ class _SetupScreenState extends State<SetupScreen> {
   Widget _stageTabs() {
     const int maxTab = SetupController.maxPointStages; // 0..8 → nine fixed tabs
     final int current = _setup.displayStageIndex;
+    // Transparent so the tabs hover over the fractal (no opaque bar).
     return Material(
-      color: Theme.of(context).colorScheme.surface,
+      type: MaterialType.transparency,
       child: SizedBox(
         height: 44,
         child: Padding(
@@ -361,6 +371,13 @@ class _SetupScreenState extends State<SetupScreen> {
     // While a text field (salt, seed phrase, …) holds focus, let it consume the
     // keystroke — never fire canvas shortcuts like S / R.
     if (_textInputHasFocus) return KeyEventResult.ignored;
+    // These are *unmodified* letter/number shortcuts. If a modifier is held,
+    // bail so the combo bubbles up to CallbackShortcuts (e.g. Alt+N focuses the
+    // iterations field rather than firing plain N for "New seed").
+    final HardwareKeyboard kb = HardwareKeyboard.instance;
+    if (kb.isAltPressed || kb.isControlPressed || kb.isMetaPressed) {
+      return KeyEventResult.ignored;
+    }
     // H — show / hide the hotkey manual in the console (and restore the console
     // if it was minimized, so the manual is actually visible).
     if (event.logicalKey == LogicalKeyboardKey.keyH) {
@@ -737,48 +754,61 @@ class _SetupScreenState extends State<SetupScreen> {
     'L+scroll brightness · scroll zoom · drag pan (over the canvas)',
   ];
 
+  /// Terminal palette: saturated green text on black.
+  static const Color _kConsoleBg = Color(0xFF000000);
+  static const Color _kConsoleFg = Color(0xFF35FF6A);
+  static const TextStyle _termStyle = TextStyle(
+    color: _kConsoleFg,
+    fontFamily: GreatWallTypography.fontFamily,
+    fontFamilyFallback: <String>['monospace'],
+    fontSize: 13,
+    height: 1.3,
+  );
+
   /// The bottom console — the single surface for toasts, focus help, and inline
-  /// confirmations. Collapses to a one-line status bar when minimized.
+  /// confirmations. Collapses to a one-line status bar when minimized. Styled as
+  /// a terminal: saturated green on black.
   Widget _console() {
-    final ColorScheme scheme = Theme.of(context).colorScheme;
     final String? focusHelp =
         _focusedField != null ? _fieldHelp(_focusedField!) : null;
     final String status = _prompt != null
         ? _prompt!.message
         : focusHelp ?? (_consoleLog.isEmpty ? 'Ready.' : _consoleLog.last);
     return Material(
-      color: scheme.surface,
+      color: _kConsoleBg,
       child: DecoratedBox(
-        decoration: BoxDecoration(
-          border: Border(top: BorderSide(color: scheme.outlineVariant)),
+        decoration: const BoxDecoration(
+          border: Border(top: BorderSide(color: _kConsoleFg)),
         ),
         child: SafeArea(
           top: false,
-          child: _chromeMinimized
-              ? _consoleStatusBar(status, scheme)
-              : _consoleExpanded(scheme),
+          child: DefaultTextStyle(
+            style: _termStyle,
+            child: IconTheme(
+              data: const IconThemeData(color: _kConsoleFg, size: 16),
+              child: _chromeMinimized
+                  ? _consoleStatusBar(status)
+                  : _consoleExpanded(),
+            ),
+          ),
         ),
       ),
     );
   }
 
   /// The collapsed console: one status line plus a restore button.
-  Widget _consoleStatusBar(String status, ColorScheme scheme) {
+  Widget _consoleStatusBar(String status) {
     return Row(
       children: <Widget>[
         const SizedBox(width: 12),
-        Icon(Icons.terminal, size: 16, color: scheme.onSurfaceVariant),
+        const Icon(Icons.terminal),
         const SizedBox(width: 8),
         Expanded(
-          child: Text(
-            status,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: Theme.of(context).textTheme.bodySmall,
-          ),
+          child: Text(status, maxLines: 1, overflow: TextOverflow.ellipsis),
         ),
         IconButton(
           tooltip: 'Restore console (Alt+M)',
+          color: _kConsoleFg,
           icon: const Icon(Icons.keyboard_arrow_up),
           onPressed: () => setState(() => _chromeMinimized = false),
         ),
@@ -788,11 +818,7 @@ class _SetupScreenState extends State<SetupScreen> {
 
   /// The expanded console: header, optional inline prompt, focus help, the
   /// recent log, and the optional hotkey manual.
-  Widget _consoleExpanded(ColorScheme scheme) {
-    final TextStyle? mono = Theme.of(context).textTheme.bodySmall?.copyWith(
-          fontFamily: GreatWallTypography.fontFamily,
-          fontFamilyFallback: const <String>['monospace'],
-        );
+  Widget _consoleExpanded() {
     return Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -801,23 +827,26 @@ class _SetupScreenState extends State<SetupScreen> {
         Row(
           children: <Widget>[
             const SizedBox(width: 12),
-            Icon(Icons.terminal, size: 16, color: scheme.onSurfaceVariant),
+            const Icon(Icons.terminal),
             const SizedBox(width: 8),
-            Text('Console', style: Theme.of(context).textTheme.labelLarge),
+            Text('Console',
+                style: _termStyle.copyWith(fontWeight: FontWeight.bold)),
             const Spacer(),
             IconButton(
               tooltip: _manualVisible ? 'Hide manual (H)' : 'Show manual (H)',
+              color: _kConsoleFg,
               icon: Icon(_manualVisible ? Icons.help : Icons.help_outline),
               onPressed: () => setState(() => _manualVisible = !_manualVisible),
             ),
             IconButton(
               tooltip: 'Minimize console & tabs (Alt+M)',
+              color: _kConsoleFg,
               icon: const Icon(Icons.keyboard_arrow_down),
               onPressed: () => setState(() => _chromeMinimized = true),
             ),
           ],
         ),
-        const Divider(height: 1),
+        Divider(height: 1, color: _kConsoleFg.withOpacity(0.4)),
         ConstrainedBox(
           constraints: const BoxConstraints(maxHeight: 200),
           child: SingleChildScrollView(
@@ -826,32 +855,26 @@ class _SetupScreenState extends State<SetupScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: <Widget>[
-                if (_prompt != null) _consolePromptBlock(scheme),
+                if (_prompt != null) _consolePromptBlock(),
                 if (_focusedField != null)
                   Padding(
                     padding: const EdgeInsets.only(bottom: 6),
                     child: Row(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: <Widget>[
-                        Icon(Icons.info_outline,
-                            size: 14, color: scheme.onSurfaceVariant),
+                        const Icon(Icons.info_outline, size: 14),
                         const SizedBox(width: 6),
-                        Expanded(
-                          child: Text(_fieldHelp(_focusedField!),
-                              style: Theme.of(context).textTheme.bodySmall),
-                        ),
+                        Expanded(child: Text(_fieldHelp(_focusedField!))),
                       ],
                     ),
                   ),
-                for (final String line in _consoleLog)
-                  Text('› $line', style: mono),
+                for (final String line in _consoleLog) Text('› $line'),
                 if (_manualVisible) ...<Widget>[
                   const SizedBox(height: 8),
                   Text('Hotkeys',
-                      style: Theme.of(context).textTheme.labelMedium),
+                      style: _termStyle.copyWith(fontWeight: FontWeight.bold)),
                   const SizedBox(height: 2),
-                  for (final String line in _manualLines)
-                    Text(line, style: mono),
+                  for (final String line in _manualLines) Text(line),
                 ],
               ],
             ),
@@ -862,36 +885,37 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   /// The inline confirmation block (replaces modal dialogs): the prompt message
-  /// plus Cancel / Confirm buttons that complete the pending future.
-  Widget _consolePromptBlock(ColorScheme scheme) {
+  /// plus Cancel / Confirm buttons that complete the pending future. Styled to
+  /// match the terminal (green on black).
+  Widget _consolePromptBlock() {
     final _ConsolePrompt p = _prompt!;
     return Container(
       margin: const EdgeInsets.only(bottom: 8),
       padding: const EdgeInsets.all(8),
       decoration: BoxDecoration(
-        color: scheme.secondaryContainer,
+        color: _kConsoleFg.withOpacity(0.08),
         borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: scheme.outline),
+        border: Border.all(color: _kConsoleFg),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: <Widget>[
-          Text(
-            p.message,
-            style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: scheme.onSecondaryContainer,
-                ),
-          ),
+          Text(p.message),
           const SizedBox(height: 8),
           Row(
             mainAxisAlignment: MainAxisAlignment.end,
             children: <Widget>[
               TextButton(
+                style: TextButton.styleFrom(foregroundColor: _kConsoleFg),
                 onPressed: () => _resolvePrompt(false),
                 child: Text(p.cancelLabel),
               ),
               const SizedBox(width: 8),
               FilledButton(
+                style: FilledButton.styleFrom(
+                  backgroundColor: _kConsoleFg,
+                  foregroundColor: _kConsoleBg,
+                ),
                 onPressed: () => _resolvePrompt(true),
                 child: Text(p.confirmLabel),
               ),
