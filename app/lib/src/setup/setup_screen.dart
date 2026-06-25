@@ -68,8 +68,11 @@ class _SetupScreenState extends State<SetupScreen> {
   void _onExportLabelRestricted({required bool adjusted}) {
     if (_exportLabelRestricted == adjusted) return;
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted && _exportLabelRestricted != adjusted) {
-        setState(() => _exportLabelRestricted = adjusted);
+      if (!mounted || _exportLabelRestricted == adjusted) return;
+      setState(() => _exportLabelRestricted = adjusted);
+      if (adjusted) {
+        _warnOnConsole('Export label adjusted to A–Z, 0–9 and "-" so it stays '
+            'reproducible.');
       }
     });
   }
@@ -88,9 +91,9 @@ class _SetupScreenState extends State<SetupScreen> {
   bool _stage0Hidden = true;
 
   /// True when the last edit to [_stage0] had characters up-cased or dropped by
-  /// the engine's canonicalisation. Surfaced as an inline red-flag so the
-  /// restriction is never applied silently (DESIGN.md "Strong text
-  /// restrictions": the divergence must be signalled to the user).
+  /// the engine's canonicalisation. Tracks the state so the warning fires once
+  /// per transition; the warning itself is surfaced on the console (DESIGN.md
+  /// "Strong text restrictions": the divergence must be signalled to the user).
   bool _stage0Restricted = false;
 
   /// Called by [_SaltPepperFormatter] (during the edit pipeline) with whether
@@ -101,8 +104,11 @@ class _SetupScreenState extends State<SetupScreen> {
   void _onStage0Restricted({required bool adjusted}) {
     if (_stage0Restricted == adjusted) return;
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted && _stage0Restricted != adjusted) {
-        setState(() => _stage0Restricted = adjusted);
+      if (!mounted || _stage0Restricted == adjusted) return;
+      setState(() => _stage0Restricted = adjusted);
+      if (adjusted) {
+        _warnOnConsole('Salt / pepper adjusted to A–Z, 0–9 and "-" so it stays '
+            'reproducible across devices.');
       }
     });
   }
@@ -1434,30 +1440,9 @@ class _SetupScreenState extends State<SetupScreen> {
           onSubmitted: (_) => _submitConfig(),
         ),
       ),
-      if (_stage0Restricted)
-        Padding(
-          padding: const EdgeInsets.only(top: 6),
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: <Widget>[
-              Icon(
-                Icons.warning_amber_rounded,
-                size: 16,
-                color: Theme.of(context).colorScheme.error,
-              ),
-              const SizedBox(width: 4),
-              Expanded(
-                child: Text(
-                  'Adjusted to A–Z, 0–9 and "-" so it stays reproducible.',
-                  style: TextStyle(
-                    color: Theme.of(context).colorScheme.error,
-                    fontSize: 12,
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
+      // The formatting warning (when the engine adjusts the text) is conveyed on
+      // the console, which expands and pops to the foreground — see
+      // _onStage0Restricted / _warnOnConsole.
     ];
   }
 
@@ -1605,30 +1590,8 @@ class _SetupScreenState extends State<SetupScreen> {
           },
         ),
       ),
-      if (_exportLabelRestricted)
-        Padding(
-          padding: const EdgeInsets.only(top: 6),
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: <Widget>[
-              Icon(
-                Icons.warning_amber_rounded,
-                size: 16,
-                color: Theme.of(context).colorScheme.error,
-              ),
-              const SizedBox(width: 4),
-              Expanded(
-                child: Text(
-                  'Adjusted to A–Z, 0–9 and "-" so it stays reproducible.',
-                  style: TextStyle(
-                    color: Theme.of(context).colorScheme.error,
-                    fontSize: 12,
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
+      // Formatting warning is conveyed on the console (see
+      // _onExportLabelRestricted / _warnOnConsole).
       const SizedBox(height: 8),
       OutlinedButton.icon(
         onPressed: (_busy || _exporting) ? null : _copyMasterSecret,
@@ -1693,6 +1656,17 @@ class _SetupScreenState extends State<SetupScreen> {
       _consoleLog.add(msg);
       if (_consoleLog.length > 50) _consoleLog.removeRange(0, _consoleLog.length - 50);
     });
+  }
+
+  /// Surface a warning on the console and make sure it is seen: expand the
+  /// console and hide the hotkey manual so the message leads, then log it.
+  void _warnOnConsole(String message) {
+    if (!mounted) return;
+    setState(() {
+      _chromeMinimized = false; // expand the console
+      _manualVisible = false; // hide the hotkeys menu so the warning leads
+    });
+    _toast(message);
   }
 
   /// Set the focus-help line when a control gains focus. Deferred to a
