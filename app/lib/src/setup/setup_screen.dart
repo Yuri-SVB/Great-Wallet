@@ -244,11 +244,15 @@ class _SetupScreenState extends State<SetupScreen> {
     node.requestFocus();
   }
 
-  /// Alt+key shortcuts that jump focus to each input field. Handled by
-  /// [CallbackShortcuts] so they fire even while another text field has focus
-  /// (where the raw [_onKey] handler defers to the field).
+  /// Alt+key shortcuts handled by [CallbackShortcuts] so they fire even while a
+  /// text field has focus (where the raw [_onKey] handler defers to the field):
+  /// Alt+M minimizes the chrome, the rest jump focus to an input field.
   Map<ShortcutActivator, VoidCallback> get _focusShortcuts =>
       <ShortcutActivator, VoidCallback>{
+        const SingleActivator(LogicalKeyboardKey.keyM, alt: true): () {
+          _sounds.play(UiSound.click);
+          setState(() => _chromeMinimized = !_chromeMinimized);
+        },
         const SingleActivator(LogicalKeyboardKey.keyS, alt: true): () =>
             _focusField(_stage0Focus, 'salt / pepper'),
         const SingleActivator(LogicalKeyboardKey.keyN, alt: true): () =>
@@ -369,12 +373,6 @@ class _SetupScreenState extends State<SetupScreen> {
     // While a text field (salt, seed phrase, …) holds focus, let it consume the
     // keystroke — never fire canvas shortcuts like S / R.
     if (_textInputHasFocus) return KeyEventResult.ignored;
-    // ` — minimize / restore the console and the stage-tab bar together.
-    if (event.logicalKey == LogicalKeyboardKey.backquote) {
-      _sounds.play(UiSound.click);
-      setState(() => _chromeMinimized = !_chromeMinimized);
-      return KeyEventResult.handled;
-    }
     // H — show / hide the hotkey manual in the console (and restore the console
     // if it was minimized, so the manual is actually visible).
     if (event.logicalKey == LogicalKeyboardKey.keyH) {
@@ -695,7 +693,7 @@ class _SetupScreenState extends State<SetupScreen> {
   /// The hotkey manual, shown in the console (on by default at launch, toggled
   /// with `H`). Lists every shortcut the setup screen handles.
   static const List<String> _manualLines = <String>[
-    '`  minimize / restore the console and the stage-tab bar',
+    'Alt+M  minimize / restore the console and the stage-tab bar',
     'H  show / hide this manual',
     'R  recenter the canvas      T  cycle through stages',
     '0–8  jump to that stage (tab or number key)',
@@ -744,7 +742,7 @@ class _SetupScreenState extends State<SetupScreen> {
           ),
         ),
         IconButton(
-          tooltip: 'Restore console (`)',
+          tooltip: 'Restore console (Alt+M)',
           icon: const Icon(Icons.keyboard_arrow_up),
           onPressed: () => setState(() => _chromeMinimized = false),
         ),
@@ -777,7 +775,7 @@ class _SetupScreenState extends State<SetupScreen> {
               onPressed: () => setState(() => _manualVisible = !_manualVisible),
             ),
             IconButton(
-              tooltip: 'Minimize console & tabs (`)',
+              tooltip: 'Minimize console & tabs (Alt+M)',
               icon: const Icon(Icons.keyboard_arrow_down),
               onPressed: () => setState(() => _chromeMinimized = true),
             ),
