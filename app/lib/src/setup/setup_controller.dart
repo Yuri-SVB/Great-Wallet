@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
@@ -196,6 +197,28 @@ class SetupController extends ChangeNotifier {
   StageParameters? get displayStageParams => _displayParams;
 
   Argon2Job? _argon2Job;
+
+  /// The Argon2 memory profile of the active session, kept so the background
+  /// generation of later stages uses the same profile as Stage 1.
+  Argon2Profile _profile = Argon2Profile.basic;
+
+  /// True while stages **after Stage 1** are still deriving in the background.
+  /// The session is already interactive (phase `memorise`) by then; this only
+  /// drives the subtle progress notice and (via the UI) holds select-mode
+  /// practice off until the whole chain exists.
+  bool _isGenerating = false;
+  bool get isGenerating => _isGenerating;
+
+  /// The stage (1..N) currently deriving in the background, or 0 when not
+  /// generating. Drives the "Deriving stage k/N…" notice.
+  int _generatingStage = 0;
+  int get generatingStage => _generatingStage;
+
+  /// Set if a background stage derivation failed; the already-derived stages
+  /// stay usable, so this is surfaced as a non-fatal notice rather than the
+  /// error phase.
+  String? _generationError;
+  String? get generationError => _generationError;
 
   // --- Select-mode recall state ---
   // One per stage (index 0 — the text stage — is always null; 1..N hold each
@@ -452,6 +475,7 @@ class SetupController extends ChangeNotifier {
       return; // a run is already in progress
     }
     _errorMessage = null;
+    _generationError = null;
     _clearRecall();
     _isRecallSession = false;
     final int pointStages = bits.length ~/ EncodingConstants.bitsPerPoint;
@@ -460,6 +484,7 @@ class SetupController extends ChangeNotifier {
     // what gets hashed (the protocol rule lives in core, not here).
     _chainText = _core.canonicalizeSaltPepper(text);
     _iterations = argon2Iterations;
+    _profile = profile;
     try {
       _entropyBits = bits;
       _points = List<EncodedPoint?>.filled(pointStages + 1, null);
@@ -471,68 +496,38 @@ class SetupController extends ChangeNotifier {
       _selectedMarks =
           List<({double re, double im})?>.filled(pointStages + 1, null);
 
-      const int bpp = EncodingConstants.bitsPerPoint;
-      for (int k = 1; k <= pointStages; k++) {
-        _workingStageIndex = k;
-        // Stage k's fractal derives from the text + every preceding point
-        // (chunks 0..k-2) — one link of the memory-hard chain. Stage 1 derives
-        // from the text alone.
-        final List<int> priorPointBits = bits.sublist(0, (k - 1) * bpp);
-        final Uint8List input = _core.chainInput(_chainText, priorPointBits);
-        _setPhase(SetupPhase.deriving);
-        _argon2Total = argon2Iterations < 1 ? 1 : argon2Iterations;
-        _argon2Done = 0;
-        final Argon2Job job = await _core.startStageDerivation(
-          input,
-          iterations: argon2Iterations,
-          profile: profile,
-          onProgress: (int done, int total) {
-            _argon2Done = done;
-            _argon2Total = total;
-            notifyListeners();
-          },
-        );
-        _argon2Job = job;
-        final StageReservoirs reservoirs = await job.result;
-        _argon2Job = null;
-        Entropy.wipe(priorPointBits);
-        _reservoirs[k] = reservoirs;
-
-        // Encode this stage's single 32-bit point (entropy chunk k-1).
-        _setPhase(SetupPhase.encoding);
-        final List<int> chunk = bits.sublist((k - 1) * bpp, k * bpp);
-        final List<EncodedPoint> pts = _core.encodeStage(
-          chunk,
-          o: reservoirs.o,
-          p: reservoirs.p,
-          q: reservoirs.q,
-        );
-        _points[k] = pts.first;
-        // Record this stage's export contribution: its params and the centre of
-        // the encoded point's leaf rectangle (DESIGN.md §"Master-Secret Export").
-        final ({int re, int im}) leaf =
-            MasterSecret.leafCentreRaw(pts.first.leafRect);
-        _stageRecords[k] = StageRecord(
-          o: reservoirs.o,
-          p: reservoirs.p,
-          q: reservoirs.q,
-          leafReRaw: leaf.re,
-          leafImRaw: leaf.im,
-        );
-        Entropy.wipe(chunk);
-        notifyListeners();
+      // A text-only setup (0 point stages) has nothing to derive — land on the
+      // Stage-0 view straight away.
+      if (pointStages < 1) {
+        Entropy.wipe(bits);
+        _entropyBits = null;
+        _applyDisplayStage(0);
+        _setPhase(SetupPhase.memorise);
+        return;
       }
 
-      // Memorise. Plaintext entropy is no longer needed once it lives on the
-      // fractals as points — wipe it; keep only the points (and the Stage-0
-      // text, which recall needs to re-derive the chain) to display.
-      Entropy.wipe(bits);
-      _entropyBits = null;
-
-      // Land on the first fractal (Stage 1) to memorise; Stage 0 (text) is
-      // reachable with the stage navigation / T.
-      _applyDisplayStage(pointStages >= 1 ? 1 : 0);
+      // Derive Stage 1 in the foreground (full-screen progress): there is
+      // nothing to study until the first fractal exists. Hand control back the
+      // moment it is ready so the user can begin memorising it…
+      final bool ok = await _deriveAndEncodeStage(1, bits, foreground: true);
+      if (!ok) return; // aborted mid-derivation (session torn down)
+      _applyDisplayStage(1);
       _setPhase(SetupPhase.memorise);
+
+      if (pointStages == 1) {
+        Entropy.wipe(bits);
+        _entropyBits = null;
+        return;
+      }
+
+      // …while the remaining stages derive in the background. Each becomes
+      // navigable the moment it is encoded ([isStageAvailable]); the entropy
+      // root is kept alive until the last one is done, then wiped. The UI holds
+      // select-mode practice off until [isGenerating] clears.
+      _isGenerating = true;
+      _generatingStage = 2;
+      notifyListeners();
+      unawaited(_generateRemaining(bits, pointStages));
     } on Argon2Cancelled {
       _resetSecrets();
       _setPhase(SetupPhase.idle);
@@ -541,6 +536,114 @@ class SetupController extends ChangeNotifier {
       // Error text is deliberately generic — never include coordinates/bits.
       _errorMessage = 'Setup failed: ${e.runtimeType}';
       _setPhase(SetupPhase.error);
+    }
+  }
+
+  /// Derive and encode a single fractal stage [k] over the entropy [bits].
+  ///
+  /// [foreground] drives the full-screen progress overlay (phase deriving →
+  /// encoding) for the blocking Stage-1 derivation; background stages leave the
+  /// phase at `memorise` and report progress only through [generatingStage] and
+  /// the Argon2 counters, so the canvas stays interactive. The reservoirs and
+  /// the encoded point are stored as soon as they exist, so the stage is
+  /// navigable immediately after this returns. Returns `false` if the session
+  /// was torn down (Reset/abort) while the derivation was in flight, in which
+  /// case nothing was stored.
+  Future<bool> _deriveAndEncodeStage(
+    int k,
+    List<int> bits, {
+    required bool foreground,
+  }) async {
+    const int bpp = EncodingConstants.bitsPerPoint;
+    _workingStageIndex = k;
+    // Stage k's fractal derives from the text + every preceding point
+    // (chunks 0..k-2) — one link of the memory-hard chain. Stage 1 derives
+    // from the text alone.
+    final List<int> priorPointBits = bits.sublist(0, (k - 1) * bpp);
+    final Uint8List input = _core.chainInput(_chainText, priorPointBits);
+    if (foreground) _setPhase(SetupPhase.deriving);
+    _argon2Total = _iterations < 1 ? 1 : _iterations;
+    _argon2Done = 0;
+    notifyListeners();
+    final Argon2Job job = await _core.startStageDerivation(
+      input,
+      iterations: _iterations,
+      profile: _profile,
+      onProgress: (int done, int total) {
+        _argon2Done = done;
+        _argon2Total = total;
+        notifyListeners();
+      },
+    );
+    _argon2Job = job;
+    final StageReservoirs reservoirs = await job.result;
+    _argon2Job = null;
+    Entropy.wipe(priorPointBits);
+    // Drop the result if the session was reset/aborted mid-flight, rather than
+    // writing into the torn-down arrays.
+    if (_entropyBits == null || k >= _reservoirs.length) {
+      reservoirs.clear();
+      return false;
+    }
+    _reservoirs[k] = reservoirs;
+
+    // Encode this stage's single 32-bit point (entropy chunk k-1).
+    if (foreground) _setPhase(SetupPhase.encoding);
+    final List<int> chunk = bits.sublist((k - 1) * bpp, k * bpp);
+    final List<EncodedPoint> pts = _core.encodeStage(
+      chunk,
+      o: reservoirs.o,
+      p: reservoirs.p,
+      q: reservoirs.q,
+    );
+    _points[k] = pts.first;
+    // Record this stage's export contribution: its params and the centre of
+    // the encoded point's leaf rectangle (DESIGN.md §"Master-Secret Export").
+    final ({int re, int im}) leaf =
+        MasterSecret.leafCentreRaw(pts.first.leafRect);
+    _stageRecords[k] = StageRecord(
+      o: reservoirs.o,
+      p: reservoirs.p,
+      q: reservoirs.q,
+      leafReRaw: leaf.re,
+      leafImRaw: leaf.im,
+    );
+    Entropy.wipe(chunk);
+    notifyListeners();
+    return true;
+  }
+
+  /// Derive the stages after Stage 1 in the background, one at a time, while the
+  /// user studies the stages already done. Owns [bits] for the duration and
+  /// wipes the entropy root once the last stage is encoded (or on abort). A
+  /// failure leaves the stages derived so far intact and surfaces
+  /// [generationError].
+  Future<void> _generateRemaining(List<int> bits, int pointStages) async {
+    try {
+      for (int k = 2; k <= pointStages; k++) {
+        _generatingStage = k;
+        notifyListeners();
+        final bool ok = await _deriveAndEncodeStage(k, bits, foreground: false);
+        if (!ok) return; // session torn down — finally cleans up
+      }
+    } on Argon2Cancelled {
+      // Aborted (e.g. Reset) — the stages already derived stay valid; the rest
+      // simply never appear. _resetSecrets has wiped the session.
+      return;
+    } catch (e) {
+      _generationError =
+          'Stage $_generatingStage failed to derive (${e.runtimeType}); '
+          'the earlier stages are still usable.';
+    } finally {
+      _isGenerating = false;
+      _generatingStage = 0;
+      // The entropy root is no longer needed once every stage carries its point
+      // (skip if a reset already wiped it).
+      if (_entropyBits != null) {
+        Entropy.wipe(bits);
+        _entropyBits = null;
+      }
+      notifyListeners();
     }
   }
 
@@ -947,6 +1050,9 @@ class SetupController extends ChangeNotifier {
     _stageCount = 0;
     _chainText = '';
     _isRecallSession = false;
+    _isGenerating = false;
+    _generatingStage = 0;
+    _generationError = null;
     _core.source.reservoirs?.clear();
     _core.source.reservoirs = null;
     _clearRecall();

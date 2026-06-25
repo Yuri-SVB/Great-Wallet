@@ -307,6 +307,13 @@ class _SetupScreenState extends State<SetupScreen> {
       _setup.showStage(index);
       return;
     }
+    // Not derived yet because generation is still running in the background —
+    // it will open on its own when ready.
+    if (_setup.isGenerating) {
+      _sounds.play(UiSound.deny);
+      _toast('Stage $index is still deriving — it will open when ready.');
+      return;
+    }
     // Not derived. Only the very next stage can be derived, and only once the
     // previous stage carries a selected point.
     if (index != _setup.firstUnderivedStage) {
@@ -367,6 +374,13 @@ class _SetupScreenState extends State<SetupScreen> {
   /// Toggle select (recall) mode. Entering it snaps the canvas to the stage the
   /// recall walk is on, so clicks land on the right fractal in chain order.
   void _setSelectMode(bool v) {
+    // Practising points while later stages are still deriving is held off (the
+    // user asked for view/navigate only until the whole chain exists).
+    if (v && _setup.isGenerating) {
+      _sounds.play(UiSound.deny);
+      _toast('Select mode opens once every stage has finished deriving.');
+      return;
+    }
     _sounds.play(v ? UiSound.select : UiSound.click);
     setState(() => _selectMode = v);
     if (v) _setup.showRecallStage();
@@ -595,6 +609,13 @@ class _SetupScreenState extends State<SetupScreen> {
             _stageNav(),
           ],
 
+          // Background generation progress: later stages are still deriving
+          // while the user studies the ones already done.
+          if (_setup.isGenerating || _setup.generationError != null) ...<Widget>[
+            const Divider(height: 32),
+            _generationNotice(),
+          ],
+
           const Divider(height: 32),
           // Always available: entering select mode snaps to the next fractal to
           // recall (Stage 0 is text, not selectable), and Reset returns to the
@@ -602,9 +623,12 @@ class _SetupScreenState extends State<SetupScreen> {
           SwitchListTile(
             contentPadding: EdgeInsets.zero,
             title: const Text('Select mode'),
-            subtitle: const Text('Click your points to recall (or press S)'),
+            subtitle: Text(_setup.isGenerating
+                ? 'Available once every stage has finished deriving'
+                : 'Click your points to recall (or press S)'),
             value: _selectMode,
-            onChanged: _setSelectMode,
+            onChanged:
+                (_busy || _setup.isGenerating) ? null : _setSelectMode,
           ),
           if (_selectMode &&
               !_setup.isTextStage &&
@@ -1058,7 +1082,10 @@ class _SetupScreenState extends State<SetupScreen> {
     final bool canNext = !_busy &&
         idx + 1 < n &&
         (_setup.isStageAvailable(idx + 1) ||
-            idx + 1 == _setup.firstUnderivedStage);
+            // Only a recall walk derives the next stage on demand; during
+            // background generation the next stage arrives on its own.
+            (_setup.isRecallSession &&
+                idx + 1 == _setup.firstUnderivedStage));
     return Row(
       mainAxisAlignment: MainAxisAlignment.spaceBetween,
       children: <Widget>[
@@ -1073,6 +1100,31 @@ class _SetupScreenState extends State<SetupScreen> {
           onPressed: canNext ? () => _selectStage(idx + 1) : null,
           icon: const Icon(Icons.chevron_right),
         ),
+      ],
+    );
+  }
+
+  /// A subtle, non-blocking notice while later stages derive in the background
+  /// (or a one-line warning if a background derivation failed). The stages
+  /// already derived are fully navigable meanwhile; focus stays put.
+  Widget _generationNotice() {
+    final String? err = _setup.generationError;
+    if (err != null) {
+      return Text(err, style: const TextStyle(color: Colors.orangeAccent));
+    }
+    final int total = _setup.nStages - 1;
+    final double? progress =
+        _setup.argon2Total > 0 ? _setup.argon2Done / _setup.argon2Total : null;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Text(
+          'Deriving stage ${_setup.generatingStage}/$total in the background — '
+          'the stages already done are ready to study now.',
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
+        const SizedBox(height: 8),
+        LinearProgressIndicator(value: progress),
       ],
     );
   }
