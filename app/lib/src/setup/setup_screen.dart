@@ -43,10 +43,9 @@ class _SetupScreenState extends State<SetupScreen> {
   /// to it after the user has been typing in a text field.
   final FocusNode _hotkeys = FocusNode(debugLabel: 'setup-hotkeys');
 
-  // Focus nodes for the input controls, so an Alt+key shortcut can jump focus
-  // straight to each one. Each field is wrapped in _track(_Field…) so focus also
-  // drives the console help. A node whose `context` is null is simply not on
-  // screen in the current mode.
+  // Focus nodes for the input controls. N/I/R focus the stages slider / import
+  // field; C focuses the colour wheel; the rest are reached with Tab. Each field
+  // is wrapped in _track(_Field…) so focus also drives the console help.
   final FocusNode _stage0Focus = FocusNode(debugLabel: 'salt');
   final FocusNode _iterationsFocus = FocusNode(debugLabel: 'iterations');
   final FocusNode _stagesFocus = FocusNode(debugLabel: 'stages');
@@ -230,34 +229,34 @@ class _SetupScreenState extends State<SetupScreen> {
     node.requestFocus();
   }
 
-  /// Alt+key shortcuts handled by [CallbackShortcuts] so they fire even while a
-  /// text field has focus (where the raw [_onKey] handler defers to the field):
-  /// Alt+M minimizes the chrome, the rest jump focus to an input field.
-  Map<ShortcutActivator, VoidCallback> get _focusShortcuts =>
+  /// Global shortcuts that fire even while a text field has focus (text fields
+  /// do not consume these keys, so they bubble up to here). Esc leaves a field
+  /// for the viewer; F1 is an alias for the manual.
+  Map<ShortcutActivator, VoidCallback> get _globalShortcuts =>
       <ShortcutActivator, VoidCallback>{
-        const SingleActivator(LogicalKeyboardKey.keyM, alt: true): () {
-          _sounds.play(UiSound.click);
-          setState(() => _chromeMinimized = !_chromeMinimized);
-        },
-        const SingleActivator(LogicalKeyboardKey.keyS, alt: true): () =>
-            _focusField(_stage0Focus, 'salt / pepper'),
-        const SingleActivator(LogicalKeyboardKey.keyN, alt: true): () =>
-            _focusField(_iterationsFocus, 'Argon2 iterations'),
-        const SingleActivator(LogicalKeyboardKey.keyG, alt: true): () =>
-            _focusField(_stagesFocus, 'number of stages'),
-        const SingleActivator(LogicalKeyboardKey.keyP, alt: true): () =>
-            _focusField(_profileFocus, 'Argon2 profile'),
-        const SingleActivator(LogicalKeyboardKey.keyI, alt: true): () =>
-            _focusField(_mnemonicFocus, 'import phrase'),
-        const SingleActivator(LogicalKeyboardKey.keyL, alt: true): () =>
-            _focusField(_exportLabelFocus, 'export label'),
+        const SingleActivator(LogicalKeyboardKey.escape): _focusViewer,
+        const SingleActivator(LogicalKeyboardKey.f1): _toggleManual,
       };
+
+  /// Return keyboard focus to the fractal viewer (and so out of any text field),
+  /// re-enabling the single-key hotkeys. The non-directional counterpart to Tab.
+  void _focusViewer() => _hotkeys.requestFocus();
+
+  /// Toggle the hotkey manual, restoring the console if it was minimized so the
+  /// manual is actually visible. Bound to H and F1.
+  void _toggleManual() {
+    _sounds.play(UiSound.click);
+    setState(() {
+      _manualVisible = !_manualVisible;
+      if (_manualVisible) _chromeMinimized = false;
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
     final bool hasResult = _setup.phase == SetupPhase.memorise;
     return CallbackShortcuts(
-      bindings: _focusShortcuts,
+      bindings: _globalShortcuts,
       child: Focus(
       focusNode: _hotkeys,
       autofocus: true,
@@ -366,23 +365,25 @@ class _SetupScreenState extends State<SetupScreen> {
   KeyEventResult _onKey(FocusNode node, KeyEvent event) {
     if (event is! KeyDownEvent) return KeyEventResult.ignored;
     // While a text field (salt, seed phrase, …) holds focus, let it consume the
-    // keystroke — never fire canvas shortcuts like S / R.
+    // keystroke — never fire canvas shortcuts. Press Esc to leave the field and
+    // return to the viewer (handled globally below).
     if (_textInputHasFocus) return KeyEventResult.ignored;
-    // These are *unmodified* letter/number shortcuts. If a modifier is held,
-    // bail so the combo bubbles up to CallbackShortcuts (e.g. Alt+N focuses the
-    // iterations field rather than firing plain N for "New seed").
+    // Scheme A: all hotkeys are single, unmodified keys, active when the viewer
+    // (not a text field) has focus. If a modifier is held, bail so OS combos are
+    // left alone.
     final HardwareKeyboard kb = HardwareKeyboard.instance;
     if (kb.isAltPressed || kb.isControlPressed || kb.isMetaPressed) {
       return KeyEventResult.ignored;
     }
-    // H — show / hide the hotkey manual in the console (and restore the console
-    // if it was minimized, so the manual is actually visible).
+    // H — show / hide the hotkey manual (F1 is an alias, handled globally).
     if (event.logicalKey == LogicalKeyboardKey.keyH) {
+      _toggleManual();
+      return KeyEventResult.handled;
+    }
+    // M — minimize / restore the console + stage tabs.
+    if (event.logicalKey == LogicalKeyboardKey.keyM) {
       _sounds.play(UiSound.click);
-      setState(() {
-        _manualVisible = !_manualVisible;
-        if (_manualVisible) _chromeMinimized = false;
-      });
+      setState(() => _chromeMinimized = !_chromeMinimized);
       return KeyEventResult.handled;
     }
     // C — focus the colour wheel (then ← → cycle hues).
@@ -390,8 +391,7 @@ class _SetupScreenState extends State<SetupScreen> {
       _focusField(_hueFocus, 'colour wheel');
       return KeyEventResult.handled;
     }
-    // N / I / R — choose the source on the config screen (New seed / Import /
-    // Recall). No-op once a session is running.
+    // N / I / R — choose the source and focus its input (config screen).
     if (event.logicalKey == LogicalKeyboardKey.keyN) {
       _setSource(_SourceMode.fresh, focusInput: true);
       return KeyEventResult.handled;
@@ -740,14 +740,13 @@ class _SetupScreenState extends State<SetupScreen> {
   /// The hotkey manual, shown in the console (on by default at launch, toggled
   /// with `H`). Lists every shortcut the setup screen handles.
   static const List<String> _manualLines = <String>[
-    'Alt+M  minimize / restore the console and the stage-tab bar',
-    'H  show / hide this manual',
+    'Esc  return to the fractal (leave a text field) · Tab cycles fields',
+    'H / F1  show / hide this manual      M  minimize / restore chrome',
     '0–8  go to that stage (recenters); press again to zoom to its point',
     'N / I / R  New seed / Import / Recall (also focuses its input)',
+    'Enter  start (Generate / Encode / Begin recall) from a field',
     'K  copy the master secret ("the key") for the focused stage',
     'C  focus the colour wheel, then ← → to cycle hues',
-    'Alt+S salt/pepper   Alt+N iterations   Alt+G stages   Alt+P profile',
-    'Alt+I import phrase   Alt+L export label',
     'L+scroll brightness · scroll zoom · drag pan (over the canvas)',
   ];
 
@@ -804,7 +803,7 @@ class _SetupScreenState extends State<SetupScreen> {
           child: Text(status, maxLines: 1, overflow: TextOverflow.ellipsis),
         ),
         IconButton(
-          tooltip: 'Restore console (Alt+M)',
+          tooltip: 'Restore console (M)',
           color: _kConsoleFg,
           icon: const Icon(Icons.keyboard_arrow_up),
           onPressed: () => setState(() => _chromeMinimized = false),
@@ -836,7 +835,7 @@ class _SetupScreenState extends State<SetupScreen> {
               onPressed: () => setState(() => _manualVisible = !_manualVisible),
             ),
             IconButton(
-              tooltip: 'Minimize console & tabs (Alt+M)',
+              tooltip: 'Minimize console & tabs (M)',
               color: _kConsoleFg,
               icon: const Icon(Icons.keyboard_arrow_down),
               onPressed: () => setState(() => _chromeMinimized = true),
@@ -1047,6 +1046,20 @@ class _SetupScreenState extends State<SetupScreen> {
     }
   }
 
+  /// Submit the config form from an input field's Enter key: run the action that
+  /// the enabled button would (Generate / Encode phrase / Begin recall), if its
+  /// preconditions hold. Focus returns to the viewer when the action starts.
+  void _submitConfig() {
+    if (_busy || _hasSession || !_iterationsValid) return;
+    if (_source == _SourceMode.recall) {
+      _beginRecall();
+    } else if (_source == _SourceMode.import) {
+      if (_mnemonic.text.trim().isNotEmpty) _start();
+    } else {
+      _start();
+    }
+  }
+
   /// One-line description of a source mode, shown in the console when selected
   /// (instead of an inline paragraph in the panel).
   String _sourceBlurb(_SourceMode mode) {
@@ -1211,6 +1224,7 @@ class _SetupScreenState extends State<SetupScreen> {
             if (v != null && v >= 0) _iterations = v;
             setState(() {});
           },
+          onSubmitted: (_) => _submitConfig(),
         ),
       ),
     ];
@@ -1298,6 +1312,7 @@ class _SetupScreenState extends State<SetupScreen> {
             _sounds.play(UiSound.click);
             setState(() {});
           },
+          onSubmitted: (_) => _submitConfig(),
         ),
       ),
     ];
@@ -1345,6 +1360,7 @@ class _SetupScreenState extends State<SetupScreen> {
             _sounds.play(UiSound.click);
             setState(() {});
           },
+          onSubmitted: (_) => _submitConfig(),
         ),
       ),
       if (_stage0Restricted)
@@ -1697,6 +1713,7 @@ class _SetupScreenState extends State<SetupScreen> {
 
   Future<void> _start() async {
     _sounds.play(UiSound.click);
+    _focusViewer(); // leave the input field; hotkeys act on the viewer now
     _brightness.reset();
     setState(() => _selectMode = false);
     final String text = _stage0.text;
@@ -1735,6 +1752,7 @@ class _SetupScreenState extends State<SetupScreen> {
   Future<void> _beginRecall() async {
     final int n = _pointStages;
     _sounds.play(UiSound.click);
+    _focusViewer(); // leave the input field; clicks/hotkeys act on the viewer
     _brightness.reset();
     await _setup.beginRecall(
       pointStages: n,
@@ -1768,6 +1786,7 @@ class _SetupScreenState extends State<SetupScreen> {
       _stage0Hidden = true;
       _exportLabelRestricted = false;
     });
+    _focusViewer(); // back on the config screen; hotkeys act on the viewer
   }
 }
 
