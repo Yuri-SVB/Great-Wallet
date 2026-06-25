@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -14,7 +15,7 @@ import 'setup_controller.dart';
 ///
 /// This is the concrete `great-wall-core + great-wall-ux` integration the
 /// architecture assigns to Setup (ARCHITECTURE.md §"7. great-wallet", mode 1):
-/// great-wall-ux's [FractalCanvas] / [HueWheel] / brightness drive the visuals,
+/// great-wall-ux's [FractalCanvas] / palette / brightness drive the visuals,
 /// while a [SetupController] runs the engine's encode/Argon2 pipeline and feeds
 /// the canvas its [EscapeCountSource] and overlays.
 class SetupScreen extends StatefulWidget {
@@ -41,6 +42,18 @@ class _SetupScreenState extends State<SetupScreen> {
   /// Focus node for the canvas/hotkey handler, so we can return keyboard focus
   /// to it after the user has been typing in a text field.
   final FocusNode _hotkeys = FocusNode(debugLabel: 'setup-hotkeys');
+
+  // Focus nodes for the input controls, so an Alt+key shortcut can jump focus
+  // straight to each one. Each field is wrapped in _track(_Field…) so focus also
+  // drives the console help. A node whose `context` is null is simply not on
+  // screen in the current mode.
+  final FocusNode _stage0Focus = FocusNode(debugLabel: 'salt');
+  final FocusNode _iterationsFocus = FocusNode(debugLabel: 'iterations');
+  final FocusNode _stagesFocus = FocusNode(debugLabel: 'stages');
+  final FocusNode _profileFocus = FocusNode(debugLabel: 'profile');
+  final FocusNode _mnemonicFocus = FocusNode(debugLabel: 'import');
+  final FocusNode _exportLabelFocus = FocusNode(debugLabel: 'export-label');
+  final FocusNode _hueFocus = FocusNode(debugLabel: 'hue');
 
   /// Per-stage **master-secret export label** (e.g. `SIGNING-1`). Appended to
   /// the Argon2id transcript message at the exporting stage, versioning the
@@ -139,8 +152,9 @@ class _SetupScreenState extends State<SetupScreen> {
   /// Recent console lines, most recent last (capped).
   final List<String> _consoleLog = <String>[];
 
-  /// Help text for the control currently under focus, shown in the console.
-  String? _focusHelp;
+  /// The input control currently under focus; the console renders its help
+  /// (label + live value) so the panel itself can stay label-free.
+  _Field? _focusedField;
 
   /// Whether the hotkey manual is shown in the console. On at launch.
   bool _manualVisible = true;
@@ -182,6 +196,13 @@ class _SetupScreenState extends State<SetupScreen> {
     _mnemonic.dispose();
     _stage0.dispose();
     _hotkeys.dispose();
+    _stage0Focus.dispose();
+    _iterationsFocus.dispose();
+    _stagesFocus.dispose();
+    _profileFocus.dispose();
+    _mnemonicFocus.dispose();
+    _exportLabelFocus.dispose();
+    _hueFocus.dispose();
     super.dispose();
   }
 
@@ -197,29 +218,58 @@ class _SetupScreenState extends State<SetupScreen> {
       _setup.phase == SetupPhase.memorise ||
       _setup.phase == SetupPhase.recallComplete;
 
+  /// Move keyboard focus to an input field by its node. If the field is not on
+  /// screen in the current mode (`context == null`), say so in the console
+  /// instead of silently doing nothing.
+  void _focusField(FocusNode node, String label) {
+    if (node.context == null) {
+      _toast('The $label field is not available in this mode.');
+      return;
+    }
+    _sounds.play(UiSound.click);
+    node.requestFocus();
+  }
+
+  /// Alt+key shortcuts handled by [CallbackShortcuts] so they fire even while a
+  /// text field has focus (where the raw [_onKey] handler defers to the field):
+  /// Alt+M minimizes the chrome, the rest jump focus to an input field.
+  Map<ShortcutActivator, VoidCallback> get _focusShortcuts =>
+      <ShortcutActivator, VoidCallback>{
+        const SingleActivator(LogicalKeyboardKey.keyM, alt: true): () {
+          _sounds.play(UiSound.click);
+          setState(() => _chromeMinimized = !_chromeMinimized);
+        },
+        const SingleActivator(LogicalKeyboardKey.keyS, alt: true): () =>
+            _focusField(_stage0Focus, 'salt / pepper'),
+        const SingleActivator(LogicalKeyboardKey.keyN, alt: true): () =>
+            _focusField(_iterationsFocus, 'Argon2 iterations'),
+        const SingleActivator(LogicalKeyboardKey.keyG, alt: true): () =>
+            _focusField(_stagesFocus, 'number of stages'),
+        const SingleActivator(LogicalKeyboardKey.keyP, alt: true): () =>
+            _focusField(_profileFocus, 'Argon2 profile'),
+        const SingleActivator(LogicalKeyboardKey.keyI, alt: true): () =>
+            _focusField(_mnemonicFocus, 'import phrase'),
+        const SingleActivator(LogicalKeyboardKey.keyL, alt: true): () =>
+            _focusField(_exportLabelFocus, 'export label'),
+      };
+
   @override
   Widget build(BuildContext context) {
     final bool hasResult = _setup.phase == SetupPhase.memorise;
-    return Focus(
+    return CallbackShortcuts(
+      bindings: _focusShortcuts,
+      child: Focus(
       focusNode: _hotkeys,
       autofocus: true,
       onKeyEvent: _onKey,
       child: Column(
         children: <Widget>[
-          // Upper edge: a fixed, full-width bar of stage tabs (0..8). Always
-          // present; unreachable tabs are greyed but stay in place. Tap or press
-          // 0–8 to jump. Hidden along with the console when the chrome is
-          // minimized.
-          if (!_chromeMinimized) _stageTabs(),
           Expanded(
             child: Row(
               children: <Widget>[
                 Expanded(
                   // Clicking anywhere on the canvas returns keyboard focus to the
-                  // hotkey handler, so the shortcuts work again after the user
-                  // has been typing in a text field (salt, seed phrase). Listener
-                  // is passive — it does not interfere with the canvas's own
-                  // pan/zoom/select.
+                  // hotkey handler; the Listener is passive.
                   child: Listener(
                     onPointerDown: (_) => _hotkeys.requestFocus(),
                     child: Stack(
@@ -233,11 +283,29 @@ class _SetupScreenState extends State<SetupScreen> {
                         if (_busy) Positioned.fill(child: _progressOverlay()),
                         if (_selectMode && !_setup.isTextStage)
                           const Positioned(
-                            top: 12,
+                            top: 56,
                             left: 12,
-                            child: _Badge(
-                                'Recall — click your point'),
+                            child: _Badge('Recall — click your point'),
                           ),
+                        // Stage tabs hover over the top of the viewer with a
+                        // transparent background, so they never squeeze the
+                        // canvas. Hidden when the chrome is minimized.
+                        if (!_chromeMinimized)
+                          Positioned(
+                            top: 0,
+                            left: 0,
+                            right: 0,
+                            child: _stageTabs(),
+                          ),
+                        // The console always floats over the foot of the viewer
+                        // (expanded or as a thin minimized bar) — it never takes
+                        // a layout row, so the view is never squeezed.
+                        Positioned(
+                          bottom: 0,
+                          left: 0,
+                          right: 0,
+                          child: _console(),
+                        ),
                       ],
                     ),
                   ),
@@ -246,15 +314,14 @@ class _SetupScreenState extends State<SetupScreen> {
               ],
             ),
           ),
-          // Foot of the screen: the console (single message surface).
-          _console(),
         ],
+      ),
       ),
     );
   }
 
   /// The upper-edge stage tabs: a **fixed** bar of nine numbered tabs (0..8,
-  /// the protocol ceiling) that always span the full width. Stage 0 is the
+  /// the protocol ceiling) spanning the fractal-view width. Stage 0 is the
   /// salt/pepper text; 1..N-1 are the chain-derived fractals. The stage under
   /// focus is highlighted; tabs that are not currently reachable — outside this
   /// setup's stage count, not yet derived, or before any session — stay visible
@@ -263,8 +330,9 @@ class _SetupScreenState extends State<SetupScreen> {
   Widget _stageTabs() {
     const int maxTab = SetupController.maxPointStages; // 0..8 → nine fixed tabs
     final int current = _setup.displayStageIndex;
+    // Transparent so the tabs hover over the fractal (no opaque bar).
     return Material(
-      color: Theme.of(context).colorScheme.surface,
+      type: MaterialType.transparency,
       child: SizedBox(
         height: 44,
         child: Padding(
@@ -300,13 +368,40 @@ class _SetupScreenState extends State<SetupScreen> {
     // While a text field (salt, seed phrase, …) holds focus, let it consume the
     // keystroke — never fire canvas shortcuts like S / R.
     if (_textInputHasFocus) return KeyEventResult.ignored;
-    if (event.logicalKey == LogicalKeyboardKey.keyR) {
-      _resetView();
+    // These are *unmodified* letter/number shortcuts. If a modifier is held,
+    // bail so the combo bubbles up to CallbackShortcuts (e.g. Alt+N focuses the
+    // iterations field rather than firing plain N for "New seed").
+    final HardwareKeyboard kb = HardwareKeyboard.instance;
+    if (kb.isAltPressed || kb.isControlPressed || kb.isMetaPressed) {
+      return KeyEventResult.ignored;
+    }
+    // H — show / hide the hotkey manual in the console (and restore the console
+    // if it was minimized, so the manual is actually visible).
+    if (event.logicalKey == LogicalKeyboardKey.keyH) {
+      _sounds.play(UiSound.click);
+      setState(() {
+        _manualVisible = !_manualVisible;
+        if (_manualVisible) _chromeMinimized = false;
+      });
       return KeyEventResult.handled;
     }
-    if (event.logicalKey == LogicalKeyboardKey.keyT) {
-      _sounds.play(UiSound.select);
-      _setup.cycleStage();
+    // C — focus the colour wheel (then ← → cycle hues).
+    if (event.logicalKey == LogicalKeyboardKey.keyC) {
+      _focusField(_hueFocus, 'colour wheel');
+      return KeyEventResult.handled;
+    }
+    // N / I / R — choose the source on the config screen (New seed / Import /
+    // Recall). No-op once a session is running.
+    if (event.logicalKey == LogicalKeyboardKey.keyN) {
+      _setSource(_SourceMode.fresh);
+      return KeyEventResult.handled;
+    }
+    if (event.logicalKey == LogicalKeyboardKey.keyI) {
+      _setSource(_SourceMode.import);
+      return KeyEventResult.handled;
+    }
+    if (event.logicalKey == LogicalKeyboardKey.keyR) {
+      _setSource(_SourceMode.recall);
       return KeyEventResult.handled;
     }
     // K — derive and copy the exported master secret ("the key") for the stage
@@ -333,17 +428,22 @@ class _SetupScreenState extends State<SetupScreen> {
       _sounds.play(UiSound.deny);
       return;
     }
-    if (index == _setup.displayStageIndex) return; // already here — no-op
+    if (index == _setup.displayStageIndex) {
+      // Re-selecting the current stage zooms to its point (if any).
+      _focusPoint(index);
+      return;
+    }
     if (index < 0 || index >= _setup.nStages) {
       _sounds.play(UiSound.deny);
       _toast('This setup has ${_setup.nStages - 1} stage'
           '${_setup.nStages - 1 == 1 ? '' : 's'} (0–${_setup.nStages - 1}).');
       return;
     }
-    // Already derived (or the Stage-0 text) — just focus it.
+    // Already derived (or the Stage-0 text) — focus it and recenter the view.
     if (_setup.isStageAvailable(index)) {
       _sounds.play(UiSound.select);
       _setup.showStage(index);
+      _recenter();
       return;
     }
     // Not derived yet because generation is still running in the background —
@@ -379,8 +479,8 @@ class _SetupScreenState extends State<SetupScreen> {
     switch (outcome) {
       case DeriveOutcome.derived:
         _sounds.play(UiSound.select);
-        _toast('Stage ${_setup.displayStageIndex}/${_setup.nStages - 1} '
-            'derived — recall your point.');
+        _recenter(); // land centred on the fresh fractal
+        _toast('Stage ${_setup.displayStageIndex} derived — recall your point.');
       case DeriveOutcome.noPriorPoint:
         _sounds.play(UiSound.deny);
         _toast('Select your point on the previous stage first.');
@@ -400,13 +500,43 @@ class _SetupScreenState extends State<SetupScreen> {
     return c.findAncestorWidgetOfExactType<EditableText>() != null;
   }
 
-  /// Recenter the canvas: restore the default position and zoom and the default
-  /// brightness offset, without touching the session or the encoded points.
-  /// Bound to `R` — a quick "I'm lost, take me home" after panning/zooming far.
-  void _resetView() {
-    _sounds.play(UiSound.click);
+  /// Soft-coded target: a focused point's leaf should occupy this fraction of
+  /// the view's (shorter-axis) span — half by default.
+  static const double _kFocusLeafRatio = 0.5;
+
+  /// Recenter the canvas to the default position/zoom and reset brightness,
+  /// without touching the session. Triggered automatically on arriving at a
+  /// stage (the old `R` behaviour, now folded into stage selection).
+  void _recenter() {
     _viewport.viewport = _initialViewport;
     _brightness.reset();
+    setState(() {});
+  }
+
+  /// Zoom-to-fit the point of [index] ("focus"): centre on its coordinates and
+  /// set the zoom so the leaf's largest dimension is [_kFocusLeafRatio] of the
+  /// view's shorter-axis span. No-op (deny) if that stage has no point.
+  void _focusPoint(int index) {
+    final ({double re, double im, double leafW, double leafH})? t =
+        _setup.focusTargetAt(index);
+    if (t == null) {
+      _sounds.play(UiSound.deny);
+      _toast('No point on Stage $index to focus yet.');
+      return;
+    }
+    final double leafMax = math.max(t.leafW, t.leafH);
+    final FractalViewport cur = _viewport.viewport;
+    // half-extent is half the shorter-axis span; choose it so leafMax /
+    // (2*halfExtent) == ratio. Fall back to the current zoom if the leaf size is
+    // unknown.
+    final double half =
+        leafMax > 0 ? leafMax / (2 * _kFocusLeafRatio) : cur.halfExtent;
+    _sounds.play(UiSound.select);
+    _viewport.viewport = cur.copyWith(
+      centreRe: t.re,
+      centreIm: t.im,
+      halfExtent: half,
+    );
     setState(() {});
   }
 
@@ -610,56 +740,72 @@ class _SetupScreenState extends State<SetupScreen> {
   /// The hotkey manual, shown in the console (on by default at launch, toggled
   /// with `H`). Lists every shortcut the setup screen handles.
   static const List<String> _manualLines = <String>[
-    '`  minimize / restore the console and the stage-tab bar',
+    'Alt+M  minimize / restore the console and the stage-tab bar',
     'H  show / hide this manual',
-    'R  recenter the canvas      T  cycle through stages',
-    '0–8  jump to that stage (tab or number key)',
+    '0–8  go to that stage (recenters); press again to zoom to its point',
+    'N / I / R  New seed / Import / Recall (config screen)',
     'K  copy the master secret ("the key") for the focused stage',
+    'C  focus the colour wheel, then ← → to cycle hues',
     'Alt+S salt/pepper   Alt+N iterations   Alt+G stages   Alt+P profile',
     'Alt+I import phrase   Alt+L export label',
     'L+scroll brightness · scroll zoom · drag pan (over the canvas)',
   ];
 
+  /// Terminal palette: fully-saturated green on black.
+  static const Color _kConsoleBg = Color(0xFF000000);
+  static const Color _kConsoleFg = Color(0xFF00FF00);
+  static const TextStyle _termStyle = TextStyle(
+    color: _kConsoleFg,
+    fontFamily: GreatWallTypography.fontFamily,
+    fontFamilyFallback: <String>['monospace'],
+    fontSize: 13,
+    height: 1.3,
+  );
+
   /// The bottom console — the single surface for toasts, focus help, and inline
-  /// confirmations. Collapses to a one-line status bar when minimized.
+  /// confirmations. Collapses to a one-line status bar when minimized. Styled as
+  /// a terminal: saturated green on black.
   Widget _console() {
-    final ColorScheme scheme = Theme.of(context).colorScheme;
+    final String? focusHelp =
+        _focusedField != null ? _fieldHelp(_focusedField!) : null;
     final String status = _prompt != null
         ? _prompt!.message
-        : _focusHelp ?? (_consoleLog.isEmpty ? 'Ready.' : _consoleLog.last);
+        : focusHelp ?? (_consoleLog.isEmpty ? 'Ready.' : _consoleLog.last);
     return Material(
-      color: scheme.surface,
+      color: _kConsoleBg,
       child: DecoratedBox(
-        decoration: BoxDecoration(
-          border: Border(top: BorderSide(color: scheme.outlineVariant)),
+        decoration: const BoxDecoration(
+          border: Border(top: BorderSide(color: _kConsoleFg)),
         ),
         child: SafeArea(
           top: false,
-          child: _chromeMinimized
-              ? _consoleStatusBar(status, scheme)
-              : _consoleExpanded(scheme),
+          child: DefaultTextStyle(
+            style: _termStyle,
+            child: IconTheme(
+              data: const IconThemeData(color: _kConsoleFg, size: 16),
+              child: _chromeMinimized
+                  ? _consoleStatusBar(status)
+                  : _consoleExpanded(),
+            ),
+          ),
         ),
       ),
     );
   }
 
   /// The collapsed console: one status line plus a restore button.
-  Widget _consoleStatusBar(String status, ColorScheme scheme) {
+  Widget _consoleStatusBar(String status) {
     return Row(
       children: <Widget>[
         const SizedBox(width: 12),
-        Icon(Icons.terminal, size: 16, color: scheme.onSurfaceVariant),
+        const Icon(Icons.terminal),
         const SizedBox(width: 8),
         Expanded(
-          child: Text(
-            status,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: Theme.of(context).textTheme.bodySmall,
-          ),
+          child: Text(status, maxLines: 1, overflow: TextOverflow.ellipsis),
         ),
         IconButton(
-          tooltip: 'Restore console (`)',
+          tooltip: 'Restore console (Alt+M)',
+          color: _kConsoleFg,
           icon: const Icon(Icons.keyboard_arrow_up),
           onPressed: () => setState(() => _chromeMinimized = false),
         ),
@@ -669,11 +815,7 @@ class _SetupScreenState extends State<SetupScreen> {
 
   /// The expanded console: header, optional inline prompt, focus help, the
   /// recent log, and the optional hotkey manual.
-  Widget _consoleExpanded(ColorScheme scheme) {
-    final TextStyle? mono = Theme.of(context).textTheme.bodySmall?.copyWith(
-          fontFamily: GreatWallTypography.fontFamily,
-          fontFamilyFallback: const <String>['monospace'],
-        );
+  Widget _consoleExpanded() {
     return Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -682,23 +824,26 @@ class _SetupScreenState extends State<SetupScreen> {
         Row(
           children: <Widget>[
             const SizedBox(width: 12),
-            Icon(Icons.terminal, size: 16, color: scheme.onSurfaceVariant),
+            const Icon(Icons.terminal),
             const SizedBox(width: 8),
-            Text('Console', style: Theme.of(context).textTheme.labelLarge),
+            Text('Console',
+                style: _termStyle.copyWith(fontWeight: FontWeight.bold)),
             const Spacer(),
             IconButton(
               tooltip: _manualVisible ? 'Hide manual (H)' : 'Show manual (H)',
+              color: _kConsoleFg,
               icon: Icon(_manualVisible ? Icons.help : Icons.help_outline),
               onPressed: () => setState(() => _manualVisible = !_manualVisible),
             ),
             IconButton(
-              tooltip: 'Minimize console & tabs (`)',
+              tooltip: 'Minimize console & tabs (Alt+M)',
+              color: _kConsoleFg,
               icon: const Icon(Icons.keyboard_arrow_down),
               onPressed: () => setState(() => _chromeMinimized = true),
             ),
           ],
         ),
-        const Divider(height: 1),
+        Divider(height: 1, color: _kConsoleFg.withOpacity(0.4)),
         ConstrainedBox(
           constraints: const BoxConstraints(maxHeight: 200),
           child: SingleChildScrollView(
@@ -707,32 +852,26 @@ class _SetupScreenState extends State<SetupScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: <Widget>[
-                if (_prompt != null) _consolePromptBlock(scheme),
-                if (_focusHelp != null)
+                if (_prompt != null) _consolePromptBlock(),
+                if (_focusedField != null)
                   Padding(
                     padding: const EdgeInsets.only(bottom: 6),
                     child: Row(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: <Widget>[
-                        Icon(Icons.info_outline,
-                            size: 14, color: scheme.onSurfaceVariant),
+                        const Icon(Icons.info_outline, size: 14),
                         const SizedBox(width: 6),
-                        Expanded(
-                          child: Text(_focusHelp!,
-                              style: Theme.of(context).textTheme.bodySmall),
-                        ),
+                        Expanded(child: Text(_fieldHelp(_focusedField!))),
                       ],
                     ),
                   ),
-                for (final String line in _consoleLog)
-                  Text('› $line', style: mono),
+                for (final String line in _consoleLog) Text('› $line'),
                 if (_manualVisible) ...<Widget>[
                   const SizedBox(height: 8),
                   Text('Hotkeys',
-                      style: Theme.of(context).textTheme.labelMedium),
+                      style: _termStyle.copyWith(fontWeight: FontWeight.bold)),
                   const SizedBox(height: 2),
-                  for (final String line in _manualLines)
-                    Text(line, style: mono),
+                  for (final String line in _manualLines) Text(line),
                 ],
               ],
             ),
@@ -743,36 +882,37 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   /// The inline confirmation block (replaces modal dialogs): the prompt message
-  /// plus Cancel / Confirm buttons that complete the pending future.
-  Widget _consolePromptBlock(ColorScheme scheme) {
+  /// plus Cancel / Confirm buttons that complete the pending future. Styled to
+  /// match the terminal (green on black).
+  Widget _consolePromptBlock() {
     final _ConsolePrompt p = _prompt!;
     return Container(
       margin: const EdgeInsets.only(bottom: 8),
       padding: const EdgeInsets.all(8),
       decoration: BoxDecoration(
-        color: scheme.secondaryContainer,
+        color: _kConsoleFg.withOpacity(0.08),
         borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: scheme.outline),
+        border: Border.all(color: _kConsoleFg),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: <Widget>[
-          Text(
-            p.message,
-            style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: scheme.onSecondaryContainer,
-                ),
-          ),
+          Text(p.message),
           const SizedBox(height: 8),
           Row(
             mainAxisAlignment: MainAxisAlignment.end,
             children: <Widget>[
               TextButton(
+                style: TextButton.styleFrom(foregroundColor: _kConsoleFg),
                 onPressed: () => _resolvePrompt(false),
                 child: Text(p.cancelLabel),
               ),
               const SizedBox(width: 8),
               FilledButton(
+                style: FilledButton.styleFrom(
+                  backgroundColor: _kConsoleFg,
+                  foregroundColor: _kConsoleBg,
+                ),
                 onPressed: () => _resolvePrompt(true),
                 child: Text(p.confirmLabel),
               ),
@@ -788,14 +928,6 @@ class _SetupScreenState extends State<SetupScreen> {
       padding: const EdgeInsets.all(16),
       child: ListView(
         children: <Widget>[
-          Text('Setup', style: Theme.of(context).textTheme.titleLarge),
-          const SizedBox(height: 4),
-          Text(
-            'Encode a fresh seed onto a fractal you will learn to remember. '
-            'Nothing is written down.',
-            style: Theme.of(context).textTheme.bodySmall,
-          ),
-          const Divider(height: 32),
 
           if (_setup.phase == SetupPhase.recallComplete)
             ..._recallCompleteControls()
@@ -806,15 +938,8 @@ class _SetupScreenState extends State<SetupScreen> {
           else
             ..._memoriseControls(),
 
-          // Stage navigation — available as soon as stages are loaded, in any
-          // mode (generation, import, recall): toggle between loaded stages and
-          // study each under the canvas (zoom / pan / brightness). Stages not
-          // yet reached during a recall walk stay disabled until recalled.
-          if ((hasResult || _setup.phase == SetupPhase.recallComplete) &&
-              _setup.nStages > 1) ...<Widget>[
-            const Divider(height: 32),
-            _stageNav(),
-          ],
+          // (Stage navigation lives in the fixed 0–8 tab bar above the canvas;
+          // the redundant "< Stage k / N >" row was dropped.)
 
           // Background generation progress: later stages are still deriving
           // while the user studies the ones already done.
@@ -877,25 +1002,23 @@ class _SetupScreenState extends State<SetupScreen> {
           ),
 
           const Divider(height: 32),
-          const Text('Palette'),
-          const SizedBox(height: 8),
+          // Colour wheel: focus with C, cycle hues with ← →. The scheme name is
+          // shown in the console (focus _Field.hue), not labelled here. No rotate
+          // buttons — the arrows replace them.
           Center(
-            child: HueWheel(
-              value: _hue,
-              onChanged: (HueOffset h) {
-                _sounds.play(UiSound.click);
-                setState(() => _hue = h);
-              },
+            child: _track(
+              _Field.hue,
+              _HueWheelControl(
+                value: _hue,
+                focusNode: _hueFocus,
+                onChanged: (HueOffset h) {
+                  _sounds.play(UiSound.click);
+                  setState(() => _hue = h);
+                },
+              ),
             ),
           ),
           const SizedBox(height: 16),
-          const Text(
-            'Hold L and scroll over the canvas to adjust brightness; '
-            'scroll to zoom, drag to pan; press R to recenter, T to cycle '
-            'stages, 0–8 to jump to a stage, K to copy the key.',
-            textAlign: TextAlign.center,
-          ),
-          const SizedBox(height: 24),
           Text(
             'engine ${widget.core.engineVersion}',
             style: Theme.of(context).textTheme.bodySmall,
@@ -906,11 +1029,35 @@ class _SetupScreenState extends State<SetupScreen> {
     );
   }
 
+  /// Choose the config source (New seed / Import / Recall) — from the segmented
+  /// button or the N / I / R hotkeys. Only meaningful on the config screen.
+  void _setSource(_SourceMode mode) {
+    if (_hasSession) return;
+    _sounds.play(UiSound.click);
+    setState(() => _source = mode);
+    _toast(_sourceBlurb(mode));
+  }
+
+  /// One-line description of a source mode, shown in the console when selected
+  /// (instead of an inline paragraph in the panel).
+  String _sourceBlurb(_SourceMode mode) {
+    switch (mode) {
+      case _SourceMode.fresh:
+        return 'New seed: generate fresh entropy and encode it onto the '
+            'fractals to memorise.';
+      case _SourceMode.import:
+        return 'Import: encode an existing BIP39 phrase onto the fractals.';
+      case _SourceMode.recall:
+        return 'Recall: enter the same salt, number of stages and Argon2 '
+            'settings, then click your memorised point on each stage. Nothing '
+            'is encoded — the seed is rebuilt from your clicks.';
+    }
+  }
+
   List<Widget> _configControls() {
     return <Widget>[
-      const Text('Source'),
-      const SizedBox(height: 4),
       SegmentedButton<_SourceMode>(
+        showSelectedIcon: false,
         segments: const <ButtonSegment<_SourceMode>>[
           ButtonSegment<_SourceMode>(
               value: _SourceMode.fresh, label: Text('New seed')),
@@ -920,28 +1067,21 @@ class _SetupScreenState extends State<SetupScreen> {
               value: _SourceMode.recall, label: Text('Recall')),
         ],
         selected: <_SourceMode>{_source},
-        onSelectionChanged: _busy
-            ? null
-            : (Set<_SourceMode> s) {
-                _sounds.play(UiSound.click);
-                setState(() => _source = s.first);
-              },
+        onSelectionChanged:
+            _busy ? null : (Set<_SourceMode> s) => _setSource(s.first),
       ),
       const SizedBox(height: 16),
-      if (_source == _SourceMode.import)
-        ..._mnemonicInput()
-      else ...<Widget>[
-        if (_source == _SourceMode.recall) ...<Widget>[
-          Text(
-            'Recall an existing setup: enter the same salt, number of stages and '
-            'Argon2 settings you used, then click your memorised point on each '
-            'stage. Nothing is encoded — the seed is rebuilt from your clicks.',
-            style: Theme.of(context).textTheme.bodySmall,
-          ),
-          const SizedBox(height: 8),
-        ],
-        ..._stagesInput(),
-      ],
+      // Keep the source-specific input the same height (the import field vs the
+      // stages slider) so switching New seed / Import / Recall does not shift the
+      // controls below it. Each builder returns a single widget.
+      SizedBox(
+        height: 56,
+        child: Align(
+          child: _source == _SourceMode.import
+              ? _mnemonicInput().single
+              : _stagesInput().single,
+        ),
+      ),
       const SizedBox(height: 16),
       ..._stage0Input(),
       const SizedBox(height: 16),
@@ -985,16 +1125,13 @@ class _SetupScreenState extends State<SetupScreen> {
   List<Widget> _stagesInput() {
     final int n = _pointStages;
     final int maxN = SetupController.maxPointStages;
-    final String summary = n == 0
-        ? 'Stage-0 text only — no fractal points.'
-        : '$n fractal stage${n == 1 ? '' : 's'} — ${n * 32} bits, '
-            '${n * 3} BIP39 words.';
+    // Label and value live in the console (focus _Field.stages); the panel keeps
+    // only the slider to save vertical space.
     return <Widget>[
-      Text('Number of stages: $n'),
-      _withHelp(
-        'Number of stages (0–8): how many fractal points your seed has. '
-        '0 = Stage-0 text only; 8 = 24 words / 256 bits.',
+      _track(
+        _Field.stages,
         Slider(
+          focusNode: _stagesFocus,
           value: n.toDouble(),
           min: 0,
           max: maxN.toDouble(),
@@ -1010,7 +1147,6 @@ class _SetupScreenState extends State<SetupScreen> {
                 },
         ),
       ),
-      Text(summary, style: Theme.of(context).textTheme.bodySmall),
     ];
   }
 
@@ -1024,14 +1160,14 @@ class _SetupScreenState extends State<SetupScreen> {
   List<Widget> _iterationsInput() {
     final String raw = _iterationsField.text.trim();
     final bool invalid = raw.isNotEmpty && !_iterationsValid;
+    // Label/help live in the console (focus _Field.iterations); keep only the
+    // field (with its validation error) in the panel.
     return <Widget>[
-      const Text('Argon2 iterations (N)'),
-      const SizedBox(height: 4),
-      _withHelp(
-        'Argon2 iterations (N): per-stage memory-hard passes. Unbounded — a '
-        'higher N means a longer, stronger derivation (hours to weeks).',
+      _track(
+        _Field.iterations,
         TextField(
           controller: _iterationsField,
+          focusNode: _iterationsFocus,
           enabled: !_busy,
           maxLines: 1,
           keyboardType: TextInputType.number,
@@ -1042,10 +1178,8 @@ class _SetupScreenState extends State<SetupScreen> {
           decoration: InputDecoration(
             isDense: true,
             border: const OutlineInputBorder(),
-            hintText: 'e.g. 1',
-            helperText: 'Per-stage Argon2 passes — no upper limit; a high N can '
-                'take hours, days, even weeks to derive.',
-            helperMaxLines: 2,
+            labelText: 'N',
+            hintText: 'iterations, e.g. 1',
             errorText: invalid ? 'Enter a whole number (0 or more).' : null,
           ),
           onChanged: (_) {
@@ -1077,81 +1211,64 @@ class _SetupScreenState extends State<SetupScreen> {
   /// iteration-count (N) field.
   Widget _argon2ProfileSlider() {
     final int idx = _profiles.indexOf(_profile).clamp(0, _profiles.length - 1);
-    return _withHelp(
-      'Argon2 profile: memory per pass — Basic 1 GiB, Advanced 32 GiB, '
-      'Great Wall 128 GiB. Higher resists parallel attack harder.',
-      Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: <Widget>[
-          Text('Argon2 profile: ${_profileLabels[idx]}'),
-          Slider(
-            value: idx.toDouble(),
-            min: 0,
-            max: (_profiles.length - 1).toDouble(),
-            divisions: _profiles.length - 1,
-            label: _profileLabels[idx],
-            onChanged: _busy
-                ? null
-                : (double v) {
-                    final Argon2Profile next = _profiles[v.round()];
-                    if (next == _profile) return;
-                    _sounds.play(UiSound.click);
-                    setState(() => _profile = next);
-                  },
-          ),
-        ],
+    // Profile name lives in the console (focus _Field.profile); the slider thumb
+    // label still shows it on drag.
+    return _track(
+      _Field.profile,
+      Slider(
+        focusNode: _profileFocus,
+        value: idx.toDouble(),
+        min: 0,
+        max: (_profiles.length - 1).toDouble(),
+        divisions: _profiles.length - 1,
+        label: _profileLabels[idx],
+        onChanged: _busy
+            ? null
+            : (double v) {
+                final Argon2Profile next = _profiles[v.round()];
+                if (next == _profile) return;
+                _sounds.play(UiSound.click);
+                setState(() => _profile = next);
+              },
       ),
     );
   }
 
-  /// The obscured BIP39 import field plus a live word-count hint. The phrase is
-  /// secret, so the field is blind (asterisks) by default with an eye toggle;
-  /// it is never echoed back anywhere else.
+  /// The obscured BIP39 import field. The phrase is secret, so the field is
+  /// blind (asterisks) by default with an eye toggle; it is never echoed back.
+  /// The instruction and live word-count are shown in the console on focus
+  /// ([_fieldHelp]).
   List<Widget> _mnemonicInput() {
-    final int words = _mnemonic.text
-        .trim()
-        .split(RegExp(r'\s+'))
-        .where((String w) => w.isNotEmpty)
-        .length;
-    final bool standard = <int>{12, 15, 18, 21, 24}.contains(words);
-    final String hint;
-    if (words == 0) {
-      hint = 'Type or paste your seed phrase.';
-    } else if (words % 3 != 0 || words > 24) {
-      hint = '$words words — must be a multiple of 3 (3–24).';
-    } else {
-      hint = '$words words → ${words ~/ 3} stages'
-          '${standard ? "" : " (sub-standard length)"}.';
-    }
     return <Widget>[
-      const Text('Seed phrase (BIP39)'),
-      const SizedBox(height: 4),
-      TextField(
-        controller: _mnemonic,
-        obscureText: _mnemonicHidden,
-        enabled: !_busy,
-        maxLines: 1,
-        autocorrect: false,
-        enableSuggestions: false,
-        decoration: InputDecoration(
-          isDense: true,
-          border: const OutlineInputBorder(),
-          hintText: 'word1 word2 …',
-          helperText: hint,
-          helperMaxLines: 2,
-          suffixIcon: IconButton(
-            tooltip: _mnemonicHidden ? 'Show phrase' : 'Hide phrase',
-            icon: Icon(
-              _mnemonicHidden ? Icons.visibility : Icons.visibility_off,
+      _track(
+        _Field.mnemonic,
+        TextField(
+          controller: _mnemonic,
+          focusNode: _mnemonicFocus,
+          obscureText: _mnemonicHidden,
+          enabled: !_busy,
+          maxLines: 1,
+          autocorrect: false,
+          enableSuggestions: false,
+          decoration: InputDecoration(
+            isDense: true,
+            border: const OutlineInputBorder(),
+            labelText: 'Import phrase (BIP39)',
+            hintText: 'word1 word2 …',
+            suffixIcon: IconButton(
+              tooltip: _mnemonicHidden ? 'Show phrase' : 'Hide phrase',
+              icon: Icon(
+                _mnemonicHidden ? Icons.visibility : Icons.visibility_off,
+              ),
+              onPressed: () =>
+                  setState(() => _mnemonicHidden = !_mnemonicHidden),
             ),
-            onPressed: () =>
-                setState(() => _mnemonicHidden = !_mnemonicHidden),
           ),
+          onChanged: (_) {
+            _sounds.play(UiSound.click);
+            setState(() {});
+          },
         ),
-        onChanged: (_) {
-          _sounds.play(UiSound.click);
-          setState(() {});
-        },
       ),
     ];
   }
@@ -1161,43 +1278,44 @@ class _SetupScreenState extends State<SetupScreen> {
   /// One field, one scheme — the user decides whether it is a public label or a
   /// secret pepper. The restriction (and why it exists) is explained inline.
   List<Widget> _stage0Input() {
+    // Label/help live in the console (focus _Field.salt). The reveal toggle and
+    // the restriction warning stay on the field.
     return <Widget>[
-      const Text('Stage 0 — salt / pepper'),
-      const SizedBox(height: 4),
-      TextField(
-        controller: _stage0,
-        obscureText: _stage0Hidden,
-        enabled: !_busy,
-        maxLines: 1,
-        autocorrect: false,
-        enableSuggestions: false,
-        inputFormatters: <TextInputFormatter>[
-          _SaltPepperFormatter(widget.core, _onStage0Restricted),
-        ],
-        decoration: InputDecoration(
-          isDense: true,
-          border: const OutlineInputBorder(),
-          hintText: 'e.g. MAIN-STASH',
-          helperText: 'Seeds your fractals. A label (MAIN-STASH) or a pasted '
-              'secret pepper — your call. Uppercase letters, digits and '
-              'hyphens only (kept unambiguous so it is reproducible).',
-          helperMaxLines: 3,
-          suffixIcon: IconButton(
-            tooltip: _stage0Hidden ? 'Show text' : 'Hide text',
-            icon: Icon(
-              _stage0Hidden ? Icons.visibility : Icons.visibility_off,
+      _track(
+        _Field.salt,
+        TextField(
+          controller: _stage0,
+          focusNode: _stage0Focus,
+          obscureText: _stage0Hidden,
+          enabled: !_busy,
+          maxLines: 1,
+          autocorrect: false,
+          enableSuggestions: false,
+          inputFormatters: <TextInputFormatter>[
+            _SaltPepperFormatter(widget.core, _onStage0Restricted),
+          ],
+          decoration: InputDecoration(
+            isDense: true,
+            border: const OutlineInputBorder(),
+            labelText: 'Stage 0 — salt / pepper',
+            hintText: 'e.g. MAIN-STASH',
+            suffixIcon: IconButton(
+              tooltip: _stage0Hidden ? 'Show text' : 'Hide text',
+              icon: Icon(
+                _stage0Hidden ? Icons.visibility : Icons.visibility_off,
+              ),
+              onPressed: () => setState(() => _stage0Hidden = !_stage0Hidden),
             ),
-            onPressed: () => setState(() => _stage0Hidden = !_stage0Hidden),
           ),
+          style: const TextStyle(
+            fontFamily: GreatWallTypography.fontFamily,
+            fontFamilyFallback: <String>['monospace'],
+          ),
+          onChanged: (_) {
+            _sounds.play(UiSound.click);
+            setState(() {});
+          },
         ),
-        style: const TextStyle(
-          fontFamily: GreatWallTypography.fontFamily,
-          fontFamilyFallback: <String>['monospace'],
-        ),
-        onChanged: (_) {
-          _sounds.play(UiSound.click);
-          setState(() {});
-        },
       ),
       if (_stage0Restricted)
         Padding(
@@ -1248,8 +1366,8 @@ class _SetupScreenState extends State<SetupScreen> {
       const Text('Memorise your points'),
       const SizedBox(height: 16),
       // Stage 0 is the salt/pepper text (no point); stages 1..N-1 are the
-      // chain-derived fractals, one point each. Step through with the stage
-      // navigator below (or the arrows / T).
+      // chain-derived fractals, one point each. Step through with the 0–8 tab
+      // bar or number keys (press a stage again to zoom to its point).
       Text(
         'Stage 0 is the salt/pepper you entered; each later stage is its own '
         'fractal carrying one point. Study the marked location on every fractal '
@@ -1299,40 +1417,6 @@ class _SetupScreenState extends State<SetupScreen> {
     ];
   }
 
-  /// Step between stages of the active session. The left arrow focuses the
-  /// previous (always-loaded) stage; the right arrow focuses the next stage if
-  /// it is derived, or — when it is the first not-yet-derived stage — triggers
-  /// its derivation (the same as selecting it by tab or number key). Disabled at
-  /// the ends or while a derivation is running.
-  Widget _stageNav() {
-    final int idx = _setup.displayStageIndex;
-    final int n = _setup.nStages;
-    final bool canPrev = idx > 0;
-    final bool canNext = !_busy &&
-        idx + 1 < n &&
-        (_setup.isStageAvailable(idx + 1) ||
-            // Only a recall walk derives the next stage on demand; during
-            // background generation the next stage arrives on its own.
-            (_setup.isRecallSession &&
-                idx + 1 == _setup.firstUnderivedStage));
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-      children: <Widget>[
-        IconButton(
-          tooltip: 'Previous stage',
-          onPressed: canPrev ? () => _selectStage(idx - 1) : null,
-          icon: const Icon(Icons.chevron_left),
-        ),
-        Text(idx == 0 ? 'Stage 0 — salt / pepper' : 'Stage $idx / ${n - 1}'),
-        IconButton(
-          tooltip: 'Next stage',
-          onPressed: canNext ? () => _selectStage(idx + 1) : null,
-          icon: const Icon(Icons.chevron_right),
-        ),
-      ],
-    );
-  }
-
   /// A subtle, non-blocking notice while later stages derive in the background
   /// (or a one-line warning if a background derivation failed). The stages
   /// already derived are fully navigable meanwhile; focus stays put.
@@ -1374,47 +1458,35 @@ class _SetupScreenState extends State<SetupScreen> {
   /// `[A-Z0-9-]`, versioning the key), and the blind copy. The Argon2id pass
   /// covers stages `1..displayStageIndex` (DESIGN.md §"Master-Secret Export").
   List<Widget> _masterExportControls() {
-    final int idx = _setup.displayStageIndex;
+    // Heading + explanation live in the console (focus _Field.exportLabel).
     return <Widget>[
-      Text(
-        'Key (master-secret export)',
-        style: Theme.of(context).textTheme.titleMedium,
-      ),
-      const SizedBox(height: 4),
-      Text(
-        'Argon2id over your setup so far (stages 1–$idx). Paste this key into '
-        'another wallet, derive a non-BIP39 secret, or use it as a downstream '
-        'pepper. The optional label versions the key (e.g. SIGNING-1) and is '
-        'mixed into the hash. Press K to derive and copy; copied blind — never '
-        'shown on screen.',
-        style: Theme.of(context).textTheme.bodySmall,
-      ),
-      const SizedBox(height: 8),
-      TextField(
-        controller: _exportLabel,
-        enabled: !_busy,
-        maxLines: 1,
-        autocorrect: false,
-        enableSuggestions: false,
-        inputFormatters: <TextInputFormatter>[
-          _SaltPepperFormatter(widget.core, _onExportLabelRestricted),
-        ],
-        decoration: const InputDecoration(
-          isDense: true,
-          border: OutlineInputBorder(),
-          labelText: 'Export label (optional)',
-          hintText: 'e.g. SIGNING-1',
-          helperText: 'Uppercase letters, digits and hyphens; any length.',
-          helperMaxLines: 2,
+      _track(
+        _Field.exportLabel,
+        TextField(
+          controller: _exportLabel,
+          focusNode: _exportLabelFocus,
+          enabled: !_busy,
+          maxLines: 1,
+          autocorrect: false,
+          enableSuggestions: false,
+          inputFormatters: <TextInputFormatter>[
+            _SaltPepperFormatter(widget.core, _onExportLabelRestricted),
+          ],
+          decoration: const InputDecoration(
+            isDense: true,
+            border: OutlineInputBorder(),
+            labelText: 'Export label (optional)',
+            hintText: 'e.g. SIGNING-1',
+          ),
+          style: const TextStyle(
+            fontFamily: GreatWallTypography.fontFamily,
+            fontFamilyFallback: <String>['monospace'],
+          ),
+          onChanged: (_) {
+            _sounds.play(UiSound.click);
+            setState(() {});
+          },
         ),
-        style: const TextStyle(
-          fontFamily: GreatWallTypography.fontFamily,
-          fontFamilyFallback: <String>['monospace'],
-        ),
-        onChanged: (_) {
-          _sounds.play(UiSound.click);
-          setState(() {});
-        },
       ),
       if (_exportLabelRestricted)
         Padding(
@@ -1509,32 +1581,80 @@ class _SetupScreenState extends State<SetupScreen> {
   /// Set the focus-help line when a control gains focus. Deferred to a
   /// post-frame callback so it never runs mid-build (focus changes fire during
   /// layout).
-  void _gainHelp(String help) {
+  void _gainFocus(_Field f) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted || _focusHelp == help) return;
-      setState(() => _focusHelp = help);
+      if (!mounted || _focusedField == f) return;
+      setState(() => _focusedField = f);
     });
   }
 
-  /// Clear the focus-help line when a control loses focus — but only if it is
-  /// still showing this control's help (so the gain of the next control wins
-  /// regardless of callback order).
-  void _loseHelp(String help) {
+  /// Clear the focused-field marker when a control loses focus — but only if it
+  /// is still this control (so the gain of the next control wins regardless of
+  /// callback order).
+  void _loseFocus(_Field f) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted || _focusHelp != help) return;
-      setState(() => _focusHelp = null);
+      if (!mounted || _focusedField != f) return;
+      setState(() => _focusedField = null);
     });
   }
 
-  /// Wrap [child] so that, while it (or a descendant, e.g. a text field) holds
-  /// focus, [help] is shown in the console. The wrapper is not itself a tab stop.
-  Widget _withHelp(String help, Widget child) {
+  /// Wrap [child] so that, while it (or a descendant text field/slider) holds
+  /// focus, the console shows field [f]'s help. The wrapper is not a tab stop.
+  Widget _track(_Field f, Widget child) {
     return Focus(
       canRequestFocus: false,
       skipTraversal: true,
-      onFocusChange: (bool has) => has ? _gainHelp(help) : _loseHelp(help),
+      onFocusChange: (bool has) => has ? _gainFocus(f) : _loseFocus(f),
       child: child,
     );
+  }
+
+  /// The console help for an input field: its label plus the current value, so
+  /// the panel itself can omit both. Computed live, so it tracks edits while the
+  /// field stays focused.
+  String _fieldHelp(_Field f) {
+    switch (f) {
+      case _Field.stages:
+        return 'Number of stages: $_pointStages (0–8). 0 = Stage-0 text only; '
+            '8 = 24 words / 256 bits. ← → or drag to change.';
+      case _Field.iterations:
+        final String n = _iterationsField.text.trim();
+        return 'Argon2 iterations N = ${n.isEmpty ? '—' : n} (0…∞). Higher = a '
+            'longer, stronger derivation (hours to weeks).';
+      case _Field.profile:
+        final int idx =
+            _profiles.indexOf(_profile).clamp(0, _profiles.length - 1);
+        return 'Argon2 profile: ${_profileLabels[idx]} — memory per pass. '
+            '← → or drag to change.';
+      case _Field.salt:
+        return 'Stage 0 salt/pepper: seeds the fractal chain. A public label or '
+            'a secret pasted pepper (uppercase letters, digits, hyphen).';
+      case _Field.mnemonic:
+        final int wc = _mnemonic.text
+            .trim()
+            .split(RegExp(r'\s+'))
+            .where((String w) => w.isNotEmpty)
+            .length;
+        if (wc == 0) {
+          return 'Import phrase: type or paste your existing BIP39 seed phrase '
+              '(kept hidden).';
+        }
+        if (wc % 3 != 0 || wc > 24) {
+          return 'Import phrase: $wc words — must be a multiple of 3 (3–24).';
+        }
+        final bool standard = <int>{12, 15, 18, 21, 24}.contains(wc);
+        return 'Import phrase: $wc words → ${wc ~/ 3} stages'
+            '${standard ? '' : ' (sub-standard length)'}.';
+      case _Field.exportLabel:
+        final int idx = _setup.displayStageIndex;
+        return 'Key (master-secret export): Argon2id over your setup so far '
+            '(stages 1–$idx). Paste into another wallet or use as a downstream '
+            'pepper. This optional label versions the key (e.g. SIGNING-1, '
+            'uppercase/digits/hyphen). Press K to derive and copy — blind, '
+            'never shown.';
+      case _Field.hue:
+        return 'Colour scheme: ${_hue.name}. ← → to cycle through the six hues.';
+    }
   }
 
   /// Answer the pending console confirmation, completing its future.
@@ -1625,6 +1745,135 @@ class _SetupScreenState extends State<SetupScreen> {
 /// imported BIP39 phrase, or a cold-start recall of an existing setup (derive
 /// from the salt and reconstruct the seed from the user's clicks).
 enum _SourceMode { fresh, import, recall }
+
+/// The input controls whose label + live value are conveyed in the console while
+/// focused (so the panel itself can stay label-free).
+enum _Field { stages, iterations, profile, salt, mnemonic, exportLabel, hue }
+
+/// A compact, focusable colour wheel: six hue sectors, no rotate buttons (←/→
+/// cycle while focused) and no inline name (it is shown in the console). Tapping
+/// a sector selects it and focuses the wheel.
+class _HueWheelControl extends StatelessWidget {
+  const _HueWheelControl({
+    required this.value,
+    required this.onChanged,
+    required this.focusNode,
+    this.diameter = 84,
+  });
+
+  final HueOffset value;
+  final ValueChanged<HueOffset> onChanged;
+  final FocusNode focusNode;
+  final double diameter;
+
+  void _step(int dir) {
+    final List<HueOffset> order = HueOffset.values;
+    final int i = (value.index + dir) % order.length;
+    onChanged(order[i < 0 ? i + order.length : i]);
+  }
+
+  KeyEventResult _onKey(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    final LogicalKeyboardKey k = event.logicalKey;
+    if (k == LogicalKeyboardKey.arrowRight || k == LogicalKeyboardKey.arrowUp) {
+      _step(1);
+      return KeyEventResult.handled;
+    }
+    if (k == LogicalKeyboardKey.arrowLeft || k == LogicalKeyboardKey.arrowDown) {
+      _step(-1);
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  void _handleTapDown(TapDownDetails details) {
+    final double r = diameter / 2;
+    final Offset v = details.localPosition - Offset(r, r);
+    if (v.distance < r * 0.25) return; // ignore the hub
+    double angle = math.atan2(v.dx, -v.dy);
+    if (angle < 0) angle += 2 * math.pi;
+    final int n = HueOffset.values.length;
+    final int sector = (angle / (2 * math.pi) * n).floor() % n;
+    onChanged(HueOffset.values[sector]);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Focus(
+      focusNode: focusNode,
+      onKeyEvent: _onKey,
+      child: Semantics(
+        label: 'Colour wheel: ${value.name}',
+        button: true,
+        child: GestureDetector(
+          onTapDown: (TapDownDetails d) {
+            focusNode.requestFocus();
+            _handleTapDown(d);
+          },
+          child: CustomPaint(
+            size: Size.square(diameter),
+            painter: _HuePainter(value, focusNode.hasFocus),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _HuePainter extends CustomPainter {
+  _HuePainter(this.selected, this.focused);
+
+  final HueOffset selected;
+  final bool focused;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final double r = size.width / 2;
+    final Offset c = Offset(r, r);
+    final int n = HueOffset.values.length;
+    final double sweep = 2 * math.pi / n;
+    for (int i = 0; i < n; i++) {
+      final double start = -math.pi / 2 + i * sweep;
+      final Paint fill = Paint()
+        ..style = PaintingStyle.fill
+        ..color = HSVColor.fromAHSV(
+          1.0,
+          HueOffset.values[i].degrees.toDouble() % 360.0,
+          1.0,
+          1.0,
+        ).toColor();
+      canvas.drawArc(
+          Rect.fromCircle(center: c, radius: r), start, sweep, true, fill);
+      if (HueOffset.values[i] == selected) {
+        canvas.drawArc(
+          Rect.fromCircle(center: c, radius: r - 2),
+          start,
+          sweep,
+          true,
+          Paint()
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = 4.0
+            ..color = Colors.white,
+        );
+      }
+    }
+    if (focused) {
+      canvas.drawCircle(
+        c,
+        r - 1,
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2.0
+          ..color = Colors.white70,
+      );
+    }
+    canvas.drawCircle(c, r * 0.22, Paint()..color = Colors.black87);
+  }
+
+  @override
+  bool shouldRepaint(_HuePainter old) =>
+      old.selected != selected || old.focused != focused;
+}
 
 /// A confirmation rendered inline in the console (instead of a modal dialog).
 /// The console's action buttons complete [completer] with the user's choice.
