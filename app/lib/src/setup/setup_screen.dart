@@ -643,14 +643,14 @@ class _SetupScreenState extends State<SetupScreen> {
       return KeyEventResult.handled;
     }
     // Field focus (uniform coverage): S salt/export · P profile · D derivation
-    // steps. The salt (config) and export-label (session) fields never coexist,
-    // so S covers whichever is on screen. Each no-ops with a console note if its
-    // field is not in the current mode.
+    // steps. The salt (config screen) and export-label (live setup) fields never
+    // coexist, so pick by session state rather than a focus node's context
+    // (which could be stale): a live setup means the export label.
     if (event.logicalKey == LogicalKeyboardKey.keyS) {
-      if (_stage0Focus.context != null) {
-        _focusField(_stage0Focus, 'salt / pepper');
-      } else {
+      if (_hasSession) {
         _focusField(_exportLabelFocus, 'export label');
+      } else {
+        _focusField(_stage0Focus, 'salt / pepper');
       }
       return KeyEventResult.handled;
     }
