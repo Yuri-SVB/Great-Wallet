@@ -176,9 +176,13 @@ class _SetupScreenState extends State<SetupScreen> {
   /// Whether the hotkey manual is shown in the console. On at launch.
   bool _manualVisible = true;
 
-  /// Whether the console and the stage-tab bar are collapsed to a thin status
-  /// line. Toggled by the console's button (and, later, a hotkey).
+  /// Whether the console is collapsed to a thin status line (the `M` hotkey /
+  /// the console's button). Independent of the stage-tab bar.
   bool _chromeMinimized = false;
+
+  /// Whether the stage-tab bar is hidden (the `9` hotkey). Independent of the
+  /// console so the user can dismiss either alone.
+  bool _stageBarHidden = false;
 
   /// A confirmation awaiting an inline answer in the console (replaces modal
   /// dialogs). Resolved by the console's action buttons.
@@ -476,8 +480,8 @@ class _SetupScreenState extends State<SetupScreen> {
                           ),
                         // Stage tabs hover over the top of the viewer with a
                         // transparent background, so they never squeeze the
-                        // canvas. Hidden when the chrome is minimized.
-                        if (!_chromeMinimized)
+                        // canvas. Toggled independently of the console (key 9).
+                        if (!_stageBarHidden)
                           Positioned(
                             top: 0,
                             left: 0,
@@ -605,11 +609,19 @@ class _SetupScreenState extends State<SetupScreen> {
       _abortDerivation();
       return KeyEventResult.handled;
     }
-    // M — minimize / restore the console + stage tabs.
+    // M — collapse / restore the console (independent of the stage bar).
     if (event.logicalKey == LogicalKeyboardKey.keyM) {
       final bool minimizing = !_chromeMinimized;
       _sounds.play(minimizing ? UiSound.chromeDown : UiSound.chromeUp);
       setState(() => _chromeMinimized = minimizing);
+      return KeyEventResult.handled;
+    }
+    // 9 — show / hide the stage-tab bar (independent of the console).
+    if (event.logicalKey == LogicalKeyboardKey.digit9 ||
+        event.logicalKey == LogicalKeyboardKey.numpad9) {
+      final bool hiding = !_stageBarHidden;
+      _sounds.play(hiding ? UiSound.chromeDown : UiSound.chromeUp);
+      setState(() => _stageBarHidden = hiding);
       return KeyEventResult.handled;
     }
     // C — focus the colour wheel (then ← → cycle hues).
@@ -1020,7 +1032,7 @@ class _SetupScreenState extends State<SetupScreen> {
   static const List<String> _manualLines = <String>[
     'F1 manual · F2 Setup · F3 Train · F4 Accelerate · F5 Inherit',
     'Esc  return to the fractal (leave a text field) · Tab cycles fields',
-    'M  minimize / restore chrome   Z  reset (asks first)',
+    'M  console   9  stage bar   Z  reset (asks first)',
     '0–8  go to that stage (recenters); press again to zoom to its point',
     'N / I / R  New seed / Import / Recall (also focuses its input)',
     'S salt / export label · P profile · D derivation steps · C colour',
