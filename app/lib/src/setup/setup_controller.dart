@@ -239,11 +239,14 @@ class SetupController extends ChangeNotifier {
   /// Whether a stage is currently halted with preserved progress.
   bool get isHalted => _halted != null;
 
-  /// Whether [resumeDerivation] can run: a generation (not a recall walk) is
-  /// halted and still holds its entropy root. A halted recall-walk derive is not
-  /// resumable from the stash here — re-deriving that stage supersedes it.
+  /// Whether [resumeDerivation] can run: a halted generation (holding its
+  /// entropy root) or a halted N/I expansion (holding its plan), and not a recall
+  /// walk. A halted recall-walk derive is not resumable from the stash here —
+  /// re-deriving that stage supersedes it.
   bool get canResume =>
-      _halted != null && _entropyBits != null && !_isRecallSession;
+      _halted != null &&
+      !_isRecallSession &&
+      (_entropyBits != null || _expandPlan != null);
 
   /// Whether the displayed stage can be truncated from (it and every stage above
   /// it deleted): a settled generated/imported setup (memorise, not deriving or
@@ -318,6 +321,16 @@ class SetupController extends ChangeNotifier {
   /// The reconstructed entropy root, set once every stage carries a point.
   List<int>? _recalledEntropyBits;
 
+  /// The imported entropy buffer (m × 32 bits) feeding an in-progress I-mode
+  /// expansion; owned by the controller and wiped when that expansion ends.
+  /// Null outside an import expansion.
+  List<int>? _expandImportBits;
+
+  /// The active N/I expansion plan (fill mode + target), kept while the
+  /// expansion runs **and** across a halt so [resumeDerivation] can finish it.
+  /// Null when no N/I expansion is in flight or halted.
+  _ExpandPlan? _expandPlan;
+
   /// The lowest point stage (1..N) whose fractal is **not** yet derived — the one
   /// a "select the next stage" action would derive. Equals [nStages] (a sentinel
   /// past the last stage) when every fractal is already derived.
@@ -338,6 +351,12 @@ class SetupController extends ChangeNotifier {
   bool _hasPointAt(int k) =>
       hasSelectedPoint(k) ||
       (k >= 1 && k < _points.length && _points[k] != null);
+
+  /// Public view of [_hasPointAt]: whether stage [k] carries a point (selected
+  /// or encoded). Lets the screen gate "derive the next stage" on the prior
+  /// point existing in any setup — recall, generated, or an in-progress
+  /// expansion (where the prior point may be encoded, not selected).
+  bool hasPointAt(int k) => _hasPointAt(k);
 
   /// Stage [k]'s 32-bit point chunk — the recall selection if present, otherwise
   /// decoded on demand from the stored encoded point. No extra secret is kept in
@@ -908,6 +927,12 @@ class SetupController extends ChangeNotifier {
         _phase == SetupPhase.encoding) {
       return;
     }
+    // An expansion halt resumes through its own (entropy-root-free) path.
+    final _ExpandPlan? plan = _expandPlan;
+    if (plan != null) {
+      _resumeExpansion(cp, plan);
+      return;
+    }
     _halted = null; // ownership of cp moves into the resume flow
     final List<int> bits = _entropyBits!;
     final int pointStages = nStages - 1;
@@ -1414,12 +1439,15 @@ class SetupController extends ChangeNotifier {
       final List<int>? chunk = _selectedChunks[j];
       if (chunk != null) Entropy.wipe(chunk);
     }
-    // The entropy root and any halt stash describe the (now-deleted) tail; the
-    // kept prefix is already derived, so neither is needed.
+    // The entropy root, any halt stash, and any halted-expansion plan describe
+    // the (now-deleted) tail; the kept prefix is already derived, so none are
+    // needed.
     if (_halted != null) {
       _halted!.wipe();
       _halted = null;
     }
+    _wipeExpandImport();
+    _expandPlan = null;
     if (_entropyBits != null) {
       Entropy.wipe(_entropyBits!);
       _entropyBits = null;
@@ -1443,6 +1471,394 @@ class SetupController extends ChangeNotifier {
     // Land on the new last stage (Stage 0 if truncated to text-only).
     _applyDisplayStage(n - 1);
     notifyListeners();
+  }
+
+  // --- Expansion: grow the setup with more point stages ----------------------
+
+  /// Whether the displayed setup can grow more stages — the counterpart to
+  /// [canTruncateFromDisplayed]'s shrink: a settled generated/imported setup
+  /// (memorise, not deriving/generating, not a recall walk) still below the
+  /// protocol ceiling of [maxPointStages]. A recall walk reconstructs a fixed
+  /// setup, so it is never expandable.
+  bool get canExpand =>
+      _phase == SetupPhase.memorise &&
+      !_isGenerating &&
+      !_isRecallSession &&
+      _stageCount > 0 &&
+      pointStageCount < maxPointStages;
+
+  /// The first point-stage index a new expansion would add (one past the current
+  /// last point stage).
+  int get firstExpansionStage => pointStageCount + 1;
+
+  /// Grow every per-stage array to a setup of [n] stages (Stage 0 + n-1 point
+  /// stages), appending empty slots. The appended stages carry no fractal or
+  /// point yet — callers derive and fill them.
+  void _growStagesTo(int n) {
+    final int add = n - _stageCount;
+    if (add <= 0) return;
+    _points = <EncodedPoint?>[..._points, ...List<EncodedPoint?>.filled(add, null)];
+    _reservoirs = <StageReservoirs?>[
+      ..._reservoirs,
+      ...List<StageReservoirs?>.filled(add, null),
+    ];
+    _stageRecords = <StageRecord?>[
+      ..._stageRecords,
+      ...List<StageRecord?>.filled(add, null),
+    ];
+    _leafRects = <FixedRect?>[..._leafRects, ...List<FixedRect?>.filled(add, null)];
+    _selectedChunks = <List<int>?>[
+      ..._selectedChunks,
+      ...List<List<int>?>.filled(add, null),
+    ];
+    _selectedMarks = <({double re, double im})?>[
+      ..._selectedMarks,
+      ...List<({double re, double im})?>.filled(add, null),
+    ];
+    _stageCount = n;
+    _pointStages = n - 1;
+  }
+
+  /// Shrink the per-stage arrays back to [n] stages, dropping the tail. Used to
+  /// undo the slots an expansion grew but never managed to fill (a halt or a
+  /// failure part-way). The dropped stages are expansion-fresh — underived and
+  /// point-less — so there is nothing secret to wipe.
+  void _shrinkStagesTo(int n) {
+    if (n >= _stageCount) return;
+    _points = _points.sublist(0, n);
+    _reservoirs = _reservoirs.sublist(0, n);
+    _stageRecords = _stageRecords.sublist(0, n);
+    _leafRects = _leafRects.sublist(0, n);
+    _selectedChunks = _selectedChunks.sublist(0, n);
+    _selectedMarks = _selectedMarks.sublist(0, n);
+    _stageCount = n;
+    _pointStages = n - 1;
+  }
+
+  /// Start an N/I expansion to [targetPointStages]: grow the new stages, record
+  /// the [mode] + target as the resumable plan, and derive/encode the new stages
+  /// in the background like the tail of generation (the studyable prefix stays
+  /// interactive). No-op unless [canExpand].
+  ///
+  /// The plan is mode-based (not a one-shot closure) so a halt can resume it:
+  /// each new stage's chunk is reproduced by [_chunkForStage] from the mode and
+  /// the kept import buffer. The manual R edit instead grows empty stages
+  /// ([beginManualExpansion]) and fills them through the interactive walk.
+  void _startExpansion(_ExpandMode mode, int targetPointStages) {
+    if (!canExpand) return;
+    final int target =
+        targetPointStages > maxPointStages ? maxPointStages : targetPointStages;
+    final int firstNew = firstExpansionStage;
+    if (target < firstNew) return; // nothing to add
+    _growStagesTo(target + 1);
+    _expandPlan = _ExpandPlan(mode, target, firstNew);
+    _isGenerating = true;
+    _generatingStage = firstNew;
+    _generationError = null;
+    notifyListeners();
+    unawaited(_expandRemaining(firstNew, target));
+  }
+
+  /// A fresh 32-bit chunk for new stage [k] under the active expansion plan:
+  /// random (N) or the k-th slice of the kept import buffer (I). Caller owns and
+  /// wipes the result.
+  List<int> _chunkForStage(int k) {
+    final _ExpandPlan plan = _expandPlan!;
+    switch (plan.mode) {
+      case _ExpandMode.generated:
+        return Entropy.randomBits(EncodingConstants.bitsPerPoint);
+      case _ExpandMode.imported:
+        const int bpp = EncodingConstants.bitsPerPoint;
+        final int off = (k - plan.firstNew) * bpp;
+        return _expandImportBits!.sublist(off, off + bpp);
+    }
+  }
+
+  /// Expand to [targetPointStages] with fresh random points for every new stage
+  /// (the N edit).
+  void expandGenerated(int targetPointStages) {
+    _startExpansion(_ExpandMode.generated, targetPointStages);
+  }
+
+  /// Expand to [targetPointStages] from [importedBits] — `32 ·
+  /// (targetPointStages - firstExpansionStage + 1)` bits, one 32-bit point per
+  /// new stage (the I edit). Ownership of [importedBits] transfers here; it is
+  /// kept (for a possible resume) and wiped when the expansion ends.
+  void expandImported(int targetPointStages, List<int> importedBits) {
+    if (!canExpand) {
+      Entropy.wipe(importedBits);
+      return;
+    }
+    _wipeExpandImport(); // drop any stale buffer before taking this one
+    _expandImportBits = importedBits;
+    _startExpansion(_ExpandMode.imported, targetPointStages);
+  }
+
+  /// Expand to [targetPointStages] from blind uppercase hex (the I edit): `8·m`
+  /// digits for the `m` new stages. Returns an error message on invalid input
+  /// (no content echoed), else null (the background expansion has started).
+  String? expandImportedHex(int targetPointStages, String hex) {
+    if (!canExpand) return 'This setup cannot be expanded.';
+    final int m = targetPointStages - firstExpansionStage + 1;
+    if (m < 1) return 'Nothing to add.';
+    List<int> bits;
+    try {
+      bits = Entropy.hexToBits(hex);
+    } on FormatException {
+      return 'Invalid hex — use uppercase 0–9 A–F.';
+    }
+    if (bits.length != m * EncodingConstants.bitsPerPoint) {
+      Entropy.wipe(bits);
+      return '$m new stage${m == 1 ? '' : 's'} need ${8 * m} hex digits.';
+    }
+    expandImported(targetPointStages, bits);
+    return null;
+  }
+
+  /// Expand to [targetPointStages] from `3·m` BIP39 words for the `m` new stages
+  /// (the I edit). Returns an error message on invalid input, else null.
+  String? expandImportedWords(int targetPointStages, String words) {
+    if (!canExpand) return 'This setup cannot be expanded.';
+    final int m = targetPointStages - firstExpansionStage + 1;
+    if (m < 1) return 'Nothing to add.';
+    List<int> bits;
+    try {
+      bits = Bip39.mnemonicToEntropyBits(words);
+    } on FormatException catch (e) {
+      return e.message;
+    }
+    if (bits.length != m * EncodingConstants.bitsPerPoint) {
+      Entropy.wipe(bits);
+      return '$m new stage${m == 1 ? '' : 's'} need ${3 * m} words.';
+    }
+    expandImported(targetPointStages, bits);
+    return null;
+  }
+
+  /// Begin a **manual** expansion to [targetPointStages]: grow the setup with
+  /// empty (underived, point-less) stages. The new stages then derive one at a
+  /// time through the ordinary interactive walk — select the next stage to derive
+  /// its fractal ([deriveNextStage]), click its point ([selectPoint]) — until the
+  /// target count is reached. No-op unless [canExpand].
+  void beginManualExpansion(int targetPointStages) {
+    if (!canExpand) return;
+    final int target =
+        targetPointStages > maxPointStages ? maxPointStages : targetPointStages;
+    if (target < firstExpansionStage) return;
+    _growStagesTo(target + 1);
+    notifyListeners();
+  }
+
+  /// Background loop for an N/I expansion: derive and encode stages
+  /// [firstNew]..[target] in chain order. A halt preserves the in-flight stage's
+  /// digest, the plan, and (for I) the import buffer so [resumeDerivation] can
+  /// finish the rest; a failure or normal finish drops the plan and any
+  /// grown-but-unfilled tail.
+  Future<void> _expandRemaining(int firstNew, int target) async {
+    int done = firstNew - 1; // last fully-encoded stage
+    try {
+      for (int k = firstNew; k <= target; k++) {
+        _generatingStage = k;
+        notifyListeners();
+        final bool ok = await _deriveAndEncodeExpandStage(k);
+        if (!ok) return; // torn down (reset) — arrays already wiped there
+        done = k;
+      }
+    } on Argon2Cancelled {
+      return; // halt/reset cancelled the in-flight stage; finally settles
+    } catch (e) {
+      _generationError =
+          'Stage $_generatingStage failed to derive (${e.runtimeType}); '
+          'the earlier stages are still usable.';
+    } finally {
+      _settleExpansion(done);
+    }
+  }
+
+  /// Shared teardown for an N/I expansion loop (fresh or resumed). On a halt,
+  /// preserve the in-flight digest + plan + import buffer (resume finishes them)
+  /// and keep the grown tail. Otherwise drop the plan, wipe the import buffer,
+  /// trim any unfilled tail, and settle on the studyable prefix.
+  void _settleExpansion(int done) {
+    // Resumable halt: a stage was in flight with at least one preserved pass.
+    if (_halting && _inFlight != null) {
+      _enterHalted(); // promotes the in-flight digest; plan + import kept
+      return;
+    }
+    // Otherwise a clean stop — normal finish, failure, reset, or a halt before
+    // the stage's first checkpoint (nothing to resume). Drop the plan, the
+    // import buffer, and any grown-but-unfilled tail.
+    _halting = false;
+    _wipeExpandImport();
+    _expandPlan = null;
+    _clearInFlight();
+    // Skip if a reset tore the session down (it cleared the arrays already).
+    if (_phase == SetupPhase.memorise && _stageCount > 0) {
+      if (done + 1 < _stageCount) _shrinkStagesTo(done + 1);
+      _isGenerating = false;
+      _generatingStage = 0;
+      // Keep the user where they were studying; only re-land if the shrink left
+      // the view past the new last stage.
+      if (_displayStageIndex >= _stageCount) _applyDisplayStage(pointStageCount);
+      notifyListeners();
+    }
+  }
+
+  /// Derive and encode one **expansion** stage [k]: hash the chain (text + every
+  /// existing point, decoded on demand) into stage k's fractal, then encode its
+  /// point ([_chunkForStage], produced only after the fractal succeeds, so a
+  /// cancelled derivation creates no chunk to leak). Background only. Returns
+  /// false if the session was torn down mid-flight (reset).
+  Future<bool> _deriveAndEncodeExpandStage(int k) async {
+    _workingStageIndex = k;
+    // Prior points (1..k-1) all already carry a point — decode them on demand.
+    final List<int> priorPointBits = <int>[
+      for (int j = 1; j < k; j++) ..._pointChunk(j),
+    ];
+    final Uint8List input = _core.chainInput(_chainText, priorPointBits);
+    _argon2Total = _iterations < 1 ? 1 : _iterations;
+    _argon2Done = 0;
+    notifyListeners();
+    final Argon2Job job = await _core.startStageDerivation(
+      input,
+      iterations: _iterations,
+      profile: _profile,
+      onProgress: (int done, int total) {
+        _argon2Done = done;
+        _argon2Total = total;
+        notifyListeners();
+      },
+      onCheckpoint: (int completed, Uint8List digest) =>
+          _setInFlight(k, completed, _argon2Total, digest),
+    );
+    _argon2Job = job;
+    final StageReservoirs reservoirs = await job.result;
+    _argon2Job = null;
+    _clearInFlight();
+    Entropy.wipe(priorPointBits);
+    // Torn down (reset) while deriving? Drop the result untouched.
+    if (k >= _reservoirs.length || _phase != SetupPhase.memorise) {
+      reservoirs.clear();
+      return false;
+    }
+    _encodePointOnReservoirs(k, _chunkForStage(k), reservoirs);
+    return true;
+  }
+
+  /// Resume a halted N/I expansion: finish the halted stage from its preserved
+  /// [cp] digest, then derive the remaining new stages. Mirrors
+  /// [_resumeRemaining] for generation; called by [resumeDerivation] when the
+  /// halted work is an expansion.
+  void _resumeExpansion(_HaltCheckpoint cp, _ExpandPlan plan) {
+    _halted = null; // ownership of cp moves into the resume flow
+    _isGenerating = true;
+    _generatingStage = cp.stage;
+    _generationError = null;
+    notifyListeners();
+    unawaited(_resumeExpandRemaining(cp, plan));
+  }
+
+  Future<void> _resumeExpandRemaining(
+    _HaltCheckpoint cp,
+    _ExpandPlan plan,
+  ) async {
+    int done = cp.stage - 1;
+    try {
+      final bool ok =
+          await _resumeAndEncodeExpandStage(cp.stage, cp.digest, cp.pass);
+      if (!ok) return;
+      done = cp.stage;
+      for (int k = cp.stage + 1; k <= plan.target; k++) {
+        _generatingStage = k;
+        notifyListeners();
+        final bool ok2 = await _deriveAndEncodeExpandStage(k);
+        if (!ok2) return;
+        done = k;
+      }
+    } on Argon2Cancelled {
+      return; // re-halted mid-resume — the finally promotes the new stash
+    } catch (e) {
+      _generationError =
+          'Stage $_generatingStage failed to derive (${e.runtimeType}); '
+          'the earlier stages are still usable.';
+    } finally {
+      _settleExpansion(done);
+    }
+  }
+
+  /// Finish a halted expansion stage [k] by resuming its Argon2 chain from the
+  /// preserved [fromDigest] (after [fromPass] passes), then encode its point.
+  /// Mirrors [_resumeAndEncodeStage]. Returns false if torn down mid-flight.
+  Future<bool> _resumeAndEncodeExpandStage(
+    int k,
+    Uint8List fromDigest,
+    int fromPass,
+  ) async {
+    _workingStageIndex = k;
+    _argon2Total = _iterations < 1 ? 1 : _iterations;
+    _argon2Done = fromPass;
+    notifyListeners();
+    final Argon2Job job = await _core.resumeStageDerivation(
+      fromDigest,
+      fromPass: fromPass,
+      iterations: _iterations,
+      profile: _profile,
+      onProgress: (int done, int total) {
+        _argon2Done = done;
+        _argon2Total = total;
+        notifyListeners();
+      },
+      onCheckpoint: (int completed, Uint8List digest) =>
+          _setInFlight(k, completed, _argon2Total, digest),
+    );
+    fromDigest.fillRange(0, fromDigest.length, 0);
+    _argon2Job = job;
+    final StageReservoirs reservoirs = await job.result;
+    _argon2Job = null;
+    _clearInFlight();
+    if (k >= _reservoirs.length || _phase != SetupPhase.memorise) {
+      reservoirs.clear();
+      return false;
+    }
+    _encodePointOnReservoirs(k, _chunkForStage(k), reservoirs);
+    return true;
+  }
+
+  /// Store [reservoirs] for stage [k], encode [chunk] as its point on them, and
+  /// record the master-secret contribution. Wipes [chunk]. The encode half of
+  /// [_storeAndEncode], shared by expansion.
+  void _encodePointOnReservoirs(
+    int k,
+    List<int> chunk,
+    StageReservoirs reservoirs,
+  ) {
+    _reservoirs[k] = reservoirs;
+    final List<EncodedPoint> pts = _core.encodeStage(
+      chunk,
+      o: reservoirs.o,
+      p: reservoirs.p,
+      q: reservoirs.q,
+    );
+    _points[k] = pts.first;
+    _leafRects[k] = pts.first.leafRect;
+    final ({int re, int im}) leaf =
+        MasterSecret.leafCentreRaw(pts.first.leafRect);
+    _stageRecords[k] = StageRecord(
+      o: reservoirs.o,
+      p: reservoirs.p,
+      q: reservoirs.q,
+      leafReRaw: leaf.re,
+      leafImRaw: leaf.im,
+    );
+    Entropy.wipe(chunk);
+    notifyListeners();
+  }
+
+  /// Wipe and drop the I-mode expansion's imported entropy buffer, if any.
+  void _wipeExpandImport() {
+    final List<int>? bits = _expandImportBits;
+    if (bits != null) Entropy.wipe(bits);
+    _expandImportBits = null;
   }
 
   /// True once every point stage (1..N) carries a selected point.
@@ -1559,6 +1975,8 @@ class SetupController extends ChangeNotifier {
     final List<int>? bits = _entropyBits;
     if (bits != null) Entropy.wipe(bits);
     _entropyBits = null;
+    _wipeExpandImport(); // drop any in-progress import-expansion buffer
+    _expandPlan = null;
     // Discard any halted-stage progress and live checkpoint.
     _halting = false;
     _clearInFlight();
@@ -1610,4 +2028,20 @@ class _HaltCheckpoint {
   final Uint8List digest;
 
   void wipe() => digest.fillRange(0, digest.length, 0);
+}
+
+/// How an N/I expansion fills its new stages' points — fresh random (N) or
+/// sliced from the kept import buffer (I).
+enum _ExpandMode { generated, imported }
+
+/// A resumable N/I expansion plan: the fill [mode], the point-stage count to
+/// reach ([target]), and the index of the first new stage ([firstNew], used to
+/// offset into the import buffer). Holds no secret itself — the import bits live
+/// in [SetupController._expandImportBits].
+class _ExpandPlan {
+  _ExpandPlan(this.mode, this.target, this.firstNew);
+
+  final _ExpandMode mode;
+  final int target;
+  final int firstNew;
 }

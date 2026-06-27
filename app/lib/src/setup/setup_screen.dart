@@ -169,6 +169,22 @@ class _SetupScreenState extends State<SetupScreen> {
   final TextEditingController _pointImport = TextEditingController();
   final FocusNode _pointImportFocus = FocusNode(debugLabel: 'point-import');
 
+  /// The point-stage count a pending expansion would grow to, while the method
+  /// picker (New / Import / Manual) is open in the console. Null otherwise.
+  int? _expandTarget;
+
+  /// The point-stage count an in-progress import expansion will reach, while its
+  /// inline m-point bit editor is open. Reuses the [_pointImport] field/focus
+  /// (the two import editors are mutually exclusive). Null otherwise.
+  int? _expandImportTarget;
+
+  /// True during a **manual** expansion (the R method): the new stages derive
+  /// one at a time and the user clicks each point on its fresh fractal. Canvas
+  /// selection is enabled while this is on; [_expandManualTarget] is the
+  /// point-stage count the walk grows to.
+  bool _expandManualActive = false;
+  int? _expandManualTarget;
+
   /// True while a master-secret export's Argon2id pass is in flight, so a second
   /// tap on "Copy master secret" is ignored until it finishes.
   bool _exporting = false;
@@ -218,6 +234,12 @@ class _SetupScreenState extends State<SetupScreen> {
       if (_pointImportStage != null) {
         _pointImport.clear();
         _pointImportStage = null;
+      }
+      // A moved view also dismisses an open expansion picker / import editor.
+      _expandTarget = null;
+      if (_expandImportTarget != null) {
+        _pointImport.clear();
+        _expandImportTarget = null;
       }
     }
     _updateEta();
@@ -444,8 +466,15 @@ class _SetupScreenState extends State<SetupScreen> {
   /// Return keyboard focus to the fractal viewer (and so out of any text field),
   /// re-enabling the single-key hotkeys. The non-directional counterpart to Tab.
   void _focusViewer() {
-    // Esc also cancels an armed manual point edit.
+    // Esc also cancels an armed manual point edit and any open expansion picker
+    // or import editor.
     if (_editPointMode) setState(() => _editPointMode = false);
+    if (_expandTarget != null) setState(() => _expandTarget = null);
+    if (_expandImportTarget != null) {
+      _pointImport.clear();
+      setState(() => _expandImportTarget = null);
+    }
+    if (_expandManualActive) _endManualExpand();
     _hotkeys.requestFocus();
   }
 
@@ -488,10 +517,12 @@ class _SetupScreenState extends State<SetupScreen> {
                         ),
                         if (_busy) Positioned.fill(child: _progressOverlay()),
                         if (_selectMode && !_setup.isTextStage)
-                          const Positioned(
+                          Positioned(
                             top: 56,
                             left: 12,
-                            child: _Badge('Recall — click your point'),
+                            child: _Badge(_expandManualActive
+                                ? 'Add stage — click your point'
+                                : 'Recall — click your point'),
                           ),
                         if (_editPointMode && !_setup.isTextStage)
                           const Positioned(
@@ -576,11 +607,17 @@ class _SetupScreenState extends State<SetupScreen> {
                       deriving: deriving == i,
                       progress: progress,
                       tooltip: _tabTooltip(i),
-                      // Tappable only for a stage that belongs to the active
-                      // setup; everything else is inert but still shown.
+                      // Tappable for a stage in the active setup; a ghost slot
+                      // beyond it is tappable too when the setup can grow, to
+                      // start an expansion up to that slot.
                       onTap: (_hasSession && i < _setup.nStages)
                           ? () => _selectStage(i)
-                          : null,
+                          : (_hasSession &&
+                                  _setup.canExpand &&
+                                  i >= _setup.nStages &&
+                                  i <= SetupController.maxPointStages)
+                              ? () => _beginExpand(i)
+                              : null,
                     ),
                   ),
                 ),
@@ -632,7 +669,9 @@ class _SetupScreenState extends State<SetupScreen> {
       // stage it opens the point-import editor in hex; on the config screen it
       // selects the Import source pre-toggled to hex.
       if (event.logicalKey == LogicalKeyboardKey.keyI) {
-        if (_setup.canEditCurrentPoint) {
+        if (_expandTarget != null) {
+          _expandImport(hex: true);
+        } else if (_setup.canEditCurrentPoint) {
           _changePointImport(hex: true);
         } else {
           _setSource(_SourceMode.import, focusInput: true);
@@ -680,7 +719,9 @@ class _SetupScreenState extends State<SetupScreen> {
     // N = new random, R = manual click. (I — blind import — lands with the
     // expansion work, which shares the inline bit editor.)
     if (event.logicalKey == LogicalKeyboardKey.keyN) {
-      if (_setup.canEditCurrentPoint) {
+      if (_expandTarget != null) {
+        _expandNew();
+      } else if (_setup.canEditCurrentPoint) {
         _changePointGenerated();
       } else {
         _setSource(_SourceMode.fresh, focusInput: true);
@@ -688,7 +729,9 @@ class _SetupScreenState extends State<SetupScreen> {
       return KeyEventResult.handled;
     }
     if (event.logicalKey == LogicalKeyboardKey.keyI) {
-      if (_setup.canEditCurrentPoint) {
+      if (_expandTarget != null) {
+        _expandImport(hex: false);
+      } else if (_setup.canEditCurrentPoint) {
         _changePointImport(hex: false);
       } else {
         _setSource(_SourceMode.import, focusInput: true);
@@ -697,6 +740,10 @@ class _SetupScreenState extends State<SetupScreen> {
       return KeyEventResult.handled;
     }
     if (event.logicalKey == LogicalKeyboardKey.keyR) {
+      if (_expandTarget != null) {
+        _expandManual();
+        return KeyEventResult.handled;
+      }
       if (_setup.canEditCurrentPoint) {
         _changePointManual();
       } else {
@@ -788,6 +835,14 @@ class _SetupScreenState extends State<SetupScreen> {
       return;
     }
     if (index < 0 || index >= _setup.nStages) {
+      // A ghost slot beyond the setup starts an expansion up to it (if the setup
+      // can grow); anything else is out of range.
+      if (index >= _setup.nStages &&
+          index <= SetupController.maxPointStages &&
+          _setup.canExpand) {
+        _beginExpand(index);
+        return;
+      }
       _sounds.play(UiSound.denyBlocked);
       _toast('This setup has ${_setup.nStages - 1} stage'
           '${_setup.nStages - 1 == 1 ? '' : 's'} (0–${_setup.nStages - 1}).');
@@ -1014,6 +1069,13 @@ class _SetupScreenState extends State<SetupScreen> {
       }
       return;
     }
+    // During a manual expansion, only the fresh (point-less) new stages accept a
+    // click; an existing stage's point is never clobbered by a stray tap.
+    if (_expandManualActive && _setup.hasPointAt(_setup.displayStageIndex)) {
+      _sounds.play(UiSound.denyBlocked);
+      _toast('Stage ${_setup.displayStageIndex} already has its point.');
+      return;
+    }
     SelectionOutcome outcome = _setup.selectPoint(sel);
     // A valid click that would clobber a re-selected stage's later fractals asks
     // for confirmation before discarding them.
@@ -1031,6 +1093,20 @@ class _SetupScreenState extends State<SetupScreen> {
       case SelectionOutcome.marked:
         _sounds.play(UiSound.selectPoint);
         final int k = _setup.displayStageIndex;
+        // Manual expansion: the click set this new stage's point; advance to the
+        // next new stage (deriving it) until the target is reached.
+        if (_expandManualActive) {
+          final int g = _expandManualTarget ?? k;
+          if (k < g) {
+            _toast('Point set on Stage $k — deriving Stage ${k + 1}…');
+            await _deriveNextStage();
+          } else {
+            _endManualExpand();
+            _sounds.play(UiSound.finalReady);
+            _toast('Expansion complete — Stage $g added.');
+          }
+          return;
+        }
         msg = k < _setup.nStages - 1
             ? 'Point marked on Stage $k/${_setup.nStages - 1} — '
                 'select Stage ${k + 1} to derive it.'
@@ -1116,6 +1192,7 @@ class _SetupScreenState extends State<SetupScreen> {
     '0–8  go to that stage (recenters); press again to zoom to its point',
     'N / I / R  New seed / Import / Recall (config) · on a stage: change its point',
     'I import = BIP39 words · Alt+I import = hex (config & point edit alike)',
+    'Click/press a ghost slot past the last stage to grow the setup (N/I/R)',
     'S salt / export label · P profile · D derivation steps · C colour',
     'Enter  start (Generate / Encode / Begin recall) from a field',
     'K  copy the master secret ("the key")    H  halt derivation (keeps progress)',
@@ -1166,7 +1243,9 @@ class _SetupScreenState extends State<SetupScreen> {
         _focusedField != null ? _fieldHelp(_focusedField!) : null;
     final String status = _prompt != null
         ? _prompt!.message
-        : _derivationStatus() ??
+        : _expandTarget != null
+            ? 'Add stages — N new · I import · Esc cancel.'
+            : _derivationStatus() ??
             focusHelp ??
             (_inMemoriseStudy ? _memoriseHelp : null) ??
             (_consoleLog.isEmpty ? 'Ready.' : _consoleLog.last);
@@ -1252,12 +1331,20 @@ class _SetupScreenState extends State<SetupScreen> {
             padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
             child: _consolePromptBlock(),
           ),
-        if (_prompt == null && _setup.derivingStageIndex != null)
+        if (_prompt == null && _expandTarget != null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+            child: _expandPickerBlock(),
+          ),
+        if (_prompt == null &&
+            _expandTarget == null &&
+            _setup.derivingStageIndex != null)
           Padding(
             padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
             child: _derivationBlock(),
           ),
         if (_prompt == null &&
+            _expandTarget == null &&
             _setup.derivingStageIndex == null &&
             _focusedField != null)
           Padding(
@@ -1274,6 +1361,7 @@ class _SetupScreenState extends State<SetupScreen> {
         // Memorise guidance — relocated here from the control panel so the panel
         // stays stable. Shown only when nothing more urgent is.
         if (_prompt == null &&
+            _expandTarget == null &&
             _setup.derivingStageIndex == null &&
             _focusedField == null &&
             _inMemoriseStudy)
@@ -1418,6 +1506,12 @@ class _SetupScreenState extends State<SetupScreen> {
             _pointImportEditor(),
           ],
 
+          // Inline editor for importing the points of an expansion's new stages.
+          if (_expandImportTarget != null) ...<Widget>[
+            const Divider(height: 32),
+            _expandImportEditor(),
+          ],
+
           // Truncation: delete the displayed stage and every stage above it.
           if (_setup.canTruncateFromDisplayed) ...<Widget>[
             const Divider(height: 32),
@@ -1434,9 +1528,14 @@ class _SetupScreenState extends State<SetupScreen> {
               _setup.phase != SetupPhase.recallComplete) ...<Widget>[
             const Divider(height: 32),
             Text(
-              'Recalling Stage ${_setup.displayStageIndex}/'
-              '${_setup.nStages - 1} — click your point to mark it, then select '
-              'the next stage (tab or number key) to derive it.',
+              _expandManualActive
+                  ? 'Adding Stage ${_setup.displayStageIndex}/'
+                      '${_expandManualTarget ?? _setup.nStages - 1} — click your '
+                      'point on this fractal; the next stage then derives '
+                      'automatically.'
+                  : 'Recalling Stage ${_setup.displayStageIndex}/'
+                      '${_setup.nStages - 1} — click your point to mark it, then '
+                      'select the next stage (tab or number key) to derive it.',
             ),
           ],
 
@@ -2064,19 +2163,55 @@ class _SetupScreenState extends State<SetupScreen> {
   /// The inline editor shown while replacing a stage's point by import.
   Widget _pointImportEditor() {
     final int k = _pointImportStage!;
+    return _importEditorBody(
+      title: 'Import a new point for Stage $k${_editTail(k)}.',
+      words: 3,
+      hexDigits: 8,
+      onApply: _applyPointImport,
+      onCancel: _cancelPointImport,
+    );
+  }
+
+  /// The inline editor shown while importing the points for an expansion's new
+  /// stages: one point per added stage ([m] points → 3·m words / 8·m hex).
+  Widget _expandImportEditor() {
+    final int g = _expandImportTarget!;
+    final int firstNew = _setup.firstExpansionStage;
+    final int m = g - firstNew + 1;
+    return _importEditorBody(
+      title: 'Import $m point${m == 1 ? '' : 's'} for new '
+          'Stage${m == 1 ? ' $g' : 's $firstNew–$g'}.',
+      words: 3 * m,
+      hexDigits: 8 * m,
+      onApply: _applyExpandImport,
+      onCancel: _cancelExpandImport,
+    );
+  }
+
+  /// Shared inline import editor: a Words/Hex toggle, a masked field, and
+  /// Apply/Cancel. [words]/[hexDigits] size the labels for the expected bit
+  /// count (one point = 3 words / 8 hex; m points scale both). Reused by the
+  /// single-point I edit and the multi-point import expansion (mutually
+  /// exclusive, so they share [_pointImport] / [_pointImportFocus]).
+  Widget _importEditorBody({
+    required String title,
+    required int words,
+    required int hexDigits,
+    required VoidCallback onApply,
+    required VoidCallback onCancel,
+  }) {
     final bool hex = _pointImportFmt == _ImportFormat.hex;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: <Widget>[
-        Text('Import a new point for Stage $k${_editTail(k)}.',
-            style: Theme.of(context).textTheme.bodySmall),
+        Text(title, style: Theme.of(context).textTheme.bodySmall),
         const SizedBox(height: 8),
         SegmentedButton<_ImportFormat>(
-          segments: const <ButtonSegment<_ImportFormat>>[
+          segments: <ButtonSegment<_ImportFormat>>[
             ButtonSegment<_ImportFormat>(
-                value: _ImportFormat.words, label: Text('3 words')),
+                value: _ImportFormat.words, label: Text('$words words')),
             ButtonSegment<_ImportFormat>(
-                value: _ImportFormat.hex, label: Text('8 hex')),
+                value: _ImportFormat.hex, label: Text('$hexDigits hex')),
           ],
           selected: <_ImportFormat>{_pointImportFmt},
           showSelectedIcon: false,
@@ -2108,7 +2243,7 @@ class _SetupScreenState extends State<SetupScreen> {
           decoration: InputDecoration(
             isDense: true,
             border: const OutlineInputBorder(),
-            labelText: hex ? '8 hex digits' : '3 words',
+            labelText: hex ? '$hexDigits hex digits' : '$words words',
             hintText: hex ? 'A1B2C3D4' : 'word word word',
             suffixIcon: IconButton(
               tooltip: _mnemonicHidden ? 'Show' : 'Hide',
@@ -2123,24 +2258,171 @@ class _SetupScreenState extends State<SetupScreen> {
             _sounds.play(UiSound.tickSoft);
             setState(() {});
           },
-          onSubmitted: (_) => _applyPointImport(),
+          onSubmitted: (_) => onApply(),
         ),
         const SizedBox(height: 8),
         Row(
           children: <Widget>[
-            FilledButton(
-              onPressed: _applyPointImport,
-              child: const Text('Apply'),
-            ),
+            FilledButton(onPressed: onApply, child: const Text('Apply')),
             const SizedBox(width: 8),
-            OutlinedButton(
-              onPressed: _cancelPointImport,
-              child: const Text('Cancel'),
-            ),
+            OutlinedButton(onPressed: onCancel, child: const Text('Cancel')),
           ],
         ),
       ],
     );
+  }
+
+  // --- Expansion (grow the setup with more point stages) ---------------------
+
+  /// Open the method picker (in the console) to grow the setup to [g] point
+  /// stages: New (random), Import, or Manual. No-op unless the setup can grow.
+  void _beginExpand(int g) {
+    if (!_setup.canExpand ||
+        g < _setup.firstExpansionStage ||
+        g > SetupController.maxPointStages) {
+      _sounds.play(UiSound.denyBlocked);
+      return;
+    }
+    // The expansion editors are mutually exclusive with the point-edit one.
+    if (_pointImportStage != null) _cancelPointImport();
+    setState(() {
+      _expandImportTarget = null;
+      _expandTarget = g;
+    });
+    _sounds.play(UiSound.navStage);
+  }
+
+  /// Expand with fresh random points for every new stage (the N method), behind
+  /// a console confirmation (each new stage costs a full derivation).
+  Future<void> _expandNew() async {
+    final int? g = _expandTarget;
+    if (g == null) return;
+    final int firstNew = _setup.firstExpansionStage;
+    final int m = g - firstNew + 1;
+    setState(() => _expandTarget = null);
+    final bool ok = await _consoleConfirm(
+      message: 'Add $m new stage${m == 1 ? '' : 's'} '
+          '(Stage${m == 1 ? ' $g' : 's $firstNew–$g'}) with fresh random '
+          'points? Each derives in turn (~the usual per-stage time).',
+      confirmLabel: 'Add',
+    );
+    if (!ok || !mounted || !_setup.canExpand) return;
+    _setup.expandGenerated(g);
+    _sounds.play(UiSound.confirm);
+    _toast('Deriving $m new stage${m == 1 ? '' : 's'} '
+        '(Stage${m == 1 ? ' $g' : 's $firstNew–$g'})…');
+  }
+
+  /// Switch from the picker to the inline import editor (the I method), in
+  /// [hex] or words.
+  void _expandImport({required bool hex}) {
+    final int? g = _expandTarget;
+    if (g == null) return;
+    _pointImport.clear();
+    setState(() {
+      _pointImportFmt = hex ? _ImportFormat.hex : _ImportFormat.words;
+      _expandTarget = null;
+      _expandImportTarget = g;
+    });
+    _pointImportFocus.requestFocus();
+  }
+
+  void _applyExpandImport() {
+    final int g = _expandImportTarget!;
+    final int firstNew = _setup.firstExpansionStage;
+    final int m = g - firstNew + 1;
+    final String text = _pointImport.text;
+    final String? err = _pointImportFmt == _ImportFormat.hex
+        ? _setup.expandImportedHex(g, text)
+        : _setup.expandImportedWords(g, text);
+    if (err != null) {
+      _sounds.play(UiSound.denyInput);
+      _toast(err);
+      return;
+    }
+    _cancelExpandImport();
+    _sounds.play(UiSound.confirm);
+    _toast('Deriving $m new stage${m == 1 ? '' : 's'} '
+        '(Stage${m == 1 ? ' $g' : 's $firstNew–$g'})…');
+  }
+
+  void _cancelExpandImport() {
+    _pointImport.clear();
+    setState(() => _expandImportTarget = null);
+    _focusViewer();
+  }
+
+  /// The console method picker shown while an expansion target is chosen.
+  Widget _expandPickerBlock() {
+    final int g = _expandTarget!;
+    final int firstNew = _setup.firstExpansionStage;
+    final int m = g - firstNew + 1;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Text('Add $m new stage${m == 1 ? '' : 's'} '
+            '(Stage${m == 1 ? ' $g' : 's $firstNew–$g'}) — choose how to fill '
+            'the new point${m == 1 ? '' : 's'}:'),
+        const SizedBox(height: 8),
+        Wrap(
+          spacing: 8,
+          runSpacing: 4,
+          children: <Widget>[
+            _expandPickButton('New (N)', _expandNew),
+            _expandPickButton('Import (I)', () => _expandImport(hex: false)),
+            _expandPickButton('Manual (R)', _expandManual),
+            _expandPickButton('Cancel (Esc)', _cancelExpand),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _expandPickButton(String label, VoidCallback onTap) => TextButton(
+        style: TextButton.styleFrom(foregroundColor: _kConsoleFg),
+        onPressed: onTap,
+        child: Text(label),
+      );
+
+  void _cancelExpand() {
+    setState(() => _expandTarget = null);
+    _focusViewer();
+  }
+
+  /// Grow the setup by hand (the R method): derive each new stage in turn and
+  /// click its point on the fresh fractal. Confirms first, grows empty stages,
+  /// enables canvas selection, and derives the first new stage; each click then
+  /// advances to the next ([_onCanvasSelect]).
+  Future<void> _expandManual() async {
+    final int? g = _expandTarget;
+    if (g == null) return;
+    final int firstNew = _setup.firstExpansionStage;
+    final int m = g - firstNew + 1;
+    setState(() => _expandTarget = null);
+    final bool ok = await _consoleConfirm(
+      message: 'Add $m new stage${m == 1 ? '' : 's'} '
+          '(Stage${m == 1 ? ' $g' : 's $firstNew–$g'}) by hand? Each derives in '
+          'turn; click your chosen point on every new fractal.',
+      confirmLabel: 'Add',
+    );
+    if (!ok || !mounted || !_setup.canExpand) return;
+    _setup.beginManualExpansion(g);
+    setState(() {
+      _expandManualActive = true;
+      _expandManualTarget = g;
+      _selectMode = true; // enable canvas point selection on the new stages
+    });
+    _sounds.play(UiSound.confirm);
+    await _deriveNextStage(); // derive Stage firstNew; the user clicks its point
+  }
+
+  /// Leave manual-expansion mode (completed or cancelled), disabling selection.
+  void _endManualExpand() {
+    setState(() {
+      _expandManualActive = false;
+      _expandManualTarget = null;
+      _selectMode = false;
+    });
   }
 
   /// Truncation control: exclude the displayed stage and every stage above it.
