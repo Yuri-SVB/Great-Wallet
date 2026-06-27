@@ -437,15 +437,19 @@ class _SetupScreenState extends State<SetupScreen> {
     // (not a text field) has focus, fired once per press. If a modifier is held,
     // bail so OS combos are left alone.
     if (event is! KeyDownEvent) return KeyEventResult.ignored;
-    // Alt+L — toggle deep render. Exceptionally takes Alt (the only Alt hotkey)
-    // because it is a rare escape hatch for high escape-count voids; handled
-    // before the modifier bail just below.
-    if (kb.isAltPressed &&
-        !kb.isControlPressed &&
-        !kb.isMetaPressed &&
-        event.logicalKey == LogicalKeyboardKey.keyL) {
-      _toggleDeepRender();
-      return KeyEventResult.handled;
+    // Alt hotkeys — exceptional actions that take Alt by design; handled before
+    // the modifier bail just below. Each is the rare/advanced counterpart of a
+    // plain key: Alt+L deep render (vs the fast default), Alt+K the full export
+    // digest (vs K's conventional first 32 chars).
+    if (kb.isAltPressed && !kb.isControlPressed && !kb.isMetaPressed) {
+      if (event.logicalKey == LogicalKeyboardKey.keyL) {
+        _toggleDeepRender();
+        return KeyEventResult.handled;
+      }
+      if (event.logicalKey == LogicalKeyboardKey.keyK) {
+        if (!_busy) _copyMasterSecret(full: true);
+        return KeyEventResult.handled;
+      }
     }
     if (kb.isAltPressed || kb.isControlPressed || kb.isMetaPressed) {
       return KeyEventResult.ignored;
@@ -894,6 +898,7 @@ class _SetupScreenState extends State<SetupScreen> {
     'Enter  start (Generate / Encode / Begin recall) from a field',
     'K  copy the master secret ("the key")    A  abort a running derivation',
     'V+↑/↓  sound volume (level 0 = muted)',
+    'Alt+K  copy the full export digest (not just the first 32 chars)',
     'Alt+L  deep render — reveal leaves in escape-count voids (slower)',
     'L+scroll brightness · scroll zoom · drag pan (over the canvas)',
   ];
@@ -1707,7 +1712,10 @@ class _SetupScreenState extends State<SetupScreen> {
         'clipboard.');
   }
 
-  Future<void> _copyMasterSecret() async {
+  /// Export and copy the master secret for the focused stage. `K` copies the
+  /// conventional first-32-chars view; `Alt+K` ([full]) copies the entire digest
+  /// (all [MasterSecret.outputBytes] as hex).
+  Future<void> _copyMasterSecret({bool full = false}) async {
     if (_exporting) return;
     final int idx = _setup.displayStageIndex;
     setState(() => _exporting = true);
@@ -1719,6 +1727,7 @@ class _SetupScreenState extends State<SetupScreen> {
       secret = await _setup.exportMasterSecret(
         stageIndex: idx,
         label: _exportLabel.text,
+        full: full,
       );
     } finally {
       if (mounted) setState(() => _exporting = false);
@@ -1728,11 +1737,14 @@ class _SetupScreenState extends State<SetupScreen> {
       _sounds.play(UiSound.deny);
       return;
     }
+    final int chars = secret.length;
     await Clipboard.setData(ClipboardData(text: secret));
     if (!mounted) return;
     _sounds.play(UiSound.confirm);
     // Confirmation never echoes the secret itself.
-    _toast('Key copied — paste it, then clear the clipboard.');
+    _toast(full
+        ? 'Full key copied ($chars chars) — paste it, then clear the clipboard.'
+        : 'Key copied — paste it, then clear the clipboard.');
   }
 
   /// Append a line to the console log (the app's toast surface).

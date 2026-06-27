@@ -372,8 +372,9 @@ class SetupController extends ChangeNotifier {
   /// Run the **master-secret export** at stage [stageIndex] (protocol 0.3.0):
   /// one Argon2id pass over the reproducible setup transcript of stages
   /// `1..stageIndex`, with the exporting stage's own [label] appended to the
-  /// message. Returns the conventional 32-hex-char display string, or null if
-  /// the stage is not exportable ([canExportMasterAt]).
+  /// message. Returns the conventional 32-hex-char display string — or, when
+  /// [full] is set, the entire digest as hex ([MasterSecret.fullHex], `Alt+K`) —
+  /// or null if the stage is not exportable ([canExportMasterAt]).
   ///
   /// This **replaces** the `0.2.0` `SHA512(seed-phrase + salt)` export: the
   /// transcript (stage-0 text, iteration count, and each stage's params +
@@ -390,6 +391,7 @@ class SetupController extends ChangeNotifier {
   Future<String?> exportMasterSecret({
     required int stageIndex,
     required String label,
+    bool full = false,
   }) async {
     if (!canExportMasterAt(stageIndex)) return null;
     final List<StageRecord> records = <StageRecord>[
@@ -407,11 +409,12 @@ class SetupController extends ChangeNotifier {
       message,
       outLen: MasterSecret.outputBytes,
     );
-    final String display = MasterSecret.displayHex(raw);
+    final String out =
+        full ? MasterSecret.fullHex(raw) : MasterSecret.displayHex(raw);
     // Wipe the coercion-relevant transcript and raw output.
     message.fillRange(0, message.length, 0);
     raw.fillRange(0, raw.length, 0);
-    return display;
+    return out;
   }
 
   /// The point markers to overlay for the currently displayed stage: the single
