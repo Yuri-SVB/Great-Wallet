@@ -185,6 +185,14 @@ class _SetupScreenState extends State<SetupScreen> {
   bool _expandManualActive = false;
   int? _expandManualTarget;
 
+  /// Provisional-key save/load: the destination/source file path and the
+  /// (provisional) password. [_vaultBusy] disables the controls while an
+  /// encrypt/decrypt pass runs.
+  final TextEditingController _vaultPath = TextEditingController();
+  final TextEditingController _vaultPassword = TextEditingController();
+  bool _vaultPasswordHidden = true;
+  bool _vaultBusy = false;
+
   /// True while a master-secret export's Argon2id pass is in flight, so a second
   /// tap on "Copy master secret" is ignored until it finishes.
   bool _exporting = false;
@@ -398,6 +406,8 @@ class _SetupScreenState extends State<SetupScreen> {
     _mnemonic.dispose();
     _pointImport.dispose();
     _pointImportFocus.dispose();
+    _vaultPath.dispose();
+    _vaultPassword.dispose();
     _stage0.dispose();
     _hotkeys.dispose();
     _stage0Focus.dispose();
@@ -1570,6 +1580,17 @@ class _SetupScreenState extends State<SetupScreen> {
             _bip39CopyButton(),
           ],
 
+          // Provisional-key save / load: an encrypted on-disk copy of the setup
+          // for the consolidation window. Save needs a settled setup; Load is
+          // offered on the config screen too (to restore one).
+          if (_setup.phase == SetupPhase.idle ||
+              _setup.canExportVault) ...<Widget>[
+            const Divider(height: 32),
+            _vaultControls(),
+          ],
+
+          const Divider(height: 32),
+
           OutlinedButton.icon(
             onPressed: _busy ? null : _reset,
             icon: const Icon(Icons.refresh),
@@ -2082,6 +2103,133 @@ class _SetupScreenState extends State<SetupScreen> {
   void _resumeDerivation() {
     _sounds.play(UiSound.select);
     _setup.resumeDerivation();
+  }
+
+  /// Provisional-key save / load: an encrypted on-disk copy of the setup, kept
+  /// only across the memorisation window and destroyed at graduation.
+  Widget _vaultControls() {
+    final bool canSave = _setup.canExportVault;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Text('Provisional key (save / load)',
+            style: Theme.of(context).textTheme.titleMedium),
+        const SizedBox(height: 4),
+        Text(
+          'Save this setup to an encrypted file (AES-256-GCM) so you can return '
+          'to it while memorising. The password is a PROVISIONAL crutch — keep '
+          'the file only until your recall is consolidated, then delete it and '
+          'forget the password. It is not a permanent backup.',
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
+        const SizedBox(height: 8),
+        TextField(
+          controller: _vaultPath,
+          enabled: !_vaultBusy,
+          maxLines: 1,
+          autocorrect: false,
+          enableSuggestions: false,
+          decoration: const InputDecoration(
+            isDense: true,
+            border: OutlineInputBorder(),
+            labelText: 'File path',
+            hintText: '/path/to/setup.gwvault',
+          ),
+        ),
+        const SizedBox(height: 8),
+        TextField(
+          controller: _vaultPassword,
+          enabled: !_vaultBusy,
+          obscureText: _vaultPasswordHidden,
+          maxLines: 1,
+          autocorrect: false,
+          enableSuggestions: false,
+          decoration: InputDecoration(
+            isDense: true,
+            border: const OutlineInputBorder(),
+            labelText: 'Password',
+            suffixIcon: IconButton(
+              tooltip: _vaultPasswordHidden ? 'Show' : 'Hide',
+              icon: Icon(_vaultPasswordHidden
+                  ? Icons.visibility
+                  : Icons.visibility_off),
+              onPressed: () => setState(
+                  () => _vaultPasswordHidden = !_vaultPasswordHidden),
+            ),
+          ),
+        ),
+        const SizedBox(height: 8),
+        Row(
+          children: <Widget>[
+            if (canSave) ...<Widget>[
+              FilledButton.icon(
+                onPressed: _vaultBusy ? null : _saveVault,
+                icon: const Icon(Icons.lock),
+                label: const Text('Save'),
+              ),
+              const SizedBox(width: 8),
+            ],
+            OutlinedButton.icon(
+              onPressed: _vaultBusy ? null : _loadVault,
+              icon: const Icon(Icons.lock_open),
+              label: const Text('Load'),
+            ),
+            if (_vaultBusy) ...<Widget>[
+              const SizedBox(width: 12),
+              const SizedBox(
+                width: 16,
+                height: 16,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+            ],
+          ],
+        ),
+      ],
+    );
+  }
+
+  Future<void> _saveVault() async {
+    final String path = _vaultPath.text.trim();
+    if (path.isEmpty) {
+      _sounds.play(UiSound.denyInput);
+      _toast('Enter a file path.');
+      return;
+    }
+    setState(() => _vaultBusy = true);
+    final String? err = await _setup.saveVaultToFile(path, _vaultPassword.text);
+    if (!mounted) return;
+    setState(() => _vaultBusy = false);
+    if (err != null) {
+      _sounds.play(UiSound.denyInput);
+      _toast(err);
+      return;
+    }
+    _vaultPassword.clear();
+    _sounds.play(UiSound.exportOk);
+    _toast('Saved (encrypted). Delete it and forget the password once your '
+        'recall is consolidated.');
+  }
+
+  Future<void> _loadVault() async {
+    final String path = _vaultPath.text.trim();
+    if (path.isEmpty) {
+      _sounds.play(UiSound.denyInput);
+      _toast('Enter a file path.');
+      return;
+    }
+    setState(() => _vaultBusy = true);
+    final String? err =
+        await _setup.loadVaultFromFile(path, _vaultPassword.text);
+    if (!mounted) return;
+    setState(() => _vaultBusy = false);
+    if (err != null) {
+      _sounds.play(UiSound.denyInput);
+      _toast(err);
+      return;
+    }
+    _vaultPassword.clear();
+    _sounds.play(UiSound.confirm);
+    _toast('Setup loaded from the encrypted file.');
   }
 
   /// Common message tail for a point edit: what gets discarded above stage [k].
