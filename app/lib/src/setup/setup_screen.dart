@@ -628,6 +628,18 @@ class _SetupScreenState extends State<SetupScreen> {
         if (!_busy) _copyMasterSecret(full: true);
         return KeyEventResult.handled;
       }
+      // Alt+I — the hex counterpart of plain I (BIP39 words): on a live editable
+      // stage it opens the point-import editor in hex; on the config screen it
+      // selects the Import source pre-toggled to hex.
+      if (event.logicalKey == LogicalKeyboardKey.keyI) {
+        if (_setup.canEditCurrentPoint) {
+          _changePointImport(hex: true);
+        } else {
+          _setSource(_SourceMode.import, focusInput: true);
+          setState(() => _importFormat = _ImportFormat.hex);
+        }
+        return KeyEventResult.handled;
+      }
     }
     if (kb.isAltPressed || kb.isControlPressed || kb.isMetaPressed) {
       return KeyEventResult.ignored;
@@ -677,9 +689,10 @@ class _SetupScreenState extends State<SetupScreen> {
     }
     if (event.logicalKey == LogicalKeyboardKey.keyI) {
       if (_setup.canEditCurrentPoint) {
-        _changePointImport();
+        _changePointImport(hex: false);
       } else {
         _setSource(_SourceMode.import, focusInput: true);
+        setState(() => _importFormat = _ImportFormat.words);
       }
       return KeyEventResult.handled;
     }
@@ -1102,6 +1115,7 @@ class _SetupScreenState extends State<SetupScreen> {
     'M  console   9  stage bar   Z  reset (asks first)',
     '0–8  go to that stage (recenters); press again to zoom to its point',
     'N / I / R  New seed / Import / Recall (config) · on a stage: change its point',
+    'I import = BIP39 words · Alt+I import = hex (config & point edit alike)',
     'S salt / export label · P profile · D derivation steps · C colour',
     'Enter  start (Generate / Encode / Begin recall) from a field',
     'K  copy the master secret ("the key")    H  halt derivation (keeps progress)',
@@ -2007,8 +2021,9 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   /// Open the inline bit editor to replace the displayed stage's point by import
-  /// (the `I` edit): 8 hex digits or 3 words → 32 bits.
-  Future<void> _changePointImport() async {
+  /// (the `I` edit): 3 words → 32 bits (plain I) or 8 hex digits (Alt+I). The
+  /// format toggle in the editor still lets the user switch after opening.
+  Future<void> _changePointImport({required bool hex}) async {
     final int k = _setup.displayStageIndex;
     final bool ok = await _consoleConfirm(
       message: 'Replace Stage $k\'s point by import${_editTail(k)}? '
@@ -2017,7 +2032,10 @@ class _SetupScreenState extends State<SetupScreen> {
     );
     if (!ok || !mounted || !_setup.canEditCurrentPoint) return;
     _pointImport.clear();
-    setState(() => _pointImportStage = k);
+    setState(() {
+      _pointImportFmt = hex ? _ImportFormat.hex : _ImportFormat.words;
+      _pointImportStage = k;
+    });
     _pointImportFocus.requestFocus();
   }
 
