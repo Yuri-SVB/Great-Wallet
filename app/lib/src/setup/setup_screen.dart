@@ -1022,7 +1022,7 @@ class _SetupScreenState extends State<SetupScreen> {
             ),
           ),
         ConstrainedBox(
-          constraints: const BoxConstraints(maxHeight: 180),
+          constraints: const BoxConstraints(maxHeight: 200),
           child: SingleChildScrollView(
             reverse: true,
             padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
@@ -1035,13 +1035,39 @@ class _SetupScreenState extends State<SetupScreen> {
                   Text('Hotkeys',
                       style: _termStyle.copyWith(
                           color: _kConsoleAccent, fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 2),
-                  for (final String line in _manualLines) Text(line),
+                  const SizedBox(height: 4),
+                  _manualColumns(),
                 ],
               ],
             ),
           ),
         ),
+      ],
+    );
+  }
+
+  /// The hotkey manual laid out in two columns. The lines are short and the
+  /// console is wide, so a single column wasted the horizontal space and ran
+  /// tall enough to scroll; splitting in half roughly halves the height and
+  /// fits comfortably without scrolling.
+  Widget _manualColumns() {
+    final int half = (_manualLines.length + 1) ~/ 2;
+    Widget column(Iterable<String> lines) => Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            for (final String line in lines)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 3),
+                child: Text(line),
+              ),
+          ],
+        );
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Expanded(child: column(_manualLines.take(half))),
+        const SizedBox(width: 20),
+        Expanded(child: column(_manualLines.skip(half))),
       ],
     );
   }
