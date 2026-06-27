@@ -876,8 +876,8 @@ class _SetupScreenState extends State<SetupScreen> {
             if (deriving) ...<Widget>[
               const SizedBox(height: 12),
               TextButton(
-                onPressed: _setup.requestStop,
-                child: const Text('Abort'),
+                onPressed: _setup.halt,
+                child: const Text('Halt'),
               ),
             ],
           ],
@@ -898,7 +898,7 @@ class _SetupScreenState extends State<SetupScreen> {
     'N / I / R  New seed / Import / Recall (also focuses its input)',
     'S salt / export label · P profile · D derivation steps · C colour',
     'Enter  start (Generate / Encode / Begin recall) from a field',
-    'K  copy the master secret ("the key")    A  abort a running derivation',
+    'K  copy the master secret ("the key")    A  halt derivation (keeps progress)',
     'V+↑/↓  sound volume (level 0 = muted)',
     'Alt+K  copy the full export digest (not just the first 32 chars)',
     'Alt+L  deep render — reveal leaves in escape-count voids (slower)',
@@ -1929,21 +1929,24 @@ class _SetupScreenState extends State<SetupScreen> {
     if (ok && mounted) _reset();
   }
 
-  /// Abort a running derivation behind a console confirmation (the A hotkey).
-  /// No-op with a deny cue when nothing is deriving.
+  /// Halt a running derivation behind a console confirmation (the A hotkey).
+  /// Kills only the current Argon2 pass; every completed intermediary digest of
+  /// the working stage is kept, as are the stages already derived. No-op with a
+  /// deny cue when nothing is deriving.
   Future<void> _abortDerivation() async {
     if (!_busy && !_setup.isGenerating) {
       _sounds.play(UiSound.deny);
       return;
     }
     final bool ok = await _consoleConfirm(
-      message: 'Abort the running derivation? Progress on the current stage is '
-          'lost (stages already derived are kept).',
-      confirmLabel: 'Abort',
+      message: 'Halt the running derivation? Only the current pass (~1 min) is '
+          'dropped — every digest completed so far on this stage is kept, and '
+          'the stages already derived stay usable.',
+      confirmLabel: 'Halt',
     );
     if (ok && mounted && (_busy || _setup.isGenerating)) {
-      _setup.requestStop();
-      _toast('Derivation aborted.');
+      _setup.halt();
+      _toast('Halted — progress kept.');
     }
   }
 

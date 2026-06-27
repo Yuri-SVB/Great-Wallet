@@ -204,6 +204,31 @@ class SetupController extends ChangeNotifier {
 
   Argon2Job? _argon2Job;
 
+  /// True between [halt] and the in-flight derivation unwinding, so the
+  /// Argon2Cancelled handlers preserve progress (stash the checkpoint, keep the
+  /// entropy) instead of treating the cancel as a full teardown.
+  bool _halting = false;
+
+  /// The working stage's latest completed intermediary digest, refreshed every
+  /// Argon2 pass. On [halt] it becomes [_halted]; on completion/reset it is
+  /// wiped. Coercion-relevant — held only while a derivation is live.
+  _HaltCheckpoint? _inFlight;
+
+  /// A halted stage's preserved progress (its last intermediary digest and the
+  /// number of passes done), kept so a later resume can finish the stage without
+  /// repeating that work. Null when nothing is halted.
+  _HaltCheckpoint? _halted;
+
+  /// Whether a stage is currently halted with preserved progress.
+  bool get isHalted => _halted != null;
+
+  /// The stage index a halt left paused (0 when none).
+  int get haltedStage => _halted?.stage ?? 0;
+
+  /// Passes completed / total for the halted stage (0 when none).
+  int get haltedPass => _halted?.pass ?? 0;
+  int get haltedTotal => _halted?.total ?? 0;
+
   /// The Argon2 memory profile of the active session, kept so the background
   /// generation of later stages uses the same profile as Stage 1.
   Argon2Profile _profile = Argon2Profile.basic;
@@ -570,8 +595,15 @@ class SetupController extends ChangeNotifier {
       notifyListeners();
       unawaited(_generateRemaining(bits, pointStages));
     } on Argon2Cancelled {
-      _resetSecrets();
-      _setPhase(SetupPhase.idle);
+      if (_halting) {
+        // Halted during the foreground Stage-1 derivation: keep the partial
+        // progress + entropy and land on the (text-only) prefix, rather than
+        // tearing the session down.
+        _enterHalted();
+      } else {
+        _resetSecrets();
+        _setPhase(SetupPhase.idle);
+      }
     } catch (e) {
       _resetSecrets();
       // Error text is deliberately generic — never include coordinates/bits.
@@ -615,10 +647,13 @@ class SetupController extends ChangeNotifier {
         _argon2Total = total;
         notifyListeners();
       },
+      onCheckpoint: (int completed, Uint8List digest) =>
+          _setInFlight(k, completed, _argon2Total, digest),
     );
     _argon2Job = job;
     final StageReservoirs reservoirs = await job.result;
     _argon2Job = null;
+    _clearInFlight(); // stage's chain finished — its digest is no longer a checkpoint
     Entropy.wipe(priorPointBits);
     // Drop the result if the session was reset/aborted mid-flight, rather than
     // writing into the torn-down arrays.
@@ -669,31 +704,76 @@ class SetupController extends ChangeNotifier {
         if (!ok) return; // session torn down — finally cleans up
       }
     } on Argon2Cancelled {
-      // Aborted (e.g. Reset) — the stages already derived stay valid; the rest
-      // simply never appear. _resetSecrets has wiped the session.
+      // Cancelled. On a halt, the in-flight stage's progress is stashed and the
+      // entropy is kept for resume (handled in the finally + _enterHalted). On a
+      // reset, _resetSecrets has already wiped the session. Either way the
+      // stages already derived stay valid; the rest simply never appear.
       return;
     } catch (e) {
       _generationError =
           'Stage $_generatingStage failed to derive (${e.runtimeType}); '
           'the earlier stages are still usable.';
     } finally {
-      _isGenerating = false;
-      _generatingStage = 0;
-      // The entropy root is no longer needed once every stage carries its point
-      // (skip if a reset already wiped it).
-      if (_entropyBits != null) {
-        Entropy.wipe(bits);
-        _entropyBits = null;
+      if (_halting) {
+        // Halt: keep the entropy root (resume needs it) and promote the stash.
+        _enterHalted();
+      } else {
+        _isGenerating = false;
+        _generatingStage = 0;
+        // The entropy root is no longer needed once every stage carries its
+        // point (skip if a reset already wiped it).
+        if (_entropyBits != null) {
+          Entropy.wipe(bits);
+          _entropyBits = null;
+        }
+        notifyListeners();
       }
-      notifyListeners();
     }
   }
 
-  /// Cancel an in-progress chained derivation. Kills the worker isolate and
-  /// fails the derivation with [Argon2Cancelled], returning the UI to idle.
-  void requestStop() {
-    _argon2Job?.cancel();
+  /// Halt an in-flight derivation: kill only the current Argon2 pass, keeping
+  /// every completed intermediary digest of the working stage (stashed in
+  /// [_halted] for a later resume) and the stages already derived. The entropy
+  /// root is kept alive (a resume needs it); use [reset] to discard everything.
+  ///
+  /// No-op when nothing is deriving. The kill costs at most the single in-flight
+  /// pass (~1 minute); all earlier passes survive because the worker streams
+  /// each one's digest and [_inFlight] holds the latest.
+  void halt() {
+    if (_argon2Job == null) return;
+    _halting = true;
+    _argon2Job!.cancel();
     _argon2Job = null;
+  }
+
+  /// Record the working stage's latest intermediary digest (one per pass),
+  /// wiping the previous one. Keeps an owned copy so the engine can wipe its.
+  void _setInFlight(int stage, int completed, int total, Uint8List digest) {
+    _inFlight?.wipe();
+    _inFlight = _HaltCheckpoint(stage, completed, total, Uint8List.fromList(digest));
+  }
+
+  /// Drop the in-flight checkpoint (a stage finished, so its digest is no longer
+  /// a resume point).
+  void _clearInFlight() {
+    _inFlight?.wipe();
+    _inFlight = null;
+  }
+
+  /// Promote the in-flight checkpoint to the halted stash and land on the
+  /// already-usable prefix. Called from the Argon2Cancelled handlers when a
+  /// [halt] (not a reset) triggered the cancel.
+  void _enterHalted() {
+    _isGenerating = false;
+    _generatingStage = 0;
+    if (_inFlight != null) {
+      _halted?.wipe();
+      _halted = _inFlight;
+      _inFlight = null;
+    }
+    _halting = false;
+    _setPhase(SetupPhase.memorise);
+    notifyListeners();
   }
 
   /// Discard the current session and return to the configuration screen,
@@ -758,10 +838,13 @@ class SetupController extends ChangeNotifier {
           _argon2Total = total;
           notifyListeners();
         },
+        onCheckpoint: (int completed, Uint8List digest) =>
+            _setInFlight(1, completed, _argon2Total, digest),
       );
       _argon2Job = job;
       final StageReservoirs reservoirs = await job.result;
       _argon2Job = null;
+      _clearInFlight();
       // Land on Stage 1, the first fractal, ready for its point. Only Stage 1 is
       // derived (it needs no prior point); the rest derive one at a time as the
       // user selects each next stage.
@@ -770,8 +853,12 @@ class SetupController extends ChangeNotifier {
       _isRecallSession = true;
       _setPhase(SetupPhase.memorise);
     } on Argon2Cancelled {
-      _resetSecrets();
-      _setPhase(SetupPhase.idle);
+      if (_halting) {
+        _enterHalted();
+      } else {
+        _resetSecrets();
+        _setPhase(SetupPhase.idle);
+      }
     } catch (e) {
       _resetSecrets();
       _errorMessage = 'Recall failed: ${e.runtimeType}';
@@ -919,10 +1006,13 @@ class SetupController extends ChangeNotifier {
           _argon2Total = total;
           notifyListeners();
         },
+        onCheckpoint: (int completed, Uint8List digest) =>
+            _setInFlight(target, completed, _argon2Total, digest),
       );
       _argon2Job = job;
       final StageReservoirs reservoirs = await job.result;
       _argon2Job = null;
+      _clearInFlight();
       Entropy.wipe(priorPointBits);
 
       _reservoirs[target] = reservoirs;
@@ -932,7 +1022,11 @@ class SetupController extends ChangeNotifier {
     } on Argon2Cancelled {
       Entropy.wipe(priorPointBits);
       _argon2Job = null;
-      _setPhase(SetupPhase.memorise);
+      if (_halting) {
+        _enterHalted();
+      } else {
+        _setPhase(SetupPhase.memorise);
+      }
       return DeriveOutcome.busy;
     }
   }
@@ -1084,6 +1178,11 @@ class SetupController extends ChangeNotifier {
     final List<int>? bits = _entropyBits;
     if (bits != null) Entropy.wipe(bits);
     _entropyBits = null;
+    // Discard any halted-stage progress and live checkpoint.
+    _halting = false;
+    _clearInFlight();
+    _halted?.wipe();
+    _halted = null;
     _points = const <EncodedPoint?>[];
     for (final StageReservoirs? r in _reservoirs) {
       r?.clear();
@@ -1114,4 +1213,20 @@ class SetupController extends ChangeNotifier {
     _resetSecrets();
     super.dispose();
   }
+}
+
+/// A halted stage's preserved progress: the last completed intermediary Argon2
+/// [digest] of stage [stage] and how many passes were done ([pass] of [total]).
+/// The [digest] is coercion-relevant and owned by the holder — call [wipe] when
+/// discarding it. A later "resume" continues the chain from [digest] for the
+/// remaining `total - pass` passes.
+class _HaltCheckpoint {
+  _HaltCheckpoint(this.stage, this.pass, this.total, this.digest);
+
+  final int stage;
+  final int pass;
+  final int total;
+  final Uint8List digest;
+
+  void wipe() => digest.fillRange(0, digest.length, 0);
 }
