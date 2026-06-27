@@ -989,40 +989,26 @@ class _SetupScreenState extends State<SetupScreen> {
       );
 
   Widget _progressOverlay() {
-    final String stageLabel =
-        'Stage ${_setup.workingStageNumber}/${_setup.nStages - 1}';
-    final String label;
-    switch (_setup.phase) {
-      case SetupPhase.deriving:
-        label = 'Deriving $stageLabel fractal (Argon2) '
-            '${_setup.argon2Done}/${_setup.argon2Total}…';
-      case SetupPhase.encoding:
-        label = 'Encoding $stageLabel point…';
-      default:
-        label = 'Working…';
-    }
     final bool deriving = _setup.phase == SetupPhase.deriving;
-    // The progress bar now lives in the stage-tab strip (which renders above
-    // this scrim), so the overlay is just a dim + a label + Halt.
+    // The stage-tab strip (above this scrim) is the progress bar and the console
+    // carries the live text + ETA, so the overlay avoids a third copy: while
+    // deriving it shows only Halt; for the brief encode (no Halt) it shows a
+    // short label so the dim is not blank.
     return ColoredBox(
       color: Colors.black54,
       // Sit a little below centre so it clears the Stage-0 text panel (which
       // sits a little above centre) during the foreground Stage-1 derivation.
       child: Align(
         alignment: const Alignment(0, 0.3),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: <Widget>[
-            Text(label, style: const TextStyle(color: Colors.white)),
-            if (deriving) ...<Widget>[
-              const SizedBox(height: 12),
-              TextButton(
+        child: deriving
+            ? TextButton(
                 onPressed: _setup.halt,
                 child: const Text('Halt'),
+              )
+            : Text(
+                _setup.phase == SetupPhase.encoding ? 'Encoding…' : 'Working…',
+                style: const TextStyle(color: Colors.white),
               ),
-            ],
-          ],
-        ),
       ),
     );
   }
