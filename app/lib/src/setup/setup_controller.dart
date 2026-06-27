@@ -256,6 +256,21 @@ class SetupController extends ChangeNotifier {
       _displayStageIndex >= 1 &&
       _displayStageIndex < nStages;
 
+  /// Whether stage [k]'s point can be edited: a settled generated/imported setup
+  /// (memorise, not deriving/generating, not a recall walk) on a derived point
+  /// stage.
+  bool _canEditPointAt(int k) =>
+      _phase == SetupPhase.memorise &&
+      !_isGenerating &&
+      !_isRecallSession &&
+      k >= 1 &&
+      k < nStages &&
+      k < _reservoirs.length &&
+      _reservoirs[k] != null;
+
+  /// Whether the displayed stage's point can be changed (see [_canEditPointAt]).
+  bool get canEditCurrentPoint => _canEditPointAt(_displayStageIndex);
+
   /// The stage index a halt left paused (0 when none).
   int get haltedStage => _halted?.stage ?? 0;
 
@@ -316,6 +331,37 @@ class SetupController extends ChangeNotifier {
   /// Whether stage [k] (1..N) has a selected point.
   bool hasSelectedPoint(int k) =>
       k >= 1 && k < _selectedChunks.length && _selectedChunks[k] != null;
+
+  /// Whether stage [k] carries a point at all — selected during a recall walk,
+  /// or already encoded in a generated/imported setup. This is the chain-forward
+  /// precondition: a stage can only be derived once every prior point exists.
+  bool _hasPointAt(int k) =>
+      hasSelectedPoint(k) ||
+      (k >= 1 && k < _points.length && _points[k] != null);
+
+  /// Stage [k]'s 32-bit point chunk — the recall selection if present, otherwise
+  /// decoded on demand from the stored encoded point. No extra secret is kept in
+  /// memory: the displayed marker already *is* this chunk (a placed point
+  /// decodes back to it), so decoding when needed avoids a redundant stored copy
+  /// while keeping chain-extension setup-agnostic.
+  List<int> _pointChunk(int k) {
+    final List<int>? sel = _selectedChunks[k];
+    if (sel != null) return sel;
+    final EncodedPoint? pt = (k >= 1 && k < _points.length) ? _points[k] : null;
+    final StageReservoirs? res =
+        (k >= 1 && k < _reservoirs.length) ? _reservoirs[k] : null;
+    if (pt == null || res == null) {
+      throw StateError('stage $k has no point to chain from');
+    }
+    final CoreDecodeResult d = _core.decodePoint(
+      reRaw: pt.reRaw,
+      imRaw: pt.imRaw,
+      o: res.o,
+      p: res.p,
+      q: res.q,
+    );
+    return d.bits;
+  }
 
   /// The green marker selected on stage [index], if any (for the canvas overlay).
   ({double re, double im})? selectedMarkAt(int index) =>
@@ -541,6 +587,39 @@ class SetupController extends ChangeNotifier {
       bits = Bip39.mnemonicToEntropyBits(mnemonic);
     } on FormatException catch (e) {
       _errorMessage = e.message; // generic by construction; no seed content
+      _setPhase(SetupPhase.error);
+      return Future<void>.value();
+    }
+    return _encodeRoot(
+      bits,
+      text: text,
+      argon2Iterations: argon2Iterations,
+      profile: profile,
+    );
+  }
+
+  /// Run the chained Setup pipeline on **blind hex entropy input** (8 hex digits
+  /// per 32-bit stage) — for users who trust an external randomness source over
+  /// the device RNG. [text] is the Stage-0 salt/pepper. Invalid or non-whole-
+  /// stage input enters the error phase with a generic message (no content).
+  Future<void> beginFromHex(
+    String hex, {
+    required String text,
+    required int argon2Iterations,
+    Argon2Profile profile = Argon2Profile.basic,
+  }) {
+    final List<int> bits;
+    try {
+      bits = Entropy.hexToBits(hex);
+    } on FormatException {
+      _errorMessage = 'Invalid hex — use uppercase 0–9 A–F.';
+      _setPhase(SetupPhase.error);
+      return Future<void>.value();
+    }
+    if (bits.length % EncodingConstants.bitsPerPoint != 0) {
+      Entropy.wipe(bits);
+      _errorMessage =
+          'Hex must be a whole number of stages (8 digits = 32 bits each).';
       _setPhase(SetupPhase.error);
       return Future<void>.value();
     }
@@ -1116,6 +1195,111 @@ class SetupController extends ChangeNotifier {
     return SelectionOutcome.marked;
   }
 
+  /// Replace stage [k]'s point with [chunk] (one 32-bit point), re-encoding it on
+  /// k's existing fractal. The stages above k were hashed from the old point, so
+  /// they are dropped and the setup shrinks to k stages (their slots become
+  /// ghosts to re-expand). Caller owns [chunk]; this copies what it keeps.
+  void _setStagePoint(int k, List<int> chunk) {
+    final StageReservoirs res = _reservoirs[k]!;
+    final List<EncodedPoint> pts =
+        _core.encodeStage(chunk, o: res.o, p: res.p, q: res.q);
+    _points[k] = pts.first;
+    _leafRects[k] = pts.first.leafRect;
+    final ({int re, int im}) leaf =
+        MasterSecret.leafCentreRaw(pts.first.leafRect);
+    _stageRecords[k] = StageRecord(
+      o: res.o,
+      p: res.p,
+      q: res.q,
+      leafReRaw: leaf.re,
+      leafImRaw: leaf.im,
+    );
+    // The encoded point now defines this stage; drop any recall-style selection.
+    _selectedMarks[k] = null;
+    final List<int>? oldSel = _selectedChunks[k];
+    if (oldSel != null) {
+      Entropy.wipe(oldSel);
+      _selectedChunks[k] = null;
+    }
+    // Drop the now-stale tail. truncateFrom no-ops when k is the last stage.
+    if (k < nStages - 1) {
+      truncateFrom(k + 1);
+    } else {
+      _applyDisplayStage(k);
+      notifyListeners();
+    }
+  }
+
+  /// Change the displayed stage's point to fresh random entropy (the `N` edit).
+  void changeCurrentPointGenerated() {
+    final int k = _displayStageIndex;
+    if (!_canEditPointAt(k)) return;
+    final List<int> chunk =
+        Entropy.randomBits(EncodingConstants.bitsPerPoint);
+    _setStagePoint(k, chunk);
+    Entropy.wipe(chunk);
+  }
+
+  /// Change the displayed stage's point to the leaf under a canvas click (the
+  /// `R` edit). Returns [SelectionOutcome.invalid] if no encodable leaf is there,
+  /// [SelectionOutcome.busy] if the stage cannot be edited, else `marked`.
+  SelectionOutcome changeCurrentPointAt(FractalSelection sel) {
+    final int k = _displayStageIndex;
+    if (!_canEditPointAt(k)) return SelectionOutcome.busy;
+    final StageReservoirs res = _reservoirs[k]!;
+    final CoreDecodeResult d = _core.decodePoint(
+      reRaw: fixedFromDouble(sel.re),
+      imRaw: fixedFromDouble(sel.im),
+      o: res.o,
+      p: res.p,
+      q: res.q,
+    );
+    if (!d.valid) return SelectionOutcome.invalid;
+    _setStagePoint(k, d.bits);
+    return SelectionOutcome.marked;
+  }
+
+  /// Change the displayed stage's point from blind uppercase hex (the `I` edit):
+  /// exactly 8 digits = 32 bits. Returns an error message on invalid input (no
+  /// content echoed), else null on success.
+  String? changeCurrentPointHex(String hex) {
+    final int k = _displayStageIndex;
+    if (!_canEditPointAt(k)) return 'This stage cannot be edited.';
+    List<int> bits;
+    try {
+      bits = Entropy.hexToBits(hex);
+    } on FormatException {
+      return 'Invalid hex — use uppercase 0–9 A–F.';
+    }
+    if (bits.length != EncodingConstants.bitsPerPoint) {
+      Entropy.wipe(bits);
+      return 'A point is 32 bits — exactly 8 hex digits.';
+    }
+    _setStagePoint(k, bits);
+    Entropy.wipe(bits);
+    return null;
+  }
+
+  /// Change the displayed stage's point from 3 BIP39 words (32 bits + checksum).
+  /// Returns an error message on invalid input, else null on success.
+  String? changeCurrentPointWords(String words) {
+    final int k = _displayStageIndex;
+    if (!_canEditPointAt(k)) return 'This stage cannot be edited.';
+    List<int> bits;
+    try {
+      bits = Bip39.mnemonicToEntropyBits(words);
+    } on FormatException catch (e) {
+      return e.message;
+    }
+    if (bits.length != EncodingConstants.bitsPerPoint) {
+      Entropy.wipe(bits);
+      return 'A point is one stage — exactly 3 words.';
+    }
+    _setStagePoint(k, bits);
+    Entropy.wipe(bits);
+    return null;
+  }
+
   /// Derive the **first not-yet-derived** stage's fractal — the explicit step
   /// that advances the chain, triggered by selecting that stage. The fractal is
   /// the memory-hard hash of the Stage-0 text plus every preceding point
@@ -1129,13 +1313,14 @@ class SetupController extends ChangeNotifier {
     if (_phase == SetupPhase.deriving) return DeriveOutcome.busy;
     final int target = firstUnderivedStage;
     if (target >= nStages) return DeriveOutcome.none; // all derived
-    // The next fractal hashes the points of every prior stage; they must exist.
+    // The next fractal hashes the points of every prior stage; they must exist
+    // (selected during recall, or already encoded in a generated/imported setup).
     for (int k = 1; k < target; k++) {
-      if (!hasSelectedPoint(k)) return DeriveOutcome.noPriorPoint;
+      if (!_hasPointAt(k)) return DeriveOutcome.noPriorPoint;
     }
 
     final List<int> priorPointBits = <int>[
-      for (int k = 1; k < target; k++) ..._selectedChunks[k]!,
+      for (int k = 1; k < target; k++) ..._pointChunk(k),
     ];
     final Uint8List input = _core.chainInput(_chainText, priorPointBits);
     try {

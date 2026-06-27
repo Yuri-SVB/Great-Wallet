@@ -152,10 +152,22 @@ class _SetupScreenState extends State<SetupScreen> {
   /// (possibly sub-standard) BIP39 phrase, or recall an existing setup from its
   /// salt (cold-start recall — no encode, the points come back from clicks).
   _SourceMode _source = _SourceMode.fresh;
+  _ImportFormat _importFormat = _ImportFormat.words;
 
   /// Select mode: when on, tapping the canvas decodes the point under the
   /// cursor instead of panning. Toggled by the panel button or the `S` key.
   bool _selectMode = false;
+
+  /// True while the user is picking a replacement point for the displayed stage
+  /// (the `R` edit): the next canvas click sets the new point. Esc cancels.
+  bool _editPointMode = false;
+
+  /// The stage whose point is being replaced by import (the `I` edit), or null
+  /// when the inline bit editor is closed.
+  int? _pointImportStage;
+  _ImportFormat _pointImportFmt = _ImportFormat.words;
+  final TextEditingController _pointImport = TextEditingController();
+  final FocusNode _pointImportFocus = FocusNode(debugLabel: 'point-import');
 
   /// True while a master-secret export's Argon2id pass is in flight, so a second
   /// tap on "Copy master secret" is ignored until it finishes.
@@ -202,6 +214,11 @@ class _SetupScreenState extends State<SetupScreen> {
     if (_setup.displayStageIndex != _shownStage) {
       _shownStage = _setup.displayStageIndex;
       _deepRender = false;
+      _editPointMode = false; // cancel an armed point edit if the view moved
+      if (_pointImportStage != null) {
+        _pointImport.clear();
+        _pointImportStage = null;
+      }
     }
     _updateEta();
     setState(() {});
@@ -357,6 +374,8 @@ class _SetupScreenState extends State<SetupScreen> {
     _iterationsField.dispose();
     _exportLabel.dispose();
     _mnemonic.dispose();
+    _pointImport.dispose();
+    _pointImportFocus.dispose();
     _stage0.dispose();
     _hotkeys.dispose();
     _stage0Focus.dispose();
@@ -424,7 +443,11 @@ class _SetupScreenState extends State<SetupScreen> {
 
   /// Return keyboard focus to the fractal viewer (and so out of any text field),
   /// re-enabling the single-key hotkeys. The non-directional counterpart to Tab.
-  void _focusViewer() => _hotkeys.requestFocus();
+  void _focusViewer() {
+    // Esc also cancels an armed manual point edit.
+    if (_editPointMode) setState(() => _editPointMode = false);
+    _hotkeys.requestFocus();
+  }
 
   /// Toggle the hotkey manual, restoring the console if it was minimized so the
   /// manual is actually visible. Bound to H and F1.
@@ -469,6 +492,12 @@ class _SetupScreenState extends State<SetupScreen> {
                             top: 56,
                             left: 12,
                             child: _Badge('Recall — click your point'),
+                          ),
+                        if (_editPointMode && !_setup.isTextStage)
+                          const Positioned(
+                            top: 56,
+                            left: 12,
+                            child: _Badge('Click the new point · Esc to cancel'),
                           ),
                         // Deep render reminder: explains the lag while the high
                         // escape-count cap is active, and how to turn it off.
@@ -599,6 +628,18 @@ class _SetupScreenState extends State<SetupScreen> {
         if (!_busy) _copyMasterSecret(full: true);
         return KeyEventResult.handled;
       }
+      // Alt+I — the hex counterpart of plain I (BIP39 words): on a live editable
+      // stage it opens the point-import editor in hex; on the config screen it
+      // selects the Import source pre-toggled to hex.
+      if (event.logicalKey == LogicalKeyboardKey.keyI) {
+        if (_setup.canEditCurrentPoint) {
+          _changePointImport(hex: true);
+        } else {
+          _setSource(_SourceMode.import, focusInput: true);
+          setState(() => _importFormat = _ImportFormat.hex);
+        }
+        return KeyEventResult.handled;
+      }
     }
     if (kb.isAltPressed || kb.isControlPressed || kb.isMetaPressed) {
       return KeyEventResult.ignored;
@@ -634,17 +675,33 @@ class _SetupScreenState extends State<SetupScreen> {
       _focusField(_hueFocus, 'colour wheel');
       return KeyEventResult.handled;
     }
-    // N / I / R — choose the source and focus its input (config screen).
+    // N / I / R — on the config screen, choose the source and focus its input.
+    // On a live, editable point stage they instead change that stage's point:
+    // N = new random, R = manual click. (I — blind import — lands with the
+    // expansion work, which shares the inline bit editor.)
     if (event.logicalKey == LogicalKeyboardKey.keyN) {
-      _setSource(_SourceMode.fresh, focusInput: true);
+      if (_setup.canEditCurrentPoint) {
+        _changePointGenerated();
+      } else {
+        _setSource(_SourceMode.fresh, focusInput: true);
+      }
       return KeyEventResult.handled;
     }
     if (event.logicalKey == LogicalKeyboardKey.keyI) {
-      _setSource(_SourceMode.import, focusInput: true);
+      if (_setup.canEditCurrentPoint) {
+        _changePointImport(hex: false);
+      } else {
+        _setSource(_SourceMode.import, focusInput: true);
+        setState(() => _importFormat = _ImportFormat.words);
+      }
       return KeyEventResult.handled;
     }
     if (event.logicalKey == LogicalKeyboardKey.keyR) {
-      _setSource(_SourceMode.recall, focusInput: true);
+      if (_setup.canEditCurrentPoint) {
+        _changePointManual();
+      } else {
+        _setSource(_SourceMode.recall, focusInput: true);
+      }
       return KeyEventResult.handled;
     }
     // Field focus (uniform coverage): S salt/export · P profile · D derivation
@@ -868,7 +925,7 @@ class _SetupScreenState extends State<SetupScreen> {
       // Selection is enabled only once points exist and the user turns on
       // select mode (button or `S`). Otherwise taps do nothing and the canvas
       // is pan/zoom only.
-      onSelect: _selectMode
+      onSelect: (_selectMode || _editPointMode)
           ? (FractalSelection sel) {
               _onCanvasSelect(sel);
             }
@@ -939,6 +996,24 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   Future<void> _onCanvasSelect(FractalSelection sel) async {
+    // Editing the displayed stage's point (the R edit): the click sets the new
+    // point and the tail (if any) was already confirmed when arming the mode.
+    if (_editPointMode) {
+      final SelectionOutcome o = _setup.changeCurrentPointAt(sel);
+      final int k = _setup.displayStageIndex;
+      switch (o) {
+        case SelectionOutcome.invalid:
+          _sounds.play(UiSound.denyMiss);
+          _toast('No encodable leaf there — zoom in and click closer.');
+        case SelectionOutcome.marked:
+          setState(() => _editPointMode = false);
+          _sounds.play(UiSound.changePoint);
+          _toast('Stage $k point changed.');
+        default:
+          setState(() => _editPointMode = false);
+      }
+      return;
+    }
     SelectionOutcome outcome = _setup.selectPoint(sel);
     // A valid click that would clobber a re-selected stage's later fractals asks
     // for confirmation before discarding them.
@@ -1039,7 +1114,8 @@ class _SetupScreenState extends State<SetupScreen> {
     'Esc  return to the fractal (leave a text field) · Tab cycles fields',
     'M  console   9  stage bar   Z  reset (asks first)',
     '0–8  go to that stage (recenters); press again to zoom to its point',
-    'N / I / R  New seed / Import / Recall (also focuses its input)',
+    'N / I / R  New seed / Import / Recall (config) · on a stage: change its point',
+    'I import = BIP39 words · Alt+I import = hex (config & point edit alike)',
     'S salt / export label · P profile · D derivation steps · C colour',
     'Enter  start (Generate / Encode / Begin recall) from a field',
     'K  copy the master secret ("the key")    H  halt derivation (keeps progress)',
@@ -1336,6 +1412,12 @@ class _SetupScreenState extends State<SetupScreen> {
             _haltedNotice(),
           ],
 
+          // Inline editor for replacing the displayed stage's point by import.
+          if (_pointImportStage != null) ...<Widget>[
+            const Divider(height: 32),
+            _pointImportEditor(),
+          ],
+
           // Truncation: delete the displayed stage and every stage above it.
           if (_setup.canTruncateFromDisplayed) ...<Widget>[
             const Divider(height: 32),
@@ -1488,16 +1570,14 @@ class _SetupScreenState extends State<SetupScreen> {
             _busy ? null : (Set<_SourceMode> s) => _setSource(s.first),
       ),
       const SizedBox(height: 16),
-      // Keep the source-specific input the same height (the import field vs the
-      // stages slider) so switching New seed / Import / Recall does not shift the
-      // controls below it. Each builder returns a single widget.
-      SizedBox(
-        height: 56,
-        child: Align(
-          child: _source == _SourceMode.import
-              ? _mnemonicInput().single
-              : _stagesInput().single,
-        ),
+      // The source-specific input: the import builder (format toggle + field) or
+      // the stages slider. Each builder returns one or more widgets, laid out in
+      // a column so switching New seed / Import / Recall swaps the whole block.
+      Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: _source == _SourceMode.import
+            ? _mnemonicInput()
+            : _stagesInput(),
       ),
       const SizedBox(height: 16),
       ..._stage0Input(),
@@ -1519,8 +1599,11 @@ class _SetupScreenState extends State<SetupScreen> {
                       _mnemonic.text.trim().isEmpty))
               ? null
               : _start,
-          child: Text(
-              _source == _SourceMode.import ? 'Encode phrase' : 'Generate'),
+          child: Text(_source == _SourceMode.import
+              ? (_importFormat == _ImportFormat.hex
+                  ? 'Encode hex'
+                  : 'Encode phrase')
+              : 'Generate'),
         ),
       if (_setup.phase == SetupPhase.error && _setup.errorMessage != null) ...<Widget>[
         const SizedBox(height: 12),
@@ -1678,7 +1761,26 @@ class _SetupScreenState extends State<SetupScreen> {
   /// The instruction and live word-count are shown in the console on focus
   /// ([_fieldHelp]).
   List<Widget> _mnemonicInput() {
+    final bool hex = _importFormat == _ImportFormat.hex;
     return <Widget>[
+      SegmentedButton<_ImportFormat>(
+        segments: const <ButtonSegment<_ImportFormat>>[
+          ButtonSegment<_ImportFormat>(
+              value: _ImportFormat.words, label: Text('Words')),
+          ButtonSegment<_ImportFormat>(
+              value: _ImportFormat.hex, label: Text('Hex')),
+        ],
+        selected: <_ImportFormat>{_importFormat},
+        showSelectedIcon: false,
+        style: const ButtonStyle(visualDensity: VisualDensity.compact),
+        onSelectionChanged: (Set<_ImportFormat> s) {
+          setState(() {
+            _importFormat = s.first;
+            _mnemonic.clear(); // the two formats are not interchangeable
+          });
+        },
+      ),
+      const SizedBox(height: 8),
       _track(
         _Field.mnemonic,
         TextField(
@@ -1689,13 +1791,24 @@ class _SetupScreenState extends State<SetupScreen> {
           maxLines: 1,
           autocorrect: false,
           enableSuggestions: false,
+          // Hex is constrained to grouped uppercase 0-9 A-F; words are free text.
+          inputFormatters: hex
+              ? <TextInputFormatter>[
+                  FilteringTextInputFormatter.allow(RegExp(r'[0-9a-fA-F ]')),
+                  TextInputFormatter.withFunction(
+                    (TextEditingValue o, TextEditingValue n) =>
+                        n.copyWith(text: n.text.toUpperCase()),
+                  ),
+                ]
+              : null,
           decoration: InputDecoration(
             isDense: true,
             border: const OutlineInputBorder(),
-            labelText: 'Import phrase (BIP39)',
-            hintText: 'word1 word2 …',
+            labelText:
+                hex ? 'Import hex (8 digits / stage)' : 'Import phrase (BIP39)',
+            hintText: hex ? 'A1B2C3D4 …' : 'word1 word2 …',
             suffixIcon: IconButton(
-              tooltip: _mnemonicHidden ? 'Show phrase' : 'Hide phrase',
+              tooltip: _mnemonicHidden ? 'Show' : 'Hide',
               icon: Icon(
                 _mnemonicHidden ? Icons.visibility : Icons.visibility_off,
               ),
@@ -1870,6 +1983,164 @@ class _SetupScreenState extends State<SetupScreen> {
   void _resumeDerivation() {
     _sounds.play(UiSound.select);
     _setup.resumeDerivation();
+  }
+
+  /// Common message tail for a point edit: what gets discarded above stage [k].
+  String _editTail(int k) {
+    final int last = _setup.nStages - 1;
+    return k < last ? ' and discard Stages ${k + 1}–$last' : '';
+  }
+
+  /// Change the displayed stage's point to fresh random entropy (the `N` edit).
+  Future<void> _changePointGenerated() async {
+    final int k = _setup.displayStageIndex;
+    final bool ok = await _consoleConfirm(
+      message: 'Replace Stage $k\'s point with new random entropy'
+          '${_editTail(k)}? This cannot be undone.',
+      confirmLabel: 'Replace',
+    );
+    if (!ok || !mounted || !_setup.canEditCurrentPoint) return;
+    _setup.changeCurrentPointGenerated();
+    _sounds.play(UiSound.changePoint);
+    _toast('Stage $k point regenerated.');
+  }
+
+  /// Arm the manual point edit (the `R` edit): the next canvas click sets the
+  /// new point for the displayed stage.
+  Future<void> _changePointManual() async {
+    final int k = _setup.displayStageIndex;
+    final bool ok = await _consoleConfirm(
+      message: 'Click a new point for Stage $k${_editTail(k)}? '
+          'This cannot be undone.',
+      confirmLabel: 'Pick new point',
+    );
+    if (!ok || !mounted || !_setup.canEditCurrentPoint) return;
+    setState(() => _editPointMode = true);
+    _sounds.play(UiSound.click);
+    _toast('Click the new point on Stage $k (Esc to cancel).');
+  }
+
+  /// Open the inline bit editor to replace the displayed stage's point by import
+  /// (the `I` edit): 3 words → 32 bits (plain I) or 8 hex digits (Alt+I). The
+  /// format toggle in the editor still lets the user switch after opening.
+  Future<void> _changePointImport({required bool hex}) async {
+    final int k = _setup.displayStageIndex;
+    final bool ok = await _consoleConfirm(
+      message: 'Replace Stage $k\'s point by import${_editTail(k)}? '
+          'This cannot be undone.',
+      confirmLabel: 'Import',
+    );
+    if (!ok || !mounted || !_setup.canEditCurrentPoint) return;
+    _pointImport.clear();
+    setState(() {
+      _pointImportFmt = hex ? _ImportFormat.hex : _ImportFormat.words;
+      _pointImportStage = k;
+    });
+    _pointImportFocus.requestFocus();
+  }
+
+  void _applyPointImport() {
+    final String text = _pointImport.text;
+    final String? err = _pointImportFmt == _ImportFormat.hex
+        ? _setup.changeCurrentPointHex(text)
+        : _setup.changeCurrentPointWords(text);
+    if (err != null) {
+      _sounds.play(UiSound.denyInput);
+      _toast(err);
+      return;
+    }
+    final int k = _setup.displayStageIndex;
+    _cancelPointImport();
+    _sounds.play(UiSound.changePoint);
+    _toast('Stage $k point changed.');
+  }
+
+  void _cancelPointImport() {
+    _pointImport.clear();
+    setState(() => _pointImportStage = null);
+    _focusViewer();
+  }
+
+  /// The inline editor shown while replacing a stage's point by import.
+  Widget _pointImportEditor() {
+    final int k = _pointImportStage!;
+    final bool hex = _pointImportFmt == _ImportFormat.hex;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Text('Import a new point for Stage $k${_editTail(k)}.',
+            style: Theme.of(context).textTheme.bodySmall),
+        const SizedBox(height: 8),
+        SegmentedButton<_ImportFormat>(
+          segments: const <ButtonSegment<_ImportFormat>>[
+            ButtonSegment<_ImportFormat>(
+                value: _ImportFormat.words, label: Text('3 words')),
+            ButtonSegment<_ImportFormat>(
+                value: _ImportFormat.hex, label: Text('8 hex')),
+          ],
+          selected: <_ImportFormat>{_pointImportFmt},
+          showSelectedIcon: false,
+          style: const ButtonStyle(visualDensity: VisualDensity.compact),
+          onSelectionChanged: (Set<_ImportFormat> s) {
+            setState(() {
+              _pointImportFmt = s.first;
+              _pointImport.clear();
+            });
+          },
+        ),
+        const SizedBox(height: 8),
+        TextField(
+          controller: _pointImport,
+          focusNode: _pointImportFocus,
+          obscureText: _mnemonicHidden,
+          maxLines: 1,
+          autocorrect: false,
+          enableSuggestions: false,
+          inputFormatters: hex
+              ? <TextInputFormatter>[
+                  FilteringTextInputFormatter.allow(RegExp(r'[0-9a-fA-F ]')),
+                  TextInputFormatter.withFunction(
+                    (TextEditingValue o, TextEditingValue n) =>
+                        n.copyWith(text: n.text.toUpperCase()),
+                  ),
+                ]
+              : null,
+          decoration: InputDecoration(
+            isDense: true,
+            border: const OutlineInputBorder(),
+            labelText: hex ? '8 hex digits' : '3 words',
+            hintText: hex ? 'A1B2C3D4' : 'word word word',
+            suffixIcon: IconButton(
+              tooltip: _mnemonicHidden ? 'Show' : 'Hide',
+              icon: Icon(
+                _mnemonicHidden ? Icons.visibility : Icons.visibility_off,
+              ),
+              onPressed: () =>
+                  setState(() => _mnemonicHidden = !_mnemonicHidden),
+            ),
+          ),
+          onChanged: (_) {
+            _sounds.play(UiSound.tickSoft);
+            setState(() {});
+          },
+          onSubmitted: (_) => _applyPointImport(),
+        ),
+        const SizedBox(height: 8),
+        Row(
+          children: <Widget>[
+            FilledButton(
+              onPressed: _applyPointImport,
+              child: const Text('Apply'),
+            ),
+            const SizedBox(width: 8),
+            OutlinedButton(
+              onPressed: _cancelPointImport,
+              child: const Text('Cancel'),
+            ),
+          ],
+        ),
+      ],
+    );
   }
 
   /// Truncation control: exclude the displayed stage and every stage above it.
@@ -2108,6 +2379,18 @@ class _SetupScreenState extends State<SetupScreen> {
         return 'Stage 0 salt/pepper: seeds the fractal chain. A public label or '
             'a secret pasted pepper (uppercase letters, digits, hyphen).';
       case _Field.mnemonic:
+        if (_importFormat == _ImportFormat.hex) {
+          final int digits = _mnemonic.text.replaceAll(RegExp(r'\s'), '').length;
+          if (digits == 0) {
+            return 'Import hex: paste uppercase 0–9 A–F from a randomness source '
+                'you trust over the device (kept hidden). 8 digits = one stage.';
+          }
+          if (digits % 8 != 0) {
+            return 'Import hex: $digits digits — must be a multiple of 8 '
+                '(8 = 32 bits = one stage).';
+          }
+          return 'Import hex: $digits digits → ${digits ~/ 8} stages.';
+        }
         final int wc = _mnemonic.text
             .trim()
             .split(RegExp(r'\s+'))
@@ -2115,7 +2398,7 @@ class _SetupScreenState extends State<SetupScreen> {
             .length;
         if (wc == 0) {
           return 'Import phrase: type or paste your existing BIP39 seed phrase '
-              '(kept hidden).';
+              '(kept hidden). 3 words = one stage.';
         }
         if (wc % 3 != 0 || wc > 24) {
           return 'Import phrase: $wc words — must be a multiple of 3 (3–24).';
@@ -2150,12 +2433,21 @@ class _SetupScreenState extends State<SetupScreen> {
     setState(() => _selectMode = false);
     final String text = _stage0.text;
     if (_source == _SourceMode.import) {
-      await _setup.beginFromMnemonic(
-        _mnemonic.text,
-        text: text,
-        argon2Iterations: _iterations,
-        profile: _profile,
-      );
+      if (_importFormat == _ImportFormat.hex) {
+        await _setup.beginFromHex(
+          _mnemonic.text,
+          text: text,
+          argon2Iterations: _iterations,
+          profile: _profile,
+        );
+      } else {
+        await _setup.beginFromMnemonic(
+          _mnemonic.text,
+          text: text,
+          argon2Iterations: _iterations,
+          profile: _profile,
+        );
+      }
       // Setup is write-only on memory: once the phrase is encoded onto the
       // fractals, wipe the plaintext from the field (keep it on error so the
       // user can fix it).
@@ -2258,6 +2550,10 @@ class _SetupScreenState extends State<SetupScreen> {
 /// imported BIP39 phrase, or a cold-start recall of an existing setup (derive
 /// from the salt and reconstruct the seed from the user's clicks).
 enum _SourceMode { fresh, import, recall }
+
+/// How imported entropy is entered: BIP39 words, or blind uppercase hex (for
+/// users who trust an external randomness source over the device RNG).
+enum _ImportFormat { words, hex }
 
 /// The input controls whose label + live value are conveyed in the console while
 /// focused (so the panel itself can stay label-free).

@@ -69,6 +69,27 @@ class Entropy {
     return bytesToBits(bytes);
   }
 
+  /// Parse an uppercase-hex string into a 0/1 bit list, 4 bits per digit,
+  /// MSB-first. Spaces (grouping) are ignored. Used for blind entropy input from
+  /// a source the user trusts more than the device RNG. Throws [FormatException]
+  /// on an empty string or any non-`[0-9A-F]` character — the message is generic
+  /// (never echoes the value).
+  static List<int> hexToBits(String hex) {
+    final String clean = hex.replaceAll(RegExp(r'\s'), '');
+    if (clean.isEmpty) throw const FormatException('no hex digits');
+    if (!RegExp(r'^[0-9A-F]+$').hasMatch(clean)) {
+      throw const FormatException('hex must be uppercase 0-9 A-F');
+    }
+    final List<int> bits = <int>[];
+    for (int i = 0; i < clean.length; i++) {
+      final int v = int.parse(clean[i], radix: 16);
+      for (int b = 3; b >= 0; b--) {
+        bits.add((v >> b) & 1);
+      }
+    }
+    return bits;
+  }
+
   /// Overwrite a bit list with zeros once it is no longer needed.
   static void wipe(List<int> bits) {
     for (int i = 0; i < bits.length; i++) {
