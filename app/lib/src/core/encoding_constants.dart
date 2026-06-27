@@ -30,11 +30,18 @@ class EncodingConstants {
 
   /// Escape-iteration cap for *rendering* the fractal canvas (constants.py:
   /// `DEFAULT_MAX_ITER`). This is a purely visual knob — it colours pixels and
-  /// does not affect which bits a point encodes to — so it is deliberately
-  /// decoupled from, and far smaller than, the engine's encode/decode cap
-  /// (`encodeParams.maxIter`, 1024). It is not a determinism-critical protocol
-  /// value, so it stays app-side.
-  static const int renderMaxIter = 64;
+  /// does not affect which bits a point encodes to — and is not a
+  /// determinism-critical protocol value, so it stays app-side.
+  ///
+  /// Dog-fooding note: raised from 64 to match the engine's encode/decode cap
+  /// (`encodeParams.maxIter`, 1024). At 64 the rendered escape-count boundary
+  /// diverged from where the encoder actually lands leaves — a leaf could sit
+  /// "inside" the 64-iteration render yet "outside" the 1024-iteration set the
+  /// encoder uses. Matching the caps makes the visual agree with the encode.
+  /// Cost scales with the cap for non-escaping (interior) pixels, which is why
+  /// a run-time, user-adjustable cap is the intended follow-up; 1024 here is a
+  /// temporary fixed value to feel out the UX.
+  static const int renderMaxIter = 1024;
 
   /// Number of fractal point stages for an entropy width: one 32-bit point per
   /// fractal (`entropy_bits / BITS_PER_POINT`). The text Stage 0 is separate and
