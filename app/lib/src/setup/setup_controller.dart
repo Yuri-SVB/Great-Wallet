@@ -256,6 +256,21 @@ class SetupController extends ChangeNotifier {
       _displayStageIndex >= 1 &&
       _displayStageIndex < nStages;
 
+  /// Whether stage [k]'s point can be edited: a settled generated/imported setup
+  /// (memorise, not deriving/generating, not a recall walk) on a derived point
+  /// stage.
+  bool _canEditPointAt(int k) =>
+      _phase == SetupPhase.memorise &&
+      !_isGenerating &&
+      !_isRecallSession &&
+      k >= 1 &&
+      k < nStages &&
+      k < _reservoirs.length &&
+      _reservoirs[k] != null;
+
+  /// Whether the displayed stage's point can be changed (see [_canEditPointAt]).
+  bool get canEditCurrentPoint => _canEditPointAt(_displayStageIndex);
+
   /// The stage index a halt left paused (0 when none).
   int get haltedStage => _halted?.stage ?? 0;
 
@@ -1177,6 +1192,70 @@ class SetupController extends ChangeNotifier {
       return SelectionOutcome.complete;
     }
     notifyListeners();
+    return SelectionOutcome.marked;
+  }
+
+  /// Replace stage [k]'s point with [chunk] (one 32-bit point), re-encoding it on
+  /// k's existing fractal. The stages above k were hashed from the old point, so
+  /// they are dropped and the setup shrinks to k stages (their slots become
+  /// ghosts to re-expand). Caller owns [chunk]; this copies what it keeps.
+  void _setStagePoint(int k, List<int> chunk) {
+    final StageReservoirs res = _reservoirs[k]!;
+    final List<EncodedPoint> pts =
+        _core.encodeStage(chunk, o: res.o, p: res.p, q: res.q);
+    _points[k] = pts.first;
+    _leafRects[k] = pts.first.leafRect;
+    final ({int re, int im}) leaf =
+        MasterSecret.leafCentreRaw(pts.first.leafRect);
+    _stageRecords[k] = StageRecord(
+      o: res.o,
+      p: res.p,
+      q: res.q,
+      leafReRaw: leaf.re,
+      leafImRaw: leaf.im,
+    );
+    // The encoded point now defines this stage; drop any recall-style selection.
+    _selectedMarks[k] = null;
+    final List<int>? oldSel = _selectedChunks[k];
+    if (oldSel != null) {
+      Entropy.wipe(oldSel);
+      _selectedChunks[k] = null;
+    }
+    // Drop the now-stale tail. truncateFrom no-ops when k is the last stage.
+    if (k < nStages - 1) {
+      truncateFrom(k + 1);
+    } else {
+      _applyDisplayStage(k);
+      notifyListeners();
+    }
+  }
+
+  /// Change the displayed stage's point to fresh random entropy (the `N` edit).
+  void changeCurrentPointGenerated() {
+    final int k = _displayStageIndex;
+    if (!_canEditPointAt(k)) return;
+    final List<int> chunk =
+        Entropy.randomBits(EncodingConstants.bitsPerPoint);
+    _setStagePoint(k, chunk);
+    Entropy.wipe(chunk);
+  }
+
+  /// Change the displayed stage's point to the leaf under a canvas click (the
+  /// `R` edit). Returns [SelectionOutcome.invalid] if no encodable leaf is there,
+  /// [SelectionOutcome.busy] if the stage cannot be edited, else `marked`.
+  SelectionOutcome changeCurrentPointAt(FractalSelection sel) {
+    final int k = _displayStageIndex;
+    if (!_canEditPointAt(k)) return SelectionOutcome.busy;
+    final StageReservoirs res = _reservoirs[k]!;
+    final CoreDecodeResult d = _core.decodePoint(
+      reRaw: fixedFromDouble(sel.re),
+      imRaw: fixedFromDouble(sel.im),
+      o: res.o,
+      p: res.p,
+      q: res.q,
+    );
+    if (!d.valid) return SelectionOutcome.invalid;
+    _setStagePoint(k, d.bits);
     return SelectionOutcome.marked;
   }
 

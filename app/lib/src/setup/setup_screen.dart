@@ -158,6 +158,10 @@ class _SetupScreenState extends State<SetupScreen> {
   /// cursor instead of panning. Toggled by the panel button or the `S` key.
   bool _selectMode = false;
 
+  /// True while the user is picking a replacement point for the displayed stage
+  /// (the `R` edit): the next canvas click sets the new point. Esc cancels.
+  bool _editPointMode = false;
+
   /// True while a master-secret export's Argon2id pass is in flight, so a second
   /// tap on "Copy master secret" is ignored until it finishes.
   bool _exporting = false;
@@ -203,6 +207,7 @@ class _SetupScreenState extends State<SetupScreen> {
     if (_setup.displayStageIndex != _shownStage) {
       _shownStage = _setup.displayStageIndex;
       _deepRender = false;
+      _editPointMode = false; // cancel an armed point edit if the view moved
     }
     _updateEta();
     setState(() {});
@@ -425,7 +430,11 @@ class _SetupScreenState extends State<SetupScreen> {
 
   /// Return keyboard focus to the fractal viewer (and so out of any text field),
   /// re-enabling the single-key hotkeys. The non-directional counterpart to Tab.
-  void _focusViewer() => _hotkeys.requestFocus();
+  void _focusViewer() {
+    // Esc also cancels an armed manual point edit.
+    if (_editPointMode) setState(() => _editPointMode = false);
+    _hotkeys.requestFocus();
+  }
 
   /// Toggle the hotkey manual, restoring the console if it was minimized so the
   /// manual is actually visible. Bound to H and F1.
@@ -470,6 +479,12 @@ class _SetupScreenState extends State<SetupScreen> {
                             top: 56,
                             left: 12,
                             child: _Badge('Recall — click your point'),
+                          ),
+                        if (_editPointMode && !_setup.isTextStage)
+                          const Positioned(
+                            top: 56,
+                            left: 12,
+                            child: _Badge('Click the new point · Esc to cancel'),
                           ),
                         // Deep render reminder: explains the lag while the high
                         // escape-count cap is active, and how to turn it off.
@@ -635,9 +650,16 @@ class _SetupScreenState extends State<SetupScreen> {
       _focusField(_hueFocus, 'colour wheel');
       return KeyEventResult.handled;
     }
-    // N / I / R — choose the source and focus its input (config screen).
+    // N / I / R — on the config screen, choose the source and focus its input.
+    // On a live, editable point stage they instead change that stage's point:
+    // N = new random, R = manual click. (I — blind import — lands with the
+    // expansion work, which shares the inline bit editor.)
     if (event.logicalKey == LogicalKeyboardKey.keyN) {
-      _setSource(_SourceMode.fresh, focusInput: true);
+      if (_setup.canEditCurrentPoint) {
+        _changePointGenerated();
+      } else {
+        _setSource(_SourceMode.fresh, focusInput: true);
+      }
       return KeyEventResult.handled;
     }
     if (event.logicalKey == LogicalKeyboardKey.keyI) {
@@ -645,7 +667,11 @@ class _SetupScreenState extends State<SetupScreen> {
       return KeyEventResult.handled;
     }
     if (event.logicalKey == LogicalKeyboardKey.keyR) {
-      _setSource(_SourceMode.recall, focusInput: true);
+      if (_setup.canEditCurrentPoint) {
+        _changePointManual();
+      } else {
+        _setSource(_SourceMode.recall, focusInput: true);
+      }
       return KeyEventResult.handled;
     }
     // Field focus (uniform coverage): S salt/export · P profile · D derivation
@@ -869,7 +895,7 @@ class _SetupScreenState extends State<SetupScreen> {
       // Selection is enabled only once points exist and the user turns on
       // select mode (button or `S`). Otherwise taps do nothing and the canvas
       // is pan/zoom only.
-      onSelect: _selectMode
+      onSelect: (_selectMode || _editPointMode)
           ? (FractalSelection sel) {
               _onCanvasSelect(sel);
             }
@@ -940,6 +966,24 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   Future<void> _onCanvasSelect(FractalSelection sel) async {
+    // Editing the displayed stage's point (the R edit): the click sets the new
+    // point and the tail (if any) was already confirmed when arming the mode.
+    if (_editPointMode) {
+      final SelectionOutcome o = _setup.changeCurrentPointAt(sel);
+      final int k = _setup.displayStageIndex;
+      switch (o) {
+        case SelectionOutcome.invalid:
+          _sounds.play(UiSound.denyMiss);
+          _toast('No encodable leaf there — zoom in and click closer.');
+        case SelectionOutcome.marked:
+          setState(() => _editPointMode = false);
+          _sounds.play(UiSound.changePoint);
+          _toast('Stage $k point changed.');
+        default:
+          setState(() => _editPointMode = false);
+      }
+      return;
+    }
     SelectionOutcome outcome = _setup.selectPoint(sel);
     // A valid click that would clobber a re-selected stage's later fractals asks
     // for confirmation before discarding them.
@@ -1040,7 +1084,7 @@ class _SetupScreenState extends State<SetupScreen> {
     'Esc  return to the fractal (leave a text field) · Tab cycles fields',
     'M  console   9  stage bar   Z  reset (asks first)',
     '0–8  go to that stage (recenters); press again to zoom to its point',
-    'N / I / R  New seed / Import / Recall (also focuses its input)',
+    'N / I / R  New seed / Import / Recall (config) · on a stage: N/R change its point',
     'S salt / export label · P profile · D derivation steps · C colour',
     'Enter  start (Generate / Encode / Begin recall) from a field',
     'K  copy the master secret ("the key")    H  halt derivation (keeps progress)',
@@ -1904,6 +1948,41 @@ class _SetupScreenState extends State<SetupScreen> {
   void _resumeDerivation() {
     _sounds.play(UiSound.select);
     _setup.resumeDerivation();
+  }
+
+  /// Common message tail for a point edit: what gets discarded above stage [k].
+  String _editTail(int k) {
+    final int last = _setup.nStages - 1;
+    return k < last ? ' and discard Stages ${k + 1}–$last' : '';
+  }
+
+  /// Change the displayed stage's point to fresh random entropy (the `N` edit).
+  Future<void> _changePointGenerated() async {
+    final int k = _setup.displayStageIndex;
+    final bool ok = await _consoleConfirm(
+      message: 'Replace Stage $k\'s point with new random entropy'
+          '${_editTail(k)}? This cannot be undone.',
+      confirmLabel: 'Replace',
+    );
+    if (!ok || !mounted || !_setup.canEditCurrentPoint) return;
+    _setup.changeCurrentPointGenerated();
+    _sounds.play(UiSound.changePoint);
+    _toast('Stage $k point regenerated.');
+  }
+
+  /// Arm the manual point edit (the `R` edit): the next canvas click sets the
+  /// new point for the displayed stage.
+  Future<void> _changePointManual() async {
+    final int k = _setup.displayStageIndex;
+    final bool ok = await _consoleConfirm(
+      message: 'Click a new point for Stage $k${_editTail(k)}? '
+          'This cannot be undone.',
+      confirmLabel: 'Pick new point',
+    );
+    if (!ok || !mounted || !_setup.canEditCurrentPoint) return;
+    setState(() => _editPointMode = true);
+    _sounds.play(UiSound.click);
+    _toast('Click the new point on Stage $k (Esc to cancel).');
   }
 
   /// Truncation control: exclude the displayed stage and every stage above it.
