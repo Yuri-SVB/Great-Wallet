@@ -380,6 +380,8 @@ class _SetupScreenState extends State<SetupScreen> {
   Widget _stageTabs() {
     const int maxTab = SetupController.maxPointStages; // 0..8 → nine fixed tabs
     final int current = _setup.displayStageIndex;
+    final int? deriving = _setup.derivingStageIndex;
+    final double progress = _setup.stageProgress;
     // Transparent so the tabs hover over the fractal (no opaque bar).
     return Material(
       type: MaterialType.transparency,
@@ -396,8 +398,13 @@ class _SetupScreenState extends State<SetupScreen> {
                     padding: const EdgeInsets.symmetric(horizontal: 3),
                     child: _StageTab(
                       index: i,
+                      // In the (possibly slider-previewed) setup, so it shows as
+                      // a real box rather than an out-of-setup ghost slot.
+                      inSetup: i < _setup.nStages,
                       selected: _hasSession && i == current,
                       available: _hasSession && _setup.isStageAvailable(i),
+                      deriving: deriving == i,
+                      progress: progress,
                       // Tappable only for a stage that belongs to the active
                       // setup; everything else is inert but still shown.
                       onTap: (_hasSession && i < _setup.nStages)
@@ -857,9 +864,8 @@ class _SetupScreenState extends State<SetupScreen> {
         label = 'Working…';
     }
     final bool deriving = _setup.phase == SetupPhase.deriving;
-    final double? progress = deriving && _setup.argon2Total > 0
-        ? _setup.argon2Done / _setup.argon2Total
-        : null; // indeterminate for the quick encode phases
+    // The progress bar now lives in the stage-tab strip (which renders above
+    // this scrim), so the overlay is just a dim + a label + Halt.
     return ColoredBox(
       color: Colors.black54,
       // Sit a little below centre so it clears the Stage-0 text panel (which
@@ -869,11 +875,6 @@ class _SetupScreenState extends State<SetupScreen> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: <Widget>[
-            SizedBox(
-              width: 260,
-              child: LinearProgressIndicator(value: progress),
-            ),
-            const SizedBox(height: 16),
             Text(label, style: const TextStyle(color: Colors.white)),
             if (deriving) ...<Widget>[
               const SizedBox(height: 12),
@@ -1649,19 +1650,12 @@ class _SetupScreenState extends State<SetupScreen> {
       return Text(err, style: const TextStyle(color: Colors.orangeAccent));
     }
     final int total = _setup.nStages - 1;
-    final double? progress =
-        _setup.argon2Total > 0 ? _setup.argon2Done / _setup.argon2Total : null;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: <Widget>[
-        Text(
-          'Deriving stage ${_setup.generatingStage}/$total in the background — '
-          'the stages already done are ready to study now.',
-          style: Theme.of(context).textTheme.bodySmall,
-        ),
-        const SizedBox(height: 8),
-        LinearProgressIndicator(value: progress),
-      ],
+    // Progress now reads off the stage-tab strip (the deriving stage's box
+    // fills), so this notice is just the explanatory line.
+    return Text(
+      'Deriving stage ${_setup.generatingStage}/$total in the background — '
+      'the stages already done are ready to study now.',
+      style: Theme.of(context).textTheme.bodySmall,
     );
   }
 
@@ -2182,58 +2176,146 @@ final Map<LogicalKeyboardKey, int> _digitKeys = <LogicalKeyboardKey, int>{
 
 /// One numbered stage tab on the upper edge. Highlighted when it is the stage
 /// under focus, dimmed and non-interactive when not yet reachable.
+/// One stage's box in the top strip. The strip doubles as the derivation
+/// progress bar: each box is a stage-sized segment, so filled boxes are elapsed
+/// work and empty ones are still to come.
+///
+/// States: **available/selected** (lit) · **deriving** (filling left→right) ·
+/// **pending** — requested but not derived (grey) · **ghost** — a slot outside
+/// the current setup (a hollow frame the chain can still grow into).
 class _StageTab extends StatelessWidget {
   const _StageTab({
     required this.index,
+    required this.inSetup,
     required this.selected,
     required this.available,
+    required this.deriving,
+    required this.progress,
     required this.onTap,
   });
 
   final int index;
+
+  /// Whether this stage belongs to the current (or slider-previewed) setup
+  /// (`index < nStages`). Out-of-setup slots render as empty ghost frames.
+  final bool inSetup;
+
   final bool selected;
   final bool available;
 
-  /// `null` when the tab is not reachable (outside the setup, or before a
-  /// session): the tab stays visible but greyed out and non-interactive.
+  /// This stage's fractal is deriving right now: the box fills as [progress].
+  final bool deriving;
+
+  /// Fill fraction in [0, 1] while [deriving].
+  final double progress;
+
   final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {
     final ColorScheme scheme = Theme.of(context).colorScheme;
-    final Color fg = selected
-        ? scheme.onPrimary
-        : available
-            ? scheme.onSurface
-            : scheme.onSurface.withOpacity(0.35);
-    final Color bg = selected ? scheme.primary : Colors.transparent;
     return Tooltip(
       message: index == 0 ? 'Stage 0 — salt / pepper' : 'Stage $index',
       child: InkWell(
         onTap: onTap,
         borderRadius: BorderRadius.circular(6),
-        child: Container(
-          alignment: Alignment.center,
-          decoration: BoxDecoration(
-            color: bg,
-            borderRadius: BorderRadius.circular(6),
-            border: Border.all(
-              color: selected ? scheme.primary : scheme.outlineVariant,
-            ),
+        child: deriving ? _derivingFace(scheme) : _restingFace(scheme),
+      ),
+    );
+  }
+
+  /// A non-deriving box: ghost (out of setup), pending (grey), or lit
+  /// (available / selected).
+  Widget _restingFace(ColorScheme scheme) {
+    if (!inSetup) {
+      // Ghost: a faint hollow slot — an open quest the chain can grow into.
+      return _box(
+        bg: Colors.transparent,
+        border: scheme.outlineVariant.withOpacity(0.25),
+        fg: scheme.onSurface.withOpacity(0.15),
+        bold: false,
+      );
+    }
+    final Color fg = selected
+        ? scheme.onPrimary
+        : available
+            ? scheme.onSurface
+            : scheme.onSurface.withOpacity(0.35); // pending (requested) grey
+    return _box(
+      bg: selected ? scheme.primary : Colors.transparent,
+      border: selected ? scheme.primary : scheme.outlineVariant,
+      fg: fg,
+      bold: selected,
+    );
+  }
+
+  /// The deriving wipe: the left [progress] fraction shows the lit face (dark
+  /// digit on the light-blue fill); the rest shows the unlit face (light digit
+  /// on transparent). Painting the digit on both faces and clipping at the fill
+  /// edge keeps it readable across the boundary — a late-90s scan-line reveal.
+  Widget _derivingFace(ColorScheme scheme) {
+    return Stack(
+      fit: StackFit.expand,
+      children: <Widget>[
+        _box(
+          bg: Colors.transparent,
+          border: scheme.primary,
+          fg: scheme.onSurface,
+          bold: false,
+        ),
+        ClipRect(
+          clipper: _LeftFractionClipper(progress),
+          child: _box(
+            bg: scheme.primary,
+            border: scheme.primary,
+            fg: scheme.onPrimary,
+            bold: false,
           ),
-          child: Text(
-            '$index',
-            style: TextStyle(
-              color: fg,
-              fontWeight: selected ? FontWeight.bold : FontWeight.normal,
-              fontFamily: GreatWallTypography.fontFamily,
-              fontFamilyFallback: const <String>['monospace'],
-            ),
-          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _box({
+    required Color bg,
+    required Color border,
+    required Color fg,
+    required bool bold,
+  }) {
+    return Container(
+      alignment: Alignment.center,
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: border),
+      ),
+      child: Text(
+        '$index',
+        style: TextStyle(
+          color: fg,
+          fontWeight: bold ? FontWeight.bold : FontWeight.normal,
+          fontFamily: GreatWallTypography.fontFamily,
+          fontFamilyFallback: const <String>['monospace'],
         ),
       ),
     );
   }
+}
+
+/// Clips a child to its left [fraction] of width — the moving edge of a stage
+/// tab's derivation fill.
+class _LeftFractionClipper extends CustomClipper<Rect> {
+  const _LeftFractionClipper(this.fraction);
+
+  final double fraction;
+
+  @override
+  Rect getClip(Size size) =>
+      Rect.fromLTWH(0, 0, size.width * fraction.clamp(0.0, 1.0), size.height);
+
+  @override
+  bool shouldReclip(_LeftFractionClipper oldClipper) =>
+      oldClipper.fraction != fraction;
 }
 
 /// Constrains the Stage-0 salt/pepper to a safe, reproducible ASCII subset:

@@ -166,6 +166,23 @@ class SetupController extends ChangeNotifier {
   int get argon2Done => _argon2Done;
   int get argon2Total => _argon2Total;
 
+  /// The point stage (1..N) whose fractal is deriving right now — foreground
+  /// (Stage 1 / a manual derive) or background generation — or null when nothing
+  /// is deriving. Drives the stage tab's progress fill.
+  int? get derivingStageIndex {
+    if (_phase == SetupPhase.deriving || _phase == SetupPhase.encoding) {
+      return _workingStageIndex;
+    }
+    if (_isGenerating) return _generatingStage;
+    return null;
+  }
+
+  /// Fraction in [0, 1] of the deriving stage's Argon2 passes done (1.0 during
+  /// the brief encode that follows, 0 when idle).
+  double get stageProgress => _argon2Total > 0
+      ? (_argon2Done / _argon2Total).clamp(0.0, 1.0)
+      : 0.0;
+
   // Session-only secret material.
   List<int>? _entropyBits;
 
