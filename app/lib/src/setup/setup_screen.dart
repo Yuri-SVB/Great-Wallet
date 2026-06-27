@@ -199,7 +199,144 @@ class _SetupScreenState extends State<SetupScreen> {
       _shownStage = _setup.displayStageIndex;
       _deepRender = false;
     }
+    _updateEta();
     setState(() {});
+  }
+
+  // --- Derivation ETA estimate ------------------------------------------------
+  // Timed off the controller's per-pass notifications: every point stage runs
+  // the same N passes at ~the same cost, so a running average of completed-pass
+  // durations projects both "this stage" and "to the last stage" honestly.
+
+  final Stopwatch _passWatch = Stopwatch();
+  int _etaStage = 0; // stage the watch is timing (0 = none)
+  int _etaPass0 = 0; // argon2Done when the watch started
+  int _etaLastDone = 0; // argon2Done at the last completed pass
+  int _etaLastMs = 0; // watch elapsed at that pass (avg is over completed passes)
+
+  /// Refresh the pass-timing watch from the controller's current state. Resets
+  /// when the deriving stage changes; records a timestamp when a pass completes.
+  void _updateEta() {
+    final int? ds = _setup.derivingStageIndex;
+    if (ds == null) {
+      if (_passWatch.isRunning) _passWatch.stop();
+      _passWatch.reset();
+      _etaStage = 0;
+      return;
+    }
+    if (ds != _etaStage) {
+      _etaStage = ds;
+      _etaPass0 = _setup.argon2Done;
+      _etaLastDone = _setup.argon2Done;
+      _etaLastMs = 0;
+      _passWatch
+        ..reset()
+        ..start();
+    } else if (_setup.argon2Done > _etaLastDone) {
+      _etaLastDone = _setup.argon2Done;
+      _etaLastMs = _passWatch.elapsedMilliseconds;
+    }
+  }
+
+  /// Average completed-pass duration in ms, or null until a pass has completed
+  /// since timing began ("estimating…").
+  double? _avgPassMs() {
+    final int passes = _etaLastDone - _etaPass0;
+    if (passes <= 0 || _etaLastMs <= 0) return null;
+    return _etaLastMs / passes;
+  }
+
+  /// Estimated time left on the deriving stage.
+  Duration? _stageEta() {
+    final double? avg = _avgPassMs();
+    if (avg == null) return null;
+    final int remaining =
+        (_setup.argon2Total - _setup.argon2Done).clamp(0, _setup.argon2Total);
+    return Duration(milliseconds: (remaining * avg).round());
+  }
+
+  /// Estimated time left until the batch's last stage finishes.
+  Duration? _totalEta() {
+    final double? avg = _avgPassMs();
+    final Duration? stage = _stageEta();
+    final int? ds = _setup.derivingStageIndex;
+    if (avg == null || stage == null || ds == null) return null;
+    final int last = _setup.nStages - 1;
+    final int fullAfter = (last - ds).clamp(0, last);
+    return stage +
+        Duration(milliseconds: (fullAfter * _setup.argon2Total * avg).round());
+  }
+
+  /// Estimated time until stage [k] finishes (null if it is already done or
+  /// not yet estimable).
+  Duration? _etaToStage(int k) {
+    final int? ds = _setup.derivingStageIndex;
+    final double? avg = _avgPassMs();
+    final Duration? stage = _stageEta();
+    if (ds == null || avg == null || stage == null || k < ds) return null;
+    final Duration fullStage =
+        Duration(milliseconds: (_setup.argon2Total * avg).round());
+    return stage + fullStage * (k - ds);
+  }
+
+  /// Compact duration: `4h 50m` / `33m 12s` / `45s`.
+  String _fmtEta(Duration d) {
+    if (d.inHours >= 1) return '${d.inHours}h ${d.inMinutes % 60}m';
+    if (d.inMinutes >= 1) return '${d.inMinutes}m ${d.inSeconds % 60}s';
+    return '${d.inSeconds}s';
+  }
+
+  /// A stage tab's hover label: its name, plus its own ETA while deriving.
+  String _tabTooltip(int i) {
+    final String base = i == 0 ? 'Stage 0 — salt / pepper' : 'Stage $i';
+    final Duration? eta = _etaToStage(i);
+    return eta == null ? base : '$base — ETA ~${_fmtEta(eta)}';
+  }
+
+  /// One-line derivation status for the console, or null when nothing derives.
+  String? _derivationStatus() {
+    final int? ds = _setup.derivingStageIndex;
+    if (ds == null) return null;
+    final Duration? t = _totalEta();
+    final String eta = t == null ? 'estimating…' : '~${_fmtEta(t)} left';
+    final int last = _setup.nStages - 1;
+    return 'Deriving Stage $ds/$last — pass ${_setup.argon2Done}/'
+        '${_setup.argon2Total} · $eta';
+  }
+
+  /// The two-line derivation block for the expanded console: the live pass and
+  /// the stage / batch ETAs.
+  Widget _derivationBlock() {
+    final int? ds = _setup.derivingStageIndex;
+    final int last = _setup.nStages - 1;
+    final Duration? s = _stageEta();
+    final Duration? t = _totalEta();
+    final String line2 = (s == null || t == null)
+        ? 'estimating…'
+        : '~${_fmtEta(s)} to this stage · ~${_fmtEta(t)} to Stage $last';
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Row(
+          children: <Widget>[
+            const Icon(Icons.hourglass_top, size: 14),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Text(
+                'Deriving Stage $ds/$last — pass ${_setup.argon2Done}/'
+                '${_setup.argon2Total}',
+                style: _termStyle.copyWith(
+                    color: _kConsoleAccent, fontWeight: FontWeight.bold),
+              ),
+            ),
+          ],
+        ),
+        Padding(
+          padding: const EdgeInsets.only(left: 20),
+          child: Text(line2),
+        ),
+      ],
+    );
   }
 
   @override
@@ -405,6 +542,7 @@ class _SetupScreenState extends State<SetupScreen> {
                       available: _hasSession && _setup.isStageAvailable(i),
                       deriving: deriving == i,
                       progress: progress,
+                      tooltip: _tabTooltip(i),
                       // Tappable only for a stage that belongs to the active
                       // setup; everything else is inert but still shown.
                       onTap: (_hasSession && i < _setup.nStages)
@@ -933,7 +1071,9 @@ class _SetupScreenState extends State<SetupScreen> {
         _focusedField != null ? _fieldHelp(_focusedField!) : null;
     final String status = _prompt != null
         ? _prompt!.message
-        : focusHelp ?? (_consoleLog.isEmpty ? 'Ready.' : _consoleLog.last);
+        : _derivationStatus() ??
+            focusHelp ??
+            (_consoleLog.isEmpty ? 'Ready.' : _consoleLog.last);
     return Material(
       color: _kConsoleBg,
       child: DecoratedBox(
@@ -1016,7 +1156,14 @@ class _SetupScreenState extends State<SetupScreen> {
             padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
             child: _consolePromptBlock(),
           ),
-        if (_prompt == null && _focusedField != null)
+        if (_prompt == null && _setup.derivingStageIndex != null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+            child: _derivationBlock(),
+          ),
+        if (_prompt == null &&
+            _setup.derivingStageIndex == null &&
+            _focusedField != null)
           Padding(
             padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
             child: Row(
@@ -2191,10 +2338,14 @@ class _StageTab extends StatelessWidget {
     required this.available,
     required this.deriving,
     required this.progress,
+    required this.tooltip,
     required this.onTap,
   });
 
   final int index;
+
+  /// Hover label — the stage name, plus its ETA while a chain is deriving.
+  final String tooltip;
 
   /// Whether this stage belongs to the current (or slider-previewed) setup
   /// (`index < nStages`). Out-of-setup slots render as empty ghost frames.
@@ -2215,7 +2366,7 @@ class _StageTab extends StatelessWidget {
   Widget build(BuildContext context) {
     final ColorScheme scheme = Theme.of(context).colorScheme;
     return Tooltip(
-      message: index == 0 ? 'Stage 0 — salt / pepper' : 'Stage $index',
+      message: tooltip,
       child: InkWell(
         onTap: onTap,
         borderRadius: BorderRadius.circular(6),
