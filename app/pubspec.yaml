@@ -41,6 +41,10 @@ dependencies:
   # lib/src/setup/setup_crypto.dart.
   cryptography: ^2.7.0
 
+  # QR rendering for the provisional-key paper export (print, then destroy at
+  # graduation). Renders the same encrypted envelope the file save produces.
+  qr_flutter: ^4.1.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

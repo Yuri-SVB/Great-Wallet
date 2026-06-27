@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -1995,13 +1996,35 @@ class SetupController extends ChangeNotifier {
     } catch (_) {
       return 'Could not read that file.';
     }
+    return _loadVaultFromBytes(bytes, password);
+  }
+
+  /// Decrypt + restore from a pasted/scanned envelope [text] (the same string a
+  /// QR carries) under [password]. Returns null on success, else a generic
+  /// error message.
+  Future<String?> loadVaultFromText(String text, String password) async {
+    if (password.isEmpty) return 'Enter a password.';
+    final String trimmed = text.trim();
+    if (trimmed.isEmpty) return 'Paste the provisional-key text.';
+    final Uint8List bytes;
+    try {
+      bytes = Uint8List.fromList(utf8.encode(trimmed));
+    } catch (_) {
+      return 'That is not a provisional key.';
+    }
+    return _loadVaultFromBytes(bytes, password);
+  }
+
+  /// Shared decrypt + restore for file and text/QR loads. The live session is
+  /// replaced only once decryption and validation both succeed.
+  Future<String?> _loadVaultFromBytes(Uint8List bytes, String password) async {
     SetupVault vault;
     try {
       vault = await SetupCrypto.openVault(bytes, password);
     } on FormatException catch (e) {
       return e.message;
     } catch (e) {
-      return 'Could not load the file (${e.runtimeType}).';
+      return 'Could not load (${e.runtimeType}).';
     }
     try {
       restoreVault(vault);

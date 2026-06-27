@@ -1,9 +1,11 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:great_wall_ux/great_wall_ux.dart';
+import 'package:qr_flutter/qr_flutter.dart';
 
 import '../core/encoding_constants.dart';
 import '../core/great_wall_core.dart';
@@ -2159,29 +2161,39 @@ class _SetupScreenState extends State<SetupScreen> {
           ),
         ),
         const SizedBox(height: 8),
-        Row(
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          crossAxisAlignment: WrapCrossAlignment.center,
           children: <Widget>[
-            if (canSave) ...<Widget>[
+            if (canSave)
               FilledButton.icon(
                 onPressed: _vaultBusy ? null : _saveVault,
                 icon: const Icon(Icons.lock),
                 label: const Text('Save'),
               ),
-              const SizedBox(width: 8),
-            ],
+            if (canSave)
+              OutlinedButton.icon(
+                onPressed: _vaultBusy ? null : _showVaultQr,
+                icon: const Icon(Icons.qr_code_2),
+                label: const Text('QR'),
+              ),
             OutlinedButton.icon(
               onPressed: _vaultBusy ? null : _loadVault,
               icon: const Icon(Icons.lock_open),
-              label: const Text('Load'),
+              label: const Text('Load file'),
             ),
-            if (_vaultBusy) ...<Widget>[
-              const SizedBox(width: 12),
+            OutlinedButton.icon(
+              onPressed: _vaultBusy ? null : _loadVaultFromText,
+              icon: const Icon(Icons.content_paste),
+              label: const Text('Load QR/text'),
+            ),
+            if (_vaultBusy)
               const SizedBox(
                 width: 16,
                 height: 16,
                 child: CircularProgressIndicator(strokeWidth: 2),
               ),
-            ],
           ],
         ),
       ],
@@ -2230,6 +2242,159 @@ class _SetupScreenState extends State<SetupScreen> {
     _vaultPassword.clear();
     _sounds.play(UiSound.confirm);
     _toast('Setup loaded from the encrypted file.');
+  }
+
+  /// Seal the setup under the entered password and show its encrypted envelope
+  /// as a QR (and selectable text) for an air-gapped paper backup.
+  Future<void> _showVaultQr() async {
+    if (_vaultPassword.text.isEmpty) {
+      _sounds.play(UiSound.denyInput);
+      _toast('Enter a password first.');
+      return;
+    }
+    setState(() => _vaultBusy = true);
+    List<int>? bytes;
+    try {
+      bytes = await _setup.sealCurrentVault(_vaultPassword.text);
+    } catch (_) {
+      bytes = null;
+    }
+    if (!mounted) return;
+    setState(() => _vaultBusy = false);
+    if (bytes == null) {
+      _sounds.play(UiSound.denyInput);
+      _toast('This setup cannot be exported yet.');
+      return;
+    }
+    final String text = utf8.decode(bytes);
+    final QrValidationResult check = QrValidator.validate(
+      data: text,
+      version: QrVersions.auto,
+      errorCorrectionLevel: QrErrorCorrectLevel.M,
+    );
+    final bool qrFits = check.status == QrValidationStatus.valid;
+    _sounds.play(UiSound.exportOk);
+    await showDialog<void>(
+      context: context,
+      builder: (BuildContext ctx) => AlertDialog(
+        title: const Text('Provisional key — QR'),
+        content: SizedBox(
+          width: 320,
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: <Widget>[
+                if (qrFits)
+                  Container(
+                    color: Colors.white,
+                    padding: const EdgeInsets.all(12),
+                    child: QrImageView(
+                      data: text,
+                      version: QrVersions.auto,
+                      errorCorrectionLevel: QrErrorCorrectLevel.M,
+                      size: 280,
+                      backgroundColor: Colors.white,
+                    ),
+                  )
+                else
+                  const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 8),
+                    child: Text(
+                      'This setup is too large for a single QR — use Save (file) '
+                      'or copy the text below.',
+                    ),
+                  ),
+                const SizedBox(height: 12),
+                const Text(
+                  'Print and keep this OFFLINE. It is the provisional key — a '
+                  'transient crutch for the memorisation window. Destroy it at '
+                  'graduation (shred/burn, or colour in the white pixels).',
+                  style: TextStyle(fontSize: 12),
+                ),
+                const SizedBox(height: 12),
+                ConstrainedBox(
+                  constraints: const BoxConstraints(maxHeight: 96),
+                  child: SingleChildScrollView(
+                    child: SelectableText(
+                      text,
+                      style: const TextStyle(fontFamily: 'monospace', fontSize: 10),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () {
+              Clipboard.setData(ClipboardData(text: text));
+              _toast('Copied. Clipboard is not air-gapped — clear it after use.');
+            },
+            child: const Text('Copy text'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Load a setup from a pasted/scanned provisional-key envelope (the QR's text).
+  Future<void> _loadVaultFromText() async {
+    if (_vaultPassword.text.isEmpty) {
+      _sounds.play(UiSound.denyInput);
+      _toast('Enter a password first.');
+      return;
+    }
+    final TextEditingController paste = TextEditingController();
+    final bool? go = await showDialog<bool>(
+      context: context,
+      builder: (BuildContext ctx) => AlertDialog(
+        title: const Text('Load from QR / text'),
+        content: SizedBox(
+          width: 320,
+          child: TextField(
+            controller: paste,
+            maxLines: 6,
+            autocorrect: false,
+            enableSuggestions: false,
+            decoration: const InputDecoration(
+              border: OutlineInputBorder(),
+              hintText: 'Paste the provisional-key text (scan the QR first).',
+            ),
+          ),
+        ),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Load'),
+          ),
+        ],
+      ),
+    );
+    final String text = paste.text;
+    paste.dispose();
+    if (go != true || !mounted) return;
+    setState(() => _vaultBusy = true);
+    final String? err = await _setup.loadVaultFromText(text, _vaultPassword.text);
+    if (!mounted) return;
+    setState(() => _vaultBusy = false);
+    if (err != null) {
+      _sounds.play(UiSound.denyInput);
+      _toast(err);
+      return;
+    }
+    _vaultPassword.clear();
+    _sounds.play(UiSound.confirm);
+    _toast('Setup loaded from the provisional key.');
   }
 
   /// Common message tail for a point edit: what gets discarded above stage [k].
