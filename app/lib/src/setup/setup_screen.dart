@@ -248,7 +248,7 @@ class _SetupScreenState extends State<SetupScreen> {
       _toast('The $label field is not available in this mode.');
       return;
     }
-    _sounds.play(UiSound.click);
+    _sounds.play(UiSound.focus);
     node.requestFocus();
   }
 
@@ -461,8 +461,9 @@ class _SetupScreenState extends State<SetupScreen> {
     }
     // M — minimize / restore the console + stage tabs.
     if (event.logicalKey == LogicalKeyboardKey.keyM) {
-      _sounds.play(UiSound.click);
-      setState(() => _chromeMinimized = !_chromeMinimized);
+      final bool minimizing = !_chromeMinimized;
+      _sounds.play(minimizing ? UiSound.chromeDown : UiSound.chromeUp);
+      setState(() => _chromeMinimized = minimizing);
       return KeyEventResult.handled;
     }
     // C — focus the colour wheel (then ← → cycle hues).
@@ -535,7 +536,7 @@ class _SetupScreenState extends State<SetupScreen> {
   /// app is now muted — and notes the level in the console.
   void _changeVolume({required bool up}) {
     final int level = up ? _sounds.volumeUp() : _sounds.volumeDown();
-    _sounds.play(UiSound.click);
+    _sounds.play(up ? UiSound.adjustUp : UiSound.adjustDown);
     _toast(level == 0 ? 'Volume muted.' : 'Volume $level/$kMaxVolumeLevel.');
   }
 
@@ -550,7 +551,7 @@ class _SetupScreenState extends State<SetupScreen> {
   /// laggy while on (see the on-canvas marker).
   void _toggleDeepRender() {
     setState(() => _deepRender = !_deepRender);
-    _sounds.play(UiSound.click);
+    _sounds.play(_deepRender ? UiSound.modeOn : UiSound.modeOff);
     _toast(_deepRender
         ? 'Deep render ON — ${widget.core.encodeParams.maxIter} iterations '
             '(slower in voids).'
@@ -563,7 +564,7 @@ class _SetupScreenState extends State<SetupScreen> {
   /// beyond the next stage) sounds a deny cue and explains why.
   void _selectStage(int index) {
     if (_busy || !_hasSession) {
-      _sounds.play(UiSound.deny);
+      _sounds.play(UiSound.denyBlocked);
       return;
     }
     if (index == _setup.displayStageIndex) {
@@ -572,14 +573,14 @@ class _SetupScreenState extends State<SetupScreen> {
       return;
     }
     if (index < 0 || index >= _setup.nStages) {
-      _sounds.play(UiSound.deny);
+      _sounds.play(UiSound.denyBlocked);
       _toast('This setup has ${_setup.nStages - 1} stage'
           '${_setup.nStages - 1 == 1 ? '' : 's'} (0–${_setup.nStages - 1}).');
       return;
     }
     // Already derived (or the Stage-0 text) — focus it and recenter the view.
     if (_setup.isStageAvailable(index)) {
-      _sounds.play(UiSound.select);
+      _sounds.play(UiSound.navStage);
       _setup.showStage(index);
       _recenter();
       return;
@@ -587,19 +588,19 @@ class _SetupScreenState extends State<SetupScreen> {
     // Not derived yet because generation is still running in the background —
     // it will open on its own when ready.
     if (_setup.isGenerating) {
-      _sounds.play(UiSound.deny);
+      _sounds.play(UiSound.denyPending);
       _toast('Stage $index is still deriving — it will open when ready.');
       return;
     }
     // Not derived. Only the very next stage can be derived, and only once the
     // previous stage carries a selected point.
     if (index != _setup.firstUnderivedStage) {
-      _sounds.play(UiSound.deny);
+      _sounds.play(UiSound.denyBlocked);
       _toast('Recall the earlier stages first.');
       return;
     }
     if (!_setup.hasSelectedPoint(index - 1)) {
-      _sounds.play(UiSound.deny);
+      _sounds.play(UiSound.denyBlocked);
       _toast('Select your point on Stage ${index - 1} first.');
       return;
     }
@@ -616,11 +617,11 @@ class _SetupScreenState extends State<SetupScreen> {
     if (!mounted) return;
     switch (outcome) {
       case DeriveOutcome.derived:
-        _sounds.play(UiSound.select);
+        _sounds.play(UiSound.stageReady);
         _recenter(); // land centred on the fresh fractal
         _toast('Stage ${_setup.displayStageIndex} derived — recall your point.');
       case DeriveOutcome.noPriorPoint:
-        _sounds.play(UiSound.deny);
+        _sounds.play(UiSound.denyBlocked);
         _toast('Select your point on the previous stage first.');
       case DeriveOutcome.none:
       case DeriveOutcome.busy:
@@ -658,7 +659,7 @@ class _SetupScreenState extends State<SetupScreen> {
     final ({double re, double im, double leafW, double leafH})? t =
         _setup.focusTargetAt(index);
     if (t == null) {
-      _sounds.play(UiSound.deny);
+      _sounds.play(UiSound.denyBlocked);
       _toast('No point on Stage $index to focus yet.');
       return;
     }
@@ -669,7 +670,7 @@ class _SetupScreenState extends State<SetupScreen> {
     // unknown.
     final double half =
         leafMax > 0 ? leafMax / (2 * _kFocusLeafRatio) : cur.halfExtent;
-    _sounds.play(UiSound.select);
+    _sounds.play(UiSound.navZoom);
     _viewport.viewport = cur.copyWith(
       centreRe: t.re,
       centreIm: t.im,
@@ -789,17 +790,17 @@ class _SetupScreenState extends State<SetupScreen> {
     final String? msg;
     switch (outcome) {
       case SelectionOutcome.invalid:
-        _sounds.play(UiSound.deny);
+        _sounds.play(UiSound.denyMiss);
         msg = 'No encodable leaf there — zoom in and click closer.';
       case SelectionOutcome.marked:
-        _sounds.play(UiSound.select);
+        _sounds.play(UiSound.selectPoint);
         final int k = _setup.displayStageIndex;
         msg = k < _setup.nStages - 1
             ? 'Point marked on Stage $k/${_setup.nStages - 1} — '
                 'select Stage ${k + 1} to derive it.'
             : 'Point marked on Stage $k/${_setup.nStages - 1}.';
       case SelectionOutcome.complete:
-        _sounds.play(UiSound.confirm);
+        _sounds.play(UiSound.finalReady);
         msg = 'Recall complete — seed reconstructed.';
       case SelectionOutcome.needsConfirm:
       case SelectionOutcome.busy:
@@ -819,6 +820,7 @@ class _SetupScreenState extends State<SetupScreen> {
   }) {
     final Completer<bool> completer = Completer<bool>();
     _resolvePrompt(false); // decline any already-pending prompt first
+    _sounds.play(UiSound.warn); // a destructive confirmation is being raised
     setState(() {
       _chromeMinimized = false; // make sure the prompt is visible
       _prompt = _ConsolePrompt(
@@ -1336,7 +1338,7 @@ class _SetupScreenState extends State<SetupScreen> {
                     : (double v) {
                         final int next = v.round();
                         if (next == _pointStages) return;
-                        _sounds.play(UiSound.click);
+                        _sounds.play(UiSound.tickSoft);
                         setState(() => _pointStages = next);
                       },
               ),
@@ -1387,7 +1389,7 @@ class _SetupScreenState extends State<SetupScreen> {
             errorText: invalid ? 'Enter a whole number (0 or more).' : null,
           ),
           onChanged: (_) {
-            _sounds.play(UiSound.click);
+            _sounds.play(UiSound.tickSoft);
             final int? v = int.tryParse(_iterationsField.text.trim());
             if (v != null && v >= 0) _iterations = v;
             setState(() {});
@@ -1436,7 +1438,7 @@ class _SetupScreenState extends State<SetupScreen> {
                   : (double v) {
                       final Argon2Profile next = _profiles[v.round()];
                       if (next == _profile) return;
-                      _sounds.play(UiSound.click);
+                      _sounds.play(UiSound.tickSoft);
                       setState(() => _profile = next);
                     },
             ),
@@ -1477,7 +1479,7 @@ class _SetupScreenState extends State<SetupScreen> {
             ),
           ),
           onChanged: (_) {
-            _sounds.play(UiSound.click);
+            _sounds.play(UiSound.tickSoft);
             setState(() {});
           },
           onSubmitted: (_) => _submitConfig(),
@@ -1525,7 +1527,7 @@ class _SetupScreenState extends State<SetupScreen> {
             fontFamilyFallback: <String>['monospace'],
           ),
           onChanged: (_) {
-            _sounds.play(UiSound.click);
+            _sounds.play(UiSound.tickSoft);
             setState(() {});
           },
           onSubmitted: (_) => _submitConfig(),
@@ -1676,7 +1678,7 @@ class _SetupScreenState extends State<SetupScreen> {
             fontFamilyFallback: <String>['monospace'],
           ),
           onChanged: (_) {
-            _sounds.play(UiSound.click);
+            _sounds.play(UiSound.tickSoft);
             setState(() {});
           },
         ),
@@ -1706,7 +1708,7 @@ class _SetupScreenState extends State<SetupScreen> {
     }
     await Clipboard.setData(ClipboardData(text: mnemonic));
     if (!mounted) return;
-    _sounds.play(UiSound.confirm);
+    _sounds.play(UiSound.exportOk);
     // Confirmation never echoes the secret itself.
     _toast('Seed phrase copied — paste it into your wallet, then clear the '
         'clipboard.');
@@ -1740,7 +1742,7 @@ class _SetupScreenState extends State<SetupScreen> {
     final int chars = secret.length;
     await Clipboard.setData(ClipboardData(text: secret));
     if (!mounted) return;
-    _sounds.play(UiSound.confirm);
+    _sounds.play(UiSound.exportOk);
     // Confirmation never echoes the secret itself.
     _toast(full
         ? 'Full key copied ($chars chars) — paste it, then clear the clipboard.'
