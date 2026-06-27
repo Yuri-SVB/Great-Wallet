@@ -454,9 +454,10 @@ class _SetupScreenState extends State<SetupScreen> {
     if (kb.isAltPressed || kb.isControlPressed || kb.isMetaPressed) {
       return KeyEventResult.ignored;
     }
-    // H — show / hide the hotkey manual (F1 is an alias, handled globally).
+    // H — halt an in-progress derivation, behind a console confirmation (keeps
+    // the work done so far). The hotkey manual lives on F1 only now.
     if (event.logicalKey == LogicalKeyboardKey.keyH) {
-      _toggleManual();
+      _abortDerivation();
       return KeyEventResult.handled;
     }
     // M — minimize / restore the console + stage tabs.
@@ -504,12 +505,7 @@ class _SetupScreenState extends State<SetupScreen> {
       _focusField(_iterationsFocus, 'derivation steps');
       return KeyEventResult.handled;
     }
-    // A — abort an in-progress derivation, behind a console confirmation
-    // (foreground Stage-1 or background generation). TLP solving hooks in later.
-    if (event.logicalKey == LogicalKeyboardKey.keyA) {
-      _abortDerivation();
-      return KeyEventResult.handled;
-    }
+    // (A is currently unbound — freed from its old "abort" duty, now on H.)
     // Z — reset, behind a console confirmation so a stray keypress cannot wipe a
     // setup.
     if (event.logicalKey == LogicalKeyboardKey.keyZ) {
@@ -893,12 +889,12 @@ class _SetupScreenState extends State<SetupScreen> {
   static const List<String> _manualLines = <String>[
     'F1 manual · F2 Setup · F3 Train · F4 Accelerate · F5 Inherit',
     'Esc  return to the fractal (leave a text field) · Tab cycles fields',
-    'H  manual   M  minimize / restore chrome   Z  reset (asks first)',
+    'M  minimize / restore chrome   Z  reset (asks first)',
     '0–8  go to that stage (recenters); press again to zoom to its point',
     'N / I / R  New seed / Import / Recall (also focuses its input)',
     'S salt / export label · P profile · D derivation steps · C colour',
     'Enter  start (Generate / Encode / Begin recall) from a field',
-    'K  copy the master secret ("the key")    A  halt derivation (keeps progress)',
+    'K  copy the master secret ("the key")    H  halt derivation (keeps progress)',
     'V+↑/↓  sound volume (level 0 = muted)',
     'Alt+K  copy the full export digest (not just the first 32 chars)',
     'Alt+L  deep render — reveal leaves in escape-count voids (slower)',
@@ -991,7 +987,7 @@ class _SetupScreenState extends State<SetupScreen> {
                     color: _kConsoleAccent, fontWeight: FontWeight.bold)),
             const Spacer(),
             IconButton(
-              tooltip: _manualVisible ? 'Hide manual (H)' : 'Show manual (H)',
+              tooltip: _manualVisible ? 'Hide manual (F1)' : 'Show manual (F1)',
               color: _kConsoleFg,
               icon: Icon(_manualVisible ? Icons.help : Icons.help_outline),
               onPressed: () => setState(() => _manualVisible = !_manualVisible),
