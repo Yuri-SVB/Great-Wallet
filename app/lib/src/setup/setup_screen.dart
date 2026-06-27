@@ -1556,16 +1556,14 @@ class _SetupScreenState extends State<SetupScreen> {
             _busy ? null : (Set<_SourceMode> s) => _setSource(s.first),
       ),
       const SizedBox(height: 16),
-      // Keep the source-specific input the same height (the import field vs the
-      // stages slider) so switching New seed / Import / Recall does not shift the
-      // controls below it. Each builder returns a single widget.
-      SizedBox(
-        height: 56,
-        child: Align(
-          child: _source == _SourceMode.import
-              ? _mnemonicInput().single
-              : _stagesInput().single,
-        ),
+      // The source-specific input: the import builder (format toggle + field) or
+      // the stages slider. Each builder returns one or more widgets, laid out in
+      // a column so switching New seed / Import / Recall swaps the whole block.
+      Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: _source == _SourceMode.import
+            ? _mnemonicInput()
+            : _stagesInput(),
       ),
       const SizedBox(height: 16),
       ..._stage0Input(),
