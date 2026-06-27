@@ -34,6 +34,18 @@ class _SetupScreenState extends State<SetupScreen> {
       PanZoomController(initial: _initialViewport);
   final BrightnessController _brightness = BrightnessController();
 
+  /// Deep render mode (Alt+L). When on, the canvas escape-count cap rises from
+  /// [EncodingConstants.renderMaxIterFast] to the engine's encode cap, so the
+  /// rendered boundary matches where the encoder lands leaves. Off by default
+  /// and reset per stage — it is an exceptional escape hatch for the rare leaf
+  /// sitting deep in a high-escape-count void, and it makes interior rendering
+  /// laggy (hence the persistent on-canvas marker).
+  bool _deepRender = false;
+
+  /// The displayed stage last seen, so deep render can snap back to fast when
+  /// the view moves to a new stage (mirrors the per-stage brightness reset).
+  int _shownStage = 0;
+
   /// UI sound cues. The canvas plays the tap "click"; the selection-outcome
   /// cues (select / confirm / deny) are dispatched from [_onCanvasSelect],
   /// where the decode result is known.
@@ -180,9 +192,151 @@ class _SetupScreenState extends State<SetupScreen> {
 
   void _onSetupChanged() {
     if (!mounted) return;
-    // Reset brightness to its session default when a new render stage appears,
-    // honouring the "beo reset each session, never persisted" invariant.
+    // Snap deep render back to fast when the view moves to a new stage — it is a
+    // per-view escalation, not a sticky preference (mirrors the brightness
+    // per-stage reset).
+    if (_setup.displayStageIndex != _shownStage) {
+      _shownStage = _setup.displayStageIndex;
+      _deepRender = false;
+    }
+    _updateEta();
     setState(() {});
+  }
+
+  // --- Derivation ETA estimate ------------------------------------------------
+  // Timed off the controller's per-pass notifications: every point stage runs
+  // the same N passes at ~the same cost, so a running average of completed-pass
+  // durations projects both "this stage" and "to the last stage" honestly.
+
+  final Stopwatch _passWatch = Stopwatch();
+  int _etaStage = 0; // stage the watch is timing (0 = none)
+  int _etaPass0 = 0; // argon2Done when the watch started
+  int _etaLastDone = 0; // argon2Done at the last completed pass
+  int _etaLastMs = 0; // watch elapsed at that pass (avg is over completed passes)
+
+  /// Refresh the pass-timing watch from the controller's current state. Resets
+  /// when the deriving stage changes; records a timestamp when a pass completes.
+  void _updateEta() {
+    final int? ds = _setup.derivingStageIndex;
+    if (ds == null) {
+      if (_passWatch.isRunning) _passWatch.stop();
+      _passWatch.reset();
+      _etaStage = 0;
+      return;
+    }
+    if (ds != _etaStage) {
+      _etaStage = ds;
+      _etaPass0 = _setup.argon2Done;
+      _etaLastDone = _setup.argon2Done;
+      _etaLastMs = 0;
+      _passWatch
+        ..reset()
+        ..start();
+    } else if (_setup.argon2Done > _etaLastDone) {
+      _etaLastDone = _setup.argon2Done;
+      _etaLastMs = _passWatch.elapsedMilliseconds;
+    }
+  }
+
+  /// Average completed-pass duration in ms, or null until a pass has completed
+  /// since timing began ("estimating…").
+  double? _avgPassMs() {
+    final int passes = _etaLastDone - _etaPass0;
+    if (passes <= 0 || _etaLastMs <= 0) return null;
+    return _etaLastMs / passes;
+  }
+
+  /// Estimated time left on the deriving stage.
+  Duration? _stageEta() {
+    final double? avg = _avgPassMs();
+    if (avg == null) return null;
+    final int remaining =
+        (_setup.argon2Total - _setup.argon2Done).clamp(0, _setup.argon2Total);
+    return Duration(milliseconds: (remaining * avg).round());
+  }
+
+  /// Estimated time left until the batch's last stage finishes.
+  Duration? _totalEta() {
+    final double? avg = _avgPassMs();
+    final Duration? stage = _stageEta();
+    final int? ds = _setup.derivingStageIndex;
+    if (avg == null || stage == null || ds == null) return null;
+    final int last = _setup.nStages - 1;
+    final int fullAfter = (last - ds).clamp(0, last);
+    return stage +
+        Duration(milliseconds: (fullAfter * _setup.argon2Total * avg).round());
+  }
+
+  /// Estimated time until stage [k] finishes (null if it is already done or
+  /// not yet estimable).
+  Duration? _etaToStage(int k) {
+    final int? ds = _setup.derivingStageIndex;
+    final double? avg = _avgPassMs();
+    final Duration? stage = _stageEta();
+    if (ds == null || avg == null || stage == null || k < ds) return null;
+    final Duration fullStage =
+        Duration(milliseconds: (_setup.argon2Total * avg).round());
+    return stage + fullStage * (k - ds);
+  }
+
+  /// Compact duration: `4h 50m` / `33m 12s` / `45s`.
+  String _fmtEta(Duration d) {
+    if (d.inHours >= 1) return '${d.inHours}h ${d.inMinutes % 60}m';
+    if (d.inMinutes >= 1) return '${d.inMinutes}m ${d.inSeconds % 60}s';
+    return '${d.inSeconds}s';
+  }
+
+  /// A stage tab's hover label: its name, plus its own ETA while deriving.
+  String _tabTooltip(int i) {
+    final String base = i == 0 ? 'Stage 0 — salt / pepper' : 'Stage $i';
+    final Duration? eta = _etaToStage(i);
+    return eta == null ? base : '$base — ETA ~${_fmtEta(eta)}';
+  }
+
+  /// One-line derivation status for the console, or null when nothing derives.
+  String? _derivationStatus() {
+    final int? ds = _setup.derivingStageIndex;
+    if (ds == null) return null;
+    final Duration? t = _totalEta();
+    final String eta = t == null ? 'estimating…' : '~${_fmtEta(t)} left';
+    final int last = _setup.nStages - 1;
+    return 'Deriving Stage $ds/$last — pass ${_setup.argon2Done}/'
+        '${_setup.argon2Total} · $eta';
+  }
+
+  /// The two-line derivation block for the expanded console: the live pass and
+  /// the stage / batch ETAs.
+  Widget _derivationBlock() {
+    final int? ds = _setup.derivingStageIndex;
+    final int last = _setup.nStages - 1;
+    final Duration? s = _stageEta();
+    final Duration? t = _totalEta();
+    final String line2 = (s == null || t == null)
+        ? 'estimating…'
+        : '~${_fmtEta(s)} to this stage · ~${_fmtEta(t)} to Stage $last';
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Row(
+          children: <Widget>[
+            const Icon(Icons.hourglass_top, size: 14),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Text(
+                'Deriving Stage $ds/$last — pass ${_setup.argon2Done}/'
+                '${_setup.argon2Total}',
+                style: _termStyle.copyWith(
+                    color: _kConsoleAccent, fontWeight: FontWeight.bold),
+              ),
+            ),
+          ],
+        ),
+        Padding(
+          padding: const EdgeInsets.only(left: 20),
+          child: Text(line2),
+        ),
+      ],
+    );
   }
 
   @override
@@ -231,7 +385,7 @@ class _SetupScreenState extends State<SetupScreen> {
       _toast('The $label field is not available in this mode.');
       return;
     }
-    _sounds.play(UiSound.click);
+    _sounds.play(UiSound.focus);
     node.requestFocus();
   }
 
@@ -312,6 +466,14 @@ class _SetupScreenState extends State<SetupScreen> {
                             left: 12,
                             child: _Badge('Recall — click your point'),
                           ),
+                        // Deep render reminder: explains the lag while the high
+                        // escape-count cap is active, and how to turn it off.
+                        if (_deepRender && !_setup.isTextStage)
+                          const Positioned(
+                            top: 56,
+                            right: 12,
+                            child: _Badge('Deep render · Alt+L to exit'),
+                          ),
                         // Stage tabs hover over the top of the viewer with a
                         // transparent background, so they never squeeze the
                         // canvas. Hidden when the chrome is minimized.
@@ -355,6 +517,8 @@ class _SetupScreenState extends State<SetupScreen> {
   Widget _stageTabs() {
     const int maxTab = SetupController.maxPointStages; // 0..8 → nine fixed tabs
     final int current = _setup.displayStageIndex;
+    final int? deriving = _setup.derivingStageIndex;
+    final double progress = _setup.stageProgress;
     // Transparent so the tabs hover over the fractal (no opaque bar).
     return Material(
       type: MaterialType.transparency,
@@ -371,8 +535,14 @@ class _SetupScreenState extends State<SetupScreen> {
                     padding: const EdgeInsets.symmetric(horizontal: 3),
                     child: _StageTab(
                       index: i,
+                      // In the (possibly slider-previewed) setup, so it shows as
+                      // a real box rather than an out-of-setup ghost slot.
+                      inSetup: i < _setup.nStages,
                       selected: _hasSession && i == current,
                       available: _hasSession && _setup.isStageAvailable(i),
+                      deriving: deriving == i,
+                      progress: progress,
+                      tooltip: _tabTooltip(i),
                       // Tappable only for a stage that belongs to the active
                       // setup; everything else is inert but still shown.
                       onTap: (_hasSession && i < _setup.nStages)
@@ -389,27 +559,57 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   KeyEventResult _onKey(FocusNode node, KeyEvent event) {
-    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    if (event is KeyUpEvent) return KeyEventResult.ignored;
     // While a text field (salt, seed phrase, …) holds focus, let it consume the
     // keystroke — never fire canvas shortcuts. Press Esc to leave the field and
     // return to the viewer (handled globally below).
     if (_textInputHasFocus) return KeyEventResult.ignored;
-    // Scheme A: all hotkeys are single, unmodified keys, active when the viewer
-    // (not a text field) has focus. If a modifier is held, bail so OS combos are
-    // left alone.
     final HardwareKeyboard kb = HardwareKeyboard.instance;
+    // V + ↑/↓ — sound volume. A held-key chord (not a Scheme-A single key), so
+    // it is handled before the key-down-only guard below and may auto-repeat
+    // while the arrow is held, ramping the level. Level 0 is silence == muted.
+    if (kb.isLogicalKeyPressed(LogicalKeyboardKey.keyV)) {
+      if (event.logicalKey == LogicalKeyboardKey.arrowUp) {
+        _changeVolume(up: true);
+        return KeyEventResult.handled;
+      }
+      if (event.logicalKey == LogicalKeyboardKey.arrowDown) {
+        _changeVolume(up: false);
+        return KeyEventResult.handled;
+      }
+    }
+    // Scheme A: all hotkeys are single, unmodified keys, active when the viewer
+    // (not a text field) has focus, fired once per press. If a modifier is held,
+    // bail so OS combos are left alone.
+    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    // Alt hotkeys — exceptional actions that take Alt by design; handled before
+    // the modifier bail just below. Each is the rare/advanced counterpart of a
+    // plain key: Alt+L deep render (vs the fast default), Alt+K the full export
+    // digest (vs K's conventional first 32 chars).
+    if (kb.isAltPressed && !kb.isControlPressed && !kb.isMetaPressed) {
+      if (event.logicalKey == LogicalKeyboardKey.keyL) {
+        _toggleDeepRender();
+        return KeyEventResult.handled;
+      }
+      if (event.logicalKey == LogicalKeyboardKey.keyK) {
+        if (!_busy) _copyMasterSecret(full: true);
+        return KeyEventResult.handled;
+      }
+    }
     if (kb.isAltPressed || kb.isControlPressed || kb.isMetaPressed) {
       return KeyEventResult.ignored;
     }
-    // H — show / hide the hotkey manual (F1 is an alias, handled globally).
+    // H — halt an in-progress derivation, behind a console confirmation (keeps
+    // the work done so far). The hotkey manual lives on F1 only now.
     if (event.logicalKey == LogicalKeyboardKey.keyH) {
-      _toggleManual();
+      _abortDerivation();
       return KeyEventResult.handled;
     }
     // M — minimize / restore the console + stage tabs.
     if (event.logicalKey == LogicalKeyboardKey.keyM) {
-      _sounds.play(UiSound.click);
-      setState(() => _chromeMinimized = !_chromeMinimized);
+      final bool minimizing = !_chromeMinimized;
+      _sounds.play(minimizing ? UiSound.chromeDown : UiSound.chromeUp);
+      setState(() => _chromeMinimized = minimizing);
       return KeyEventResult.handled;
     }
     // C — focus the colour wheel (then ← → cycle hues).
@@ -450,12 +650,7 @@ class _SetupScreenState extends State<SetupScreen> {
       _focusField(_iterationsFocus, 'derivation steps');
       return KeyEventResult.handled;
     }
-    // A — abort an in-progress derivation, behind a console confirmation
-    // (foreground Stage-1 or background generation). TLP solving hooks in later.
-    if (event.logicalKey == LogicalKeyboardKey.keyA) {
-      _abortDerivation();
-      return KeyEventResult.handled;
-    }
+    // (A is currently unbound — freed from its old "abort" duty, now on H.)
     // Z — reset, behind a console confirmation so a stray keypress cannot wipe a
     // setup.
     if (event.logicalKey == LogicalKeyboardKey.keyZ) {
@@ -477,13 +672,40 @@ class _SetupScreenState extends State<SetupScreen> {
     return KeyEventResult.ignored;
   }
 
+  /// Step the UI sound-cue volume one level (bound to `V` + ↑/↓). Plays a cue at
+  /// the new level as feedback — silent at level 0, which *is* the cue that the
+  /// app is now muted — and notes the level in the console.
+  void _changeVolume({required bool up}) {
+    final int level = up ? _sounds.volumeUp() : _sounds.volumeDown();
+    _sounds.play(up ? UiSound.adjustUp : UiSound.adjustDown);
+    _toast(level == 0 ? 'Volume muted.' : 'Volume $level/$kMaxVolumeLevel.');
+  }
+
+  /// Current render escape-count cap: the fast default, or the engine's encode
+  /// cap when deep render (Alt+L) is on.
+  int get _renderMaxIter => _deepRender
+      ? widget.core.encodeParams.maxIter
+      : EncodingConstants.renderMaxIterFast;
+
+  /// Toggle deep render mode (Alt+L). Raises/lowers the canvas escape-count cap
+  /// so the rendered boundary matches the encoder in high escape-count voids;
+  /// laggy while on (see the on-canvas marker).
+  void _toggleDeepRender() {
+    setState(() => _deepRender = !_deepRender);
+    _sounds.play(_deepRender ? UiSound.modeOn : UiSound.modeOff);
+    _toast(_deepRender
+        ? 'Deep render ON — ${widget.core.encodeParams.maxIter} iterations '
+            '(slower in voids).'
+        : 'Deep render off — ${EncodingConstants.renderMaxIterFast} iterations.');
+  }
+
   /// Select stage [index]: focus it if it is already available (Stage 0, or a
   /// fractal already derived), or — if it is the first not-yet-derived stage —
   /// trigger that stage's derivation. Anything else (out of range, or a gap
   /// beyond the next stage) sounds a deny cue and explains why.
   void _selectStage(int index) {
     if (_busy || !_hasSession) {
-      _sounds.play(UiSound.deny);
+      _sounds.play(UiSound.denyBlocked);
       return;
     }
     if (index == _setup.displayStageIndex) {
@@ -492,14 +714,14 @@ class _SetupScreenState extends State<SetupScreen> {
       return;
     }
     if (index < 0 || index >= _setup.nStages) {
-      _sounds.play(UiSound.deny);
+      _sounds.play(UiSound.denyBlocked);
       _toast('This setup has ${_setup.nStages - 1} stage'
           '${_setup.nStages - 1 == 1 ? '' : 's'} (0–${_setup.nStages - 1}).');
       return;
     }
     // Already derived (or the Stage-0 text) — focus it and recenter the view.
     if (_setup.isStageAvailable(index)) {
-      _sounds.play(UiSound.select);
+      _sounds.play(UiSound.navStage);
       _setup.showStage(index);
       _recenter();
       return;
@@ -507,19 +729,19 @@ class _SetupScreenState extends State<SetupScreen> {
     // Not derived yet because generation is still running in the background —
     // it will open on its own when ready.
     if (_setup.isGenerating) {
-      _sounds.play(UiSound.deny);
+      _sounds.play(UiSound.denyPending);
       _toast('Stage $index is still deriving — it will open when ready.');
       return;
     }
     // Not derived. Only the very next stage can be derived, and only once the
     // previous stage carries a selected point.
     if (index != _setup.firstUnderivedStage) {
-      _sounds.play(UiSound.deny);
+      _sounds.play(UiSound.denyBlocked);
       _toast('Recall the earlier stages first.');
       return;
     }
     if (!_setup.hasSelectedPoint(index - 1)) {
-      _sounds.play(UiSound.deny);
+      _sounds.play(UiSound.denyBlocked);
       _toast('Select your point on Stage ${index - 1} first.');
       return;
     }
@@ -536,11 +758,11 @@ class _SetupScreenState extends State<SetupScreen> {
     if (!mounted) return;
     switch (outcome) {
       case DeriveOutcome.derived:
-        _sounds.play(UiSound.select);
+        _sounds.play(UiSound.stageReady);
         _recenter(); // land centred on the fresh fractal
         _toast('Stage ${_setup.displayStageIndex} derived — recall your point.');
       case DeriveOutcome.noPriorPoint:
-        _sounds.play(UiSound.deny);
+        _sounds.play(UiSound.denyBlocked);
         _toast('Select your point on the previous stage first.');
       case DeriveOutcome.none:
       case DeriveOutcome.busy:
@@ -578,7 +800,7 @@ class _SetupScreenState extends State<SetupScreen> {
     final ({double re, double im, double leafW, double leafH})? t =
         _setup.focusTargetAt(index);
     if (t == null) {
-      _sounds.play(UiSound.deny);
+      _sounds.play(UiSound.denyBlocked);
       _toast('No point on Stage $index to focus yet.');
       return;
     }
@@ -589,7 +811,7 @@ class _SetupScreenState extends State<SetupScreen> {
     // unknown.
     final double half =
         leafMax > 0 ? leafMax / (2 * _kFocusLeafRatio) : cur.halfExtent;
-    _sounds.play(UiSound.select);
+    _sounds.play(UiSound.navZoom);
     _viewport.viewport = cur.copyWith(
       centreRe: t.re,
       centreIm: t.im,
@@ -621,7 +843,7 @@ class _SetupScreenState extends State<SetupScreen> {
       stage: stage,
       stageParameters:
           stage == Stage.stage2 ? _setup.displayStageParams : null,
-      maxIterations: EncodingConstants.renderMaxIter,
+      maxIterations: _renderMaxIter,
       // Generated points (white, after Generate) plus selected points (green,
       // in select mode). Empty until there is something to show.
       overlays: _setup.overlaysForDisplayStage(),
@@ -644,7 +866,10 @@ class _SetupScreenState extends State<SetupScreen> {
     final String text = _setup.saltPepper;
     return ColoredBox(
       color: Theme.of(context).colorScheme.surface,
-      child: Center(
+      // Sit a little above centre so the derivation progress overlay (which sits
+      // a little below centre) never lands on top of this text.
+      child: Align(
+        alignment: const Alignment(0, -0.3),
         child: Padding(
           padding: const EdgeInsets.all(32),
           child: Column(
@@ -709,17 +934,17 @@ class _SetupScreenState extends State<SetupScreen> {
     final String? msg;
     switch (outcome) {
       case SelectionOutcome.invalid:
-        _sounds.play(UiSound.deny);
+        _sounds.play(UiSound.denyMiss);
         msg = 'No encodable leaf there — zoom in and click closer.';
       case SelectionOutcome.marked:
-        _sounds.play(UiSound.select);
+        _sounds.play(UiSound.selectPoint);
         final int k = _setup.displayStageIndex;
         msg = k < _setup.nStages - 1
             ? 'Point marked on Stage $k/${_setup.nStages - 1} — '
                 'select Stage ${k + 1} to derive it.'
             : 'Point marked on Stage $k/${_setup.nStages - 1}.';
       case SelectionOutcome.complete:
-        _sounds.play(UiSound.confirm);
+        _sounds.play(UiSound.finalReady);
         msg = 'Recall complete — seed reconstructed.';
       case SelectionOutcome.needsConfirm:
       case SelectionOutcome.busy:
@@ -739,6 +964,7 @@ class _SetupScreenState extends State<SetupScreen> {
   }) {
     final Completer<bool> completer = Completer<bool>();
     _resolvePrompt(false); // decline any already-pending prompt first
+    _sounds.play(UiSound.warn); // a destructive confirmation is being raised
     setState(() {
       _chromeMinimized = false; // make sure the prompt is visible
       _prompt = _ConsolePrompt(
@@ -763,43 +989,26 @@ class _SetupScreenState extends State<SetupScreen> {
       );
 
   Widget _progressOverlay() {
-    final String stageLabel =
-        'Stage ${_setup.workingStageNumber}/${_setup.nStages - 1}';
-    final String label;
-    switch (_setup.phase) {
-      case SetupPhase.deriving:
-        label = 'Deriving $stageLabel fractal (Argon2) '
-            '${_setup.argon2Done}/${_setup.argon2Total}…';
-      case SetupPhase.encoding:
-        label = 'Encoding $stageLabel point…';
-      default:
-        label = 'Working…';
-    }
     final bool deriving = _setup.phase == SetupPhase.deriving;
-    final double? progress = deriving && _setup.argon2Total > 0
-        ? _setup.argon2Done / _setup.argon2Total
-        : null; // indeterminate for the quick encode phases
+    // The stage-tab strip (above this scrim) is the progress bar and the console
+    // carries the live text + ETA, so the overlay avoids a third copy: while
+    // deriving it shows only Halt; for the brief encode (no Halt) it shows a
+    // short label so the dim is not blank.
     return ColoredBox(
       color: Colors.black54,
-      child: Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: <Widget>[
-            SizedBox(
-              width: 260,
-              child: LinearProgressIndicator(value: progress),
-            ),
-            const SizedBox(height: 16),
-            Text(label, style: const TextStyle(color: Colors.white)),
-            if (deriving) ...<Widget>[
-              const SizedBox(height: 12),
-              TextButton(
-                onPressed: _setup.requestStop,
-                child: const Text('Abort'),
+      // Sit a little below centre so it clears the Stage-0 text panel (which
+      // sits a little above centre) during the foreground Stage-1 derivation.
+      child: Align(
+        alignment: const Alignment(0, 0.3),
+        child: deriving
+            ? TextButton(
+                onPressed: _setup.halt,
+                child: const Text('Halt'),
+              )
+            : Text(
+                _setup.phase == SetupPhase.encoding ? 'Encoding…' : 'Working…',
+                style: const TextStyle(color: Colors.white),
               ),
-            ],
-          ],
-        ),
       ),
     );
   }
@@ -811,12 +1020,15 @@ class _SetupScreenState extends State<SetupScreen> {
   static const List<String> _manualLines = <String>[
     'F1 manual · F2 Setup · F3 Train · F4 Accelerate · F5 Inherit',
     'Esc  return to the fractal (leave a text field) · Tab cycles fields',
-    'H  manual   M  minimize / restore chrome   Z  reset (asks first)',
+    'M  minimize / restore chrome   Z  reset (asks first)',
     '0–8  go to that stage (recenters); press again to zoom to its point',
     'N / I / R  New seed / Import / Recall (also focuses its input)',
     'S salt / export label · P profile · D derivation steps · C colour',
     'Enter  start (Generate / Encode / Begin recall) from a field',
-    'K  copy the master secret ("the key")    A  abort a running derivation',
+    'K  copy the master secret ("the key")    H  halt derivation (keeps progress)',
+    'V+↑/↓  sound volume (level 0 = muted)',
+    'Alt+K  copy the full export digest (not just the first 32 chars)',
+    'Alt+L  deep render — reveal leaves in escape-count voids (slower)',
     'L+scroll brightness · scroll zoom · drag pan (over the canvas)',
   ];
 
@@ -845,7 +1057,9 @@ class _SetupScreenState extends State<SetupScreen> {
         _focusedField != null ? _fieldHelp(_focusedField!) : null;
     final String status = _prompt != null
         ? _prompt!.message
-        : focusHelp ?? (_consoleLog.isEmpty ? 'Ready.' : _consoleLog.last);
+        : _derivationStatus() ??
+            focusHelp ??
+            (_consoleLog.isEmpty ? 'Ready.' : _consoleLog.last);
     return Material(
       color: _kConsoleBg,
       child: DecoratedBox(
@@ -906,7 +1120,7 @@ class _SetupScreenState extends State<SetupScreen> {
                     color: _kConsoleAccent, fontWeight: FontWeight.bold)),
             const Spacer(),
             IconButton(
-              tooltip: _manualVisible ? 'Hide manual (H)' : 'Show manual (H)',
+              tooltip: _manualVisible ? 'Hide manual (F1)' : 'Show manual (F1)',
               color: _kConsoleFg,
               icon: Icon(_manualVisible ? Icons.help : Icons.help_outline),
               onPressed: () => setState(() => _manualVisible = !_manualVisible),
@@ -928,7 +1142,14 @@ class _SetupScreenState extends State<SetupScreen> {
             padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
             child: _consolePromptBlock(),
           ),
-        if (_prompt == null && _focusedField != null)
+        if (_prompt == null && _setup.derivingStageIndex != null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+            child: _derivationBlock(),
+          ),
+        if (_prompt == null &&
+            _setup.derivingStageIndex == null &&
+            _focusedField != null)
           Padding(
             padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
             child: Row(
@@ -941,7 +1162,7 @@ class _SetupScreenState extends State<SetupScreen> {
             ),
           ),
         ConstrainedBox(
-          constraints: const BoxConstraints(maxHeight: 180),
+          constraints: const BoxConstraints(maxHeight: 200),
           child: SingleChildScrollView(
             reverse: true,
             padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
@@ -954,13 +1175,39 @@ class _SetupScreenState extends State<SetupScreen> {
                   Text('Hotkeys',
                       style: _termStyle.copyWith(
                           color: _kConsoleAccent, fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 2),
-                  for (final String line in _manualLines) Text(line),
+                  const SizedBox(height: 4),
+                  _manualColumns(),
                 ],
               ],
             ),
           ),
         ),
+      ],
+    );
+  }
+
+  /// The hotkey manual laid out in two columns. The lines are short and the
+  /// console is wide, so a single column wasted the horizontal space and ran
+  /// tall enough to scroll; splitting in half roughly halves the height and
+  /// fits comfortably without scrolling.
+  Widget _manualColumns() {
+    final int half = (_manualLines.length + 1) ~/ 2;
+    Widget column(Iterable<String> lines) => Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            for (final String line in lines)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 3),
+                child: Text(line),
+              ),
+          ],
+        );
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Expanded(child: column(_manualLines.take(half))),
+        const SizedBox(width: 20),
+        Expanded(child: column(_manualLines.skip(half))),
       ],
     );
   }
@@ -1253,7 +1500,7 @@ class _SetupScreenState extends State<SetupScreen> {
                     : (double v) {
                         final int next = v.round();
                         if (next == _pointStages) return;
-                        _sounds.play(UiSound.click);
+                        _sounds.play(UiSound.tickSoft);
                         setState(() => _pointStages = next);
                       },
               ),
@@ -1304,7 +1551,7 @@ class _SetupScreenState extends State<SetupScreen> {
             errorText: invalid ? 'Enter a whole number (0 or more).' : null,
           ),
           onChanged: (_) {
-            _sounds.play(UiSound.click);
+            _sounds.play(UiSound.tickSoft);
             final int? v = int.tryParse(_iterationsField.text.trim());
             if (v != null && v >= 0) _iterations = v;
             setState(() {});
@@ -1353,7 +1600,7 @@ class _SetupScreenState extends State<SetupScreen> {
                   : (double v) {
                       final Argon2Profile next = _profiles[v.round()];
                       if (next == _profile) return;
-                      _sounds.play(UiSound.click);
+                      _sounds.play(UiSound.tickSoft);
                       setState(() => _profile = next);
                     },
             ),
@@ -1394,7 +1641,7 @@ class _SetupScreenState extends State<SetupScreen> {
             ),
           ),
           onChanged: (_) {
-            _sounds.play(UiSound.click);
+            _sounds.play(UiSound.tickSoft);
             setState(() {});
           },
           onSubmitted: (_) => _submitConfig(),
@@ -1442,7 +1689,7 @@ class _SetupScreenState extends State<SetupScreen> {
             fontFamilyFallback: <String>['monospace'],
           ),
           onChanged: (_) {
-            _sounds.play(UiSound.click);
+            _sounds.play(UiSound.tickSoft);
             setState(() {});
           },
           onSubmitted: (_) => _submitConfig(),
@@ -1536,19 +1783,12 @@ class _SetupScreenState extends State<SetupScreen> {
       return Text(err, style: const TextStyle(color: Colors.orangeAccent));
     }
     final int total = _setup.nStages - 1;
-    final double? progress =
-        _setup.argon2Total > 0 ? _setup.argon2Done / _setup.argon2Total : null;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: <Widget>[
-        Text(
-          'Deriving stage ${_setup.generatingStage}/$total in the background — '
-          'the stages already done are ready to study now.',
-          style: Theme.of(context).textTheme.bodySmall,
-        ),
-        const SizedBox(height: 8),
-        LinearProgressIndicator(value: progress),
-      ],
+    // Progress now reads off the stage-tab strip (the deriving stage's box
+    // fills), so this notice is just the explanatory line.
+    return Text(
+      'Deriving stage ${_setup.generatingStage}/$total in the background — '
+      'the stages already done are ready to study now.',
+      style: Theme.of(context).textTheme.bodySmall,
     );
   }
 
@@ -1593,7 +1833,7 @@ class _SetupScreenState extends State<SetupScreen> {
             fontFamilyFallback: <String>['monospace'],
           ),
           onChanged: (_) {
-            _sounds.play(UiSound.click);
+            _sounds.play(UiSound.tickSoft);
             setState(() {});
           },
         ),
@@ -1623,13 +1863,16 @@ class _SetupScreenState extends State<SetupScreen> {
     }
     await Clipboard.setData(ClipboardData(text: mnemonic));
     if (!mounted) return;
-    _sounds.play(UiSound.confirm);
+    _sounds.play(UiSound.exportOk);
     // Confirmation never echoes the secret itself.
     _toast('Seed phrase copied — paste it into your wallet, then clear the '
         'clipboard.');
   }
 
-  Future<void> _copyMasterSecret() async {
+  /// Export and copy the master secret for the focused stage. `K` copies the
+  /// conventional first-32-chars view; `Alt+K` ([full]) copies the entire digest
+  /// (all [MasterSecret.outputBytes] as hex).
+  Future<void> _copyMasterSecret({bool full = false}) async {
     if (_exporting) return;
     final int idx = _setup.displayStageIndex;
     setState(() => _exporting = true);
@@ -1641,6 +1884,7 @@ class _SetupScreenState extends State<SetupScreen> {
       secret = await _setup.exportMasterSecret(
         stageIndex: idx,
         label: _exportLabel.text,
+        full: full,
       );
     } finally {
       if (mounted) setState(() => _exporting = false);
@@ -1650,11 +1894,14 @@ class _SetupScreenState extends State<SetupScreen> {
       _sounds.play(UiSound.deny);
       return;
     }
+    final int chars = secret.length;
     await Clipboard.setData(ClipboardData(text: secret));
     if (!mounted) return;
-    _sounds.play(UiSound.confirm);
+    _sounds.play(UiSound.exportOk);
     // Confirmation never echoes the secret itself.
-    _toast('Key copied — paste it, then clear the clipboard.');
+    _toast(full
+        ? 'Full key copied ($chars chars) — paste it, then clear the clipboard.'
+        : 'Key copied — paste it, then clear the clipboard.');
   }
 
   /// Append a line to the console log (the app's toast surface).
@@ -1837,21 +2084,24 @@ class _SetupScreenState extends State<SetupScreen> {
     if (ok && mounted) _reset();
   }
 
-  /// Abort a running derivation behind a console confirmation (the A hotkey).
-  /// No-op with a deny cue when nothing is deriving.
+  /// Halt a running derivation behind a console confirmation (the A hotkey).
+  /// Kills only the current Argon2 pass; every completed intermediary digest of
+  /// the working stage is kept, as are the stages already derived. No-op with a
+  /// deny cue when nothing is deriving.
   Future<void> _abortDerivation() async {
     if (!_busy && !_setup.isGenerating) {
       _sounds.play(UiSound.deny);
       return;
     }
     final bool ok = await _consoleConfirm(
-      message: 'Abort the running derivation? Progress on the current stage is '
-          'lost (stages already derived are kept).',
-      confirmLabel: 'Abort',
+      message: 'Halt the running derivation? Only the current pass (~1 min) is '
+          'dropped — every digest completed so far on this stage is kept, and '
+          'the stages already derived stay usable.',
+      confirmLabel: 'Halt',
     );
     if (ok && mounted && (_busy || _setup.isGenerating)) {
-      _setup.requestStop();
-      _toast('Derivation aborted.');
+      _setup.halt();
+      _toast('Halted — progress kept.');
     }
   }
 
@@ -1906,6 +2156,11 @@ class _HueWheelControl extends StatelessWidget {
 
   KeyEventResult _onKey(FocusNode node, KeyEvent event) {
     if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    // Let the V + ↑/↓ volume chord bubble up to the screen handler instead of
+    // cycling the hue, so volume works the same while the wheel holds focus.
+    if (HardwareKeyboard.instance.isLogicalKeyPressed(LogicalKeyboardKey.keyV)) {
+      return KeyEventResult.ignored;
+    }
     final LogicalKeyboardKey k = event.logicalKey;
     if (k == LogicalKeyboardKey.arrowRight || k == LogicalKeyboardKey.arrowUp) {
       _step(1);
@@ -2054,58 +2309,150 @@ final Map<LogicalKeyboardKey, int> _digitKeys = <LogicalKeyboardKey, int>{
 
 /// One numbered stage tab on the upper edge. Highlighted when it is the stage
 /// under focus, dimmed and non-interactive when not yet reachable.
+/// One stage's box in the top strip. The strip doubles as the derivation
+/// progress bar: each box is a stage-sized segment, so filled boxes are elapsed
+/// work and empty ones are still to come.
+///
+/// States: **available/selected** (lit) · **deriving** (filling left→right) ·
+/// **pending** — requested but not derived (grey) · **ghost** — a slot outside
+/// the current setup (a hollow frame the chain can still grow into).
 class _StageTab extends StatelessWidget {
   const _StageTab({
     required this.index,
+    required this.inSetup,
     required this.selected,
     required this.available,
+    required this.deriving,
+    required this.progress,
+    required this.tooltip,
     required this.onTap,
   });
 
   final int index;
+
+  /// Hover label — the stage name, plus its ETA while a chain is deriving.
+  final String tooltip;
+
+  /// Whether this stage belongs to the current (or slider-previewed) setup
+  /// (`index < nStages`). Out-of-setup slots render as empty ghost frames.
+  final bool inSetup;
+
   final bool selected;
   final bool available;
 
-  /// `null` when the tab is not reachable (outside the setup, or before a
-  /// session): the tab stays visible but greyed out and non-interactive.
+  /// This stage's fractal is deriving right now: the box fills as [progress].
+  final bool deriving;
+
+  /// Fill fraction in [0, 1] while [deriving].
+  final double progress;
+
   final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {
     final ColorScheme scheme = Theme.of(context).colorScheme;
+    return Tooltip(
+      message: tooltip,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(6),
+        child: deriving ? _derivingFace(scheme) : _restingFace(scheme),
+      ),
+    );
+  }
+
+  /// A non-deriving box: ghost (out of setup), pending (grey), or lit
+  /// (available / selected).
+  Widget _restingFace(ColorScheme scheme) {
+    if (!inSetup) {
+      // Ghost: a faint hollow slot — an open quest the chain can grow into.
+      return _box(
+        bg: Colors.transparent,
+        border: scheme.outlineVariant.withOpacity(0.25),
+        fg: scheme.onSurface.withOpacity(0.15),
+        bold: false,
+      );
+    }
     final Color fg = selected
         ? scheme.onPrimary
         : available
             ? scheme.onSurface
-            : scheme.onSurface.withOpacity(0.35);
-    final Color bg = selected ? scheme.primary : Colors.transparent;
-    return Tooltip(
-      message: index == 0 ? 'Stage 0 — salt / pepper' : 'Stage $index',
-      child: InkWell(
-        onTap: onTap,
+            : scheme.onSurface.withOpacity(0.35); // pending (requested) grey
+    return _box(
+      bg: selected ? scheme.primary : Colors.transparent,
+      border: selected ? scheme.primary : scheme.outlineVariant,
+      fg: fg,
+      bold: selected,
+    );
+  }
+
+  /// The deriving wipe: the left [progress] fraction shows the lit face (dark
+  /// digit on the light-blue fill); the rest shows the unlit face (light digit
+  /// on transparent). Painting the digit on both faces and clipping at the fill
+  /// edge keeps it readable across the boundary — a late-90s scan-line reveal.
+  Widget _derivingFace(ColorScheme scheme) {
+    return Stack(
+      fit: StackFit.expand,
+      children: <Widget>[
+        _box(
+          bg: Colors.transparent,
+          border: scheme.primary,
+          fg: scheme.onSurface,
+          bold: false,
+        ),
+        ClipRect(
+          clipper: _LeftFractionClipper(progress),
+          child: _box(
+            bg: scheme.primary,
+            border: scheme.primary,
+            fg: scheme.onPrimary,
+            bold: false,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _box({
+    required Color bg,
+    required Color border,
+    required Color fg,
+    required bool bold,
+  }) {
+    return Container(
+      alignment: Alignment.center,
+      decoration: BoxDecoration(
+        color: bg,
         borderRadius: BorderRadius.circular(6),
-        child: Container(
-          alignment: Alignment.center,
-          decoration: BoxDecoration(
-            color: bg,
-            borderRadius: BorderRadius.circular(6),
-            border: Border.all(
-              color: selected ? scheme.primary : scheme.outlineVariant,
-            ),
-          ),
-          child: Text(
-            '$index',
-            style: TextStyle(
-              color: fg,
-              fontWeight: selected ? FontWeight.bold : FontWeight.normal,
-              fontFamily: GreatWallTypography.fontFamily,
-              fontFamilyFallback: const <String>['monospace'],
-            ),
-          ),
+        border: Border.all(color: border),
+      ),
+      child: Text(
+        '$index',
+        style: TextStyle(
+          color: fg,
+          fontWeight: bold ? FontWeight.bold : FontWeight.normal,
+          fontFamily: GreatWallTypography.fontFamily,
+          fontFamilyFallback: const <String>['monospace'],
         ),
       ),
     );
   }
+}
+
+/// Clips a child to its left [fraction] of width — the moving edge of a stage
+/// tab's derivation fill.
+class _LeftFractionClipper extends CustomClipper<Rect> {
+  const _LeftFractionClipper(this.fraction);
+
+  final double fraction;
+
+  @override
+  Rect getClip(Size size) =>
+      Rect.fromLTWH(0, 0, size.width * fraction.clamp(0.0, 1.0), size.height);
+
+  @override
+  bool shouldReclip(_LeftFractionClipper oldClipper) =>
+      oldClipper.fraction != fraction;
 }
 
 /// Constrains the Stage-0 salt/pepper to a safe, reproducible ASCII subset:

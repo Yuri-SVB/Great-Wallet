@@ -126,6 +126,18 @@ class MasterSecret {
     return hex.length > displayChars ? hex.substring(0, displayChars) : hex;
   }
 
+  /// The **entire** Argon2id master-secret [raw] output as hex (all
+  /// [outputBytes] → `2 × outputBytes` characters). The advanced counterpart to
+  /// [displayHex]: copied by `Alt+K` for callers that want the full digest, not
+  /// just the conventional first [displayChars].
+  static String fullHex(Uint8List raw) {
+    final StringBuffer sb = StringBuffer();
+    for (int i = 0; i < raw.length; i++) {
+      sb.write(raw[i].toRadixString(16).padLeft(2, '0'));
+    }
+    return sb.toString();
+  }
+
   static void _writeText(BytesBuilder out, String text) {
     // Canonical [A-Z0-9-] is pure ASCII, so the code units are the bytes.
     final List<int> bytes = text.codeUnits;

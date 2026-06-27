@@ -89,6 +89,19 @@ void main() {
       expect(MasterSecret.displayHex(raw).length, MasterSecret.displayChars);
     });
   });
+
+  group('MasterSecret.fullHex', () {
+    test('is the entire output as hex (2 chars per byte)', () {
+      final Uint8List raw = Uint8List(MasterSecret.outputBytes);
+      for (int i = 0; i < 16; i++) {
+        raw[i] = i; // 0x00..0x0f, rest stay zero
+      }
+      final String full = MasterSecret.fullHex(raw);
+      expect(full.length, MasterSecret.outputBytes * 2);
+      expect(full.startsWith('000102030405060708090a0b0c0d0e0f'), isTrue);
+      expect(full, _hex(raw));
+    });
+  });
 }
 
 String _hex(Uint8List bytes) {

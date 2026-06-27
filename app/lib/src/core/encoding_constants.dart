@@ -28,13 +28,20 @@ class EncodingConstants {
   static const int canonicalP = 0;
   static const int canonicalQ = 0;
 
-  /// Escape-iteration cap for *rendering* the fractal canvas (constants.py:
-  /// `DEFAULT_MAX_ITER`). This is a purely visual knob — it colours pixels and
-  /// does not affect which bits a point encodes to — so it is deliberately
-  /// decoupled from, and far smaller than, the engine's encode/decode cap
-  /// (`encodeParams.maxIter`, 1024). It is not a determinism-critical protocol
-  /// value, so it stays app-side.
-  static const int renderMaxIter = 64;
+  /// Default escape-iteration cap for *rendering* the fractal canvas
+  /// (constants.py: `DEFAULT_MAX_ITER`). This is a purely visual knob — it
+  /// colours pixels and does not affect which bits a point encodes to — and is
+  /// not a determinism-critical protocol value, so it stays app-side.
+  ///
+  /// Kept small (fast): rendering cost scales with the cap for non-escaping
+  /// (interior) pixels, so a high cap makes zooming into high-escape-count voids
+  /// laggy. The rare leaf that sits deep in such a void — invisible at this cap
+  /// because the void renders as featureless — is reached with the `Alt+L` deep
+  /// render toggle, which raises the cap to the engine's encode cap
+  /// (`GreatWallCore.encodeParams.maxIter`) so the rendered boundary matches
+  /// where the encoder actually lands leaves. The deep value is read from the
+  /// engine at runtime, never mirrored here, so it can never drift from it.
+  static const int renderMaxIterFast = 64;
 
   /// Number of fractal point stages for an entropy width: one 32-bit point per
   /// fractal (`entropy_bits / BITS_PER_POINT`). The text Stage 0 is separate and

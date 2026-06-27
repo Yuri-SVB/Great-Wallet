@@ -143,11 +143,18 @@ class GreatWallCore {
   /// of waiting out the run. (A single in-flight native pass cannot be
   /// preempted mid-call, but cancel stops listening and tears the isolate down
   /// at once; granularity is one pass, as in the reference.)
+  ///
+  /// [onCheckpoint] is invoked after **every** completed pass with that pass's
+  /// intermediary digest (the chain so far). A caller that keeps the latest can
+  /// therefore halt mid-stage — kill the in-flight pass via [Argon2Job.cancel] —
+  /// and lose only that single pass, not the whole stage's accumulated work. The
+  /// digest is coercion-relevant; the caller owns what it keeps and must wipe it.
   Future<Argon2Job> startStageDerivation(
     Uint8List input, {
     required int iterations,
     Argon2Profile profile = Argon2Profile.basic,
     void Function(int completed, int total)? onProgress,
+    void Function(int completed, Uint8List digest)? onCheckpoint,
   }) async {
     final int total = iterations < 1 ? 1 : iterations;
 
@@ -156,6 +163,7 @@ class GreatWallCore {
       final int n = input.length < 32 ? input.length : 32;
       final Uint8List digest = Uint8List(32)..setRange(0, n, input);
       onProgress?.call(1, total);
+      onCheckpoint?.call(1, digest);
       final StageReservoirs r = StageReservoirs.fromArgon2Digest(digest);
       digest.fillRange(0, digest.length, 0);
       return Argon2Job(Future<StageReservoirs>.value(r), () {});
@@ -173,13 +181,20 @@ class GreatWallCore {
     void cleanup() => port.close();
 
     port.listen((dynamic msg) {
-      if (msg is int) {
-        onProgress?.call(msg, total);
-      } else if (msg is Uint8List) {
-        final StageReservoirs r = StageReservoirs.fromArgon2Digest(msg);
-        msg.fillRange(0, msg.length, 0);
-        if (!completer.isCompleted) completer.complete(r);
-        cleanup();
+      if (msg is (int, Uint8List)) {
+        // One completed pass: its index and the resulting intermediary digest.
+        // Hand the checkpoint to the caller (it copies what it needs to keep,
+        // so a halt mid-stage preserves the digests done so far), then wipe our
+        // copy. The final pass (completed == total) also resolves the result.
+        final (int completed, Uint8List digest) = msg;
+        onProgress?.call(completed, total);
+        onCheckpoint?.call(completed, digest);
+        if (completed >= total) {
+          final StageReservoirs r = StageReservoirs.fromArgon2Digest(digest);
+          if (!completer.isCompleted) completer.complete(r);
+          cleanup();
+        }
+        digest.fillRange(0, digest.length, 0);
       } else {
         // Error payload (from the isolate body or onError): [message, stack].
         if (!completer.isCompleted) {
@@ -241,19 +256,22 @@ void _argon2idMasterIsolateEntry((SendPort, Uint8List, int) args) {
   send.send(out);
 }
 
-/// Worker-isolate entry: open the engine, run the Argon2 loop, stream progress
-/// (`int` after each pass) and finally the 32-byte digest (`Uint8List`).
+/// Worker-isolate entry: open the engine, run the Argon2 loop, and after each
+/// pass stream back a `(passIndex, digest)` record. Streaming every
+/// intermediary digest (not just the count) is what lets a halt mid-stage keep
+/// the work done so far: the main isolate retains the latest one, so killing
+/// the in-flight pass costs at most that single pass. The last record
+/// (`passIndex == iterations`) carries the final digest.
 void _argon2IsolateEntry((SendPort, Uint8List, int, int) args) {
   final (SendPort send, Uint8List input, int iterations, int profileValue) = args;
   final Argon2Profile profile = Argon2Profile.values[profileValue];
   final GreatWallCoreBindings bindings = GreatWallCoreBindings.open();
   Uint8List digest = bindings.argon2Single(input, profile);
-  send.send(1);
+  send.send((1, digest));
   for (int i = 1; i < iterations; i++) {
     digest = bindings.argon2Single(digest, profile);
-    send.send(i + 1);
+    send.send((i + 1, digest));
   }
-  send.send(digest);
 }
 
 /// A running stage derivation: its [result], and a [cancel] that kills the
