@@ -1056,6 +1056,21 @@ class _SetupScreenState extends State<SetupScreen> {
   /// than an abstract flat grey; it stays unsaturated enough to sit neutrally
   /// against all six fractal hue schemes. See great-wall-ux/SCOPE.md
   /// §"Console palette" for the rationale.
+  /// Memorise-mode guidance. Lives in the console (not the control panel) so the
+  /// panel stays a stable, compact action surface.
+  static const String _memoriseHelp =
+      'Memorise your points. Stage 0 is the salt/pepper you entered; each later '
+      'stage is its own fractal carrying one point. Study the marked location on '
+      'every fractal until you can find it from memory, then finish — the seed '
+      'is then held only in your recall.';
+
+  /// Whether the user is studying a settled generated/imported setup (the state
+  /// the [_memoriseHelp] guidance applies to).
+  bool get _inMemoriseStudy =>
+      _setup.phase == SetupPhase.memorise &&
+      !_setup.isGenerating &&
+      !_setup.isRecallSession;
+
   static const Color _kConsoleBg = Color(0xE6131519); // ~90% opaque gunmetal
   static const Color _kConsoleFg = Color(0xFFE9EDF2); // cool off-white
   static const Color _kConsoleAccent = Color(0xFFB8C2CC); // brighter, same cast
@@ -1077,6 +1092,7 @@ class _SetupScreenState extends State<SetupScreen> {
         ? _prompt!.message
         : _derivationStatus() ??
             focusHelp ??
+            (_inMemoriseStudy ? _memoriseHelp : null) ??
             (_consoleLog.isEmpty ? 'Ready.' : _consoleLog.last);
     return Material(
       color: _kConsoleBg,
@@ -1176,6 +1192,23 @@ class _SetupScreenState extends State<SetupScreen> {
                 const Icon(Icons.info_outline, size: 14),
                 const SizedBox(width: 6),
                 Expanded(child: Text(_fieldHelp(_focusedField!))),
+              ],
+            ),
+          ),
+        // Memorise guidance — relocated here from the control panel so the panel
+        // stays stable. Shown only when nothing more urgent is.
+        if (_prompt == null &&
+            _setup.derivingStageIndex == null &&
+            _focusedField == null &&
+            _inMemoriseStudy)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                const Icon(Icons.menu_book, size: 14),
+                const SizedBox(width: 6),
+                Expanded(child: Text(_memoriseHelp)),
               ],
             ),
           ),
@@ -1749,20 +1782,9 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   List<Widget> _memoriseControls() {
+    // The "what to do" guidance lives in the console now (see _memoriseHelp), so
+    // the panel stays a stable, compact action surface.
     return <Widget>[
-      const Text('Memorise your points'),
-      const SizedBox(height: 16),
-      // Stage 0 is the salt/pepper text (no point); stages 1..N-1 are the
-      // chain-derived fractals, one point each. Step through with the 0–8 tab
-      // bar or number keys (press a stage again to zoom to its point).
-      Text(
-        'Stage 0 is the salt/pepper you entered; each later stage is its own '
-        'fractal carrying one point. Study the marked location on every fractal '
-        'until you can find it from memory. When confident, finish — the seed '
-        'is then held only in your recall.',
-        style: Theme.of(context).textTheme.bodySmall,
-      ),
-      const SizedBox(height: 16),
       FilledButton(
         onPressed: () {
           _sounds.play(UiSound.confirm);
