@@ -721,7 +721,10 @@ class _SetupScreenState extends State<SetupScreen> {
     final String text = _setup.saltPepper;
     return ColoredBox(
       color: Theme.of(context).colorScheme.surface,
-      child: Center(
+      // Sit a little above centre so the derivation progress overlay (which sits
+      // a little below centre) never lands on top of this text.
+      child: Align(
+        alignment: const Alignment(0, -0.3),
         child: Padding(
           padding: const EdgeInsets.all(32),
           child: Column(
@@ -859,7 +862,10 @@ class _SetupScreenState extends State<SetupScreen> {
         : null; // indeterminate for the quick encode phases
     return ColoredBox(
       color: Colors.black54,
-      child: Center(
+      // Sit a little below centre so it clears the Stage-0 text panel (which
+      // sits a little above centre) during the foreground Stage-1 derivation.
+      child: Align(
+        alignment: const Alignment(0, 0.3),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: <Widget>[
