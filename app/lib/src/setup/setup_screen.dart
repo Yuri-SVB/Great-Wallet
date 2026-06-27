@@ -624,6 +624,11 @@ class _SetupScreenState extends State<SetupScreen> {
       setState(() => _stageBarHidden = hiding);
       return KeyEventResult.handled;
     }
+    // X — exclude the displayed stage and every stage above it (truncate).
+    if (event.logicalKey == LogicalKeyboardKey.keyX) {
+      _truncate();
+      return KeyEventResult.handled;
+    }
     // C — focus the colour wheel (then ← → cycle hues).
     if (event.logicalKey == LogicalKeyboardKey.keyC) {
       _focusField(_hueFocus, 'colour wheel');
@@ -1038,6 +1043,7 @@ class _SetupScreenState extends State<SetupScreen> {
     'S salt / export label · P profile · D derivation steps · C colour',
     'Enter  start (Generate / Encode / Begin recall) from a field',
     'K  copy the master secret ("the key")    H  halt derivation (keeps progress)',
+    'X  exclude this stage & above (shorten the setup)',
     'V+↑/↓  sound volume (level 0 = muted)',
     'Alt+K  copy the full export digest (not just the first 32 chars)',
     'Alt+L  deep render — reveal leaves in escape-count voids (slower)',
@@ -1844,7 +1850,7 @@ class _SetupScreenState extends State<SetupScreen> {
     _setup.resumeDerivation();
   }
 
-  /// Truncation control: delete the displayed stage and every stage above it.
+  /// Truncation control: exclude the displayed stage and every stage above it.
   Widget _truncateControl() {
     final int k = _setup.displayStageIndex;
     final int last = _setup.nStages - 1;
@@ -1853,8 +1859,8 @@ class _SetupScreenState extends State<SetupScreen> {
       children: <Widget>[
         Text(
           k == last
-              ? 'Shorten the setup by deleting this last stage.'
-              : 'Shorten the setup: delete Stage $k and every stage above it '
+              ? 'Shorten the setup by excluding this last stage.'
+              : 'Shorten the setup: exclude Stage $k and every stage above it '
                   '(Stages $k–$last), keeping Stages 0–${k - 1}.',
           style: Theme.of(context).textTheme.bodySmall,
         ),
@@ -1862,31 +1868,37 @@ class _SetupScreenState extends State<SetupScreen> {
         OutlinedButton.icon(
           onPressed: _truncate,
           icon: const Icon(Icons.content_cut),
-          label: Text('Delete Stage $k & above'),
+          label: Text('Exclude Stage $k & above (X)'),
         ),
       ],
     );
   }
 
+  /// Exclude the displayed stage and every stage above it. Bound to the `X`
+  /// hotkey and the truncate button; denies when the displayed stage cannot be
+  /// truncated (Stage 0, or a not-yet-settled / recall setup).
   Future<void> _truncate() async {
+    if (!_setup.canTruncateFromDisplayed) {
+      _sounds.play(UiSound.deny);
+      return;
+    }
     final int k = _setup.displayStageIndex;
-    if (k < 1) return;
     final int last = _setup.nStages - 1;
     final String kept =
         k == 1 ? 'only the salt/pepper text' : 'Stages 0–${k - 1}';
     final bool ok = await _consoleConfirm(
       message: k == last
-          ? 'Delete Stage $k? The setup keeps $kept. This cannot be undone.'
-          : 'Delete Stages $k–$last? The setup keeps $kept. '
+          ? 'Exclude Stage $k? The setup keeps $kept. This cannot be undone.'
+          : 'Exclude Stages $k–$last? The setup keeps $kept. '
               'This cannot be undone.',
-      confirmLabel: 'Delete',
+      confirmLabel: 'Exclude',
     );
     if (!ok || !mounted) return;
     _setup.truncateFrom(k);
     _sounds.play(UiSound.undo);
     _toast(k - 1 >= 1
-        ? 'Truncated — setup now has ${k - 1} stage${k - 1 == 1 ? '' : 's'}.'
-        : 'Truncated to the salt/pepper text (no point stages).');
+        ? 'Excluded — setup now has ${k - 1} stage${k - 1 == 1 ? '' : 's'}.'
+        : 'Excluded down to the salt/pepper text (no point stages).');
   }
 
   /// The blind BIP39 seed-phrase copy. Operates on whatever has been recalled so
