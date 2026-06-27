@@ -1573,6 +1573,47 @@ class SetupController extends ChangeNotifier {
     });
   }
 
+  /// Expand to [targetPointStages] from blind uppercase hex (the I edit): `8·m`
+  /// digits for the `m` new stages. Returns an error message on invalid input
+  /// (no content echoed), else null (the background expansion has started).
+  String? expandImportedHex(int targetPointStages, String hex) {
+    if (!canExpand) return 'This setup cannot be expanded.';
+    final int m = targetPointStages - firstExpansionStage + 1;
+    if (m < 1) return 'Nothing to add.';
+    List<int> bits;
+    try {
+      bits = Entropy.hexToBits(hex);
+    } on FormatException {
+      return 'Invalid hex — use uppercase 0–9 A–F.';
+    }
+    if (bits.length != m * EncodingConstants.bitsPerPoint) {
+      Entropy.wipe(bits);
+      return '$m new stage${m == 1 ? '' : 's'} need ${8 * m} hex digits.';
+    }
+    expandImported(targetPointStages, bits);
+    return null;
+  }
+
+  /// Expand to [targetPointStages] from `3·m` BIP39 words for the `m` new stages
+  /// (the I edit). Returns an error message on invalid input, else null.
+  String? expandImportedWords(int targetPointStages, String words) {
+    if (!canExpand) return 'This setup cannot be expanded.';
+    final int m = targetPointStages - firstExpansionStage + 1;
+    if (m < 1) return 'Nothing to add.';
+    List<int> bits;
+    try {
+      bits = Bip39.mnemonicToEntropyBits(words);
+    } on FormatException catch (e) {
+      return e.message;
+    }
+    if (bits.length != m * EncodingConstants.bitsPerPoint) {
+      Entropy.wipe(bits);
+      return '$m new stage${m == 1 ? '' : 's'} need ${3 * m} words.';
+    }
+    expandImported(targetPointStages, bits);
+    return null;
+  }
+
   /// Begin a **manual** expansion to [targetPointStages]: grow the setup with
   /// empty (underived, point-less) stages. The new stages then derive one at a
   /// time through the ordinary interactive walk — select the next stage to derive
