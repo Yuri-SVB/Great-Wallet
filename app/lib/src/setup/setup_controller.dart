@@ -245,6 +245,17 @@ class SetupController extends ChangeNotifier {
   bool get canResume =>
       _halted != null && _entropyBits != null && !_isRecallSession;
 
+  /// Whether the displayed stage can be truncated from (it and every stage above
+  /// it deleted): a settled generated/imported setup (memorise, not deriving or
+  /// generating) showing a point stage (≥ 1). Recall reconstructs a fixed setup,
+  /// so it is not editable this way.
+  bool get canTruncateFromDisplayed =>
+      _phase == SetupPhase.memorise &&
+      !_isGenerating &&
+      !_isRecallSession &&
+      _displayStageIndex >= 1 &&
+      _displayStageIndex < nStages;
+
   /// The stage index a halt left paused (0 when none).
   int get haltedStage => _halted?.stage ?? 0;
 
@@ -1197,6 +1208,56 @@ class SetupController extends ChangeNotifier {
     final List<int>? rec = _recalledEntropyBits;
     if (rec != null) Entropy.wipe(rec);
     _recalledEntropyBits = null;
+  }
+
+  /// Truncate the setup: delete stage [k] and every stage above it, leaving a
+  /// setup of stages `0..k-1`. The kept prefix is fully derived, so the entropy
+  /// root and any halt stash (which belong to the removed tail) are wiped. The
+  /// display lands on the new last stage. No-op unless
+  /// [canTruncateFromDisplayed] applies (so `k >= 1`).
+  void truncateFrom(int k) {
+    if (_phase != SetupPhase.memorise ||
+        _isGenerating ||
+        _isRecallSession ||
+        k < 1 ||
+        k >= nStages) {
+      return;
+    }
+    // Wipe the secret material of every removed stage.
+    for (int j = k; j < nStages; j++) {
+      _reservoirs[j]?.clear();
+      final List<int>? chunk = _selectedChunks[j];
+      if (chunk != null) Entropy.wipe(chunk);
+    }
+    // The entropy root and any halt stash describe the (now-deleted) tail; the
+    // kept prefix is already derived, so neither is needed.
+    if (_halted != null) {
+      _halted!.wipe();
+      _halted = null;
+    }
+    if (_entropyBits != null) {
+      Entropy.wipe(_entropyBits!);
+      _entropyBits = null;
+    }
+    final List<int>? rec = _recalledEntropyBits;
+    if (rec != null) Entropy.wipe(rec);
+    _recalledEntropyBits = null;
+
+    // Shrink to k stages (k-1 point stages) and trim every per-stage array.
+    final int n = k;
+    _points = _points.sublist(0, n);
+    _reservoirs = _reservoirs.sublist(0, n);
+    _stageRecords = _stageRecords.sublist(0, n);
+    _leafRects = _leafRects.sublist(0, n);
+    _selectedChunks = _selectedChunks.sublist(0, n);
+    _selectedMarks = _selectedMarks.sublist(0, n);
+    _stageCount = n;
+    _pointStages = n - 1;
+    _generationError = null;
+
+    // Land on the new last stage (Stage 0 if truncated to text-only).
+    _applyDisplayStage(n - 1);
+    notifyListeners();
   }
 
   /// True once every point stage (1..N) carries a selected point.

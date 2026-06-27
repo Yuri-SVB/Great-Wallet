@@ -1285,6 +1285,12 @@ class _SetupScreenState extends State<SetupScreen> {
             _haltedNotice(),
           ],
 
+          // Truncation: delete the displayed stage and every stage above it.
+          if (_setup.canTruncateFromDisplayed) ...<Widget>[
+            const Divider(height: 32),
+            _truncateControl(),
+          ],
+
           // The cold-start recall walk shows a per-stage hint while the user
           // clicks their points back. There is no select-mode toggle: a recall
           // session selects implicitly (the answer is hidden), and a
@@ -1824,6 +1830,51 @@ class _SetupScreenState extends State<SetupScreen> {
   void _resumeDerivation() {
     _sounds.play(UiSound.select);
     _setup.resumeDerivation();
+  }
+
+  /// Truncation control: delete the displayed stage and every stage above it.
+  Widget _truncateControl() {
+    final int k = _setup.displayStageIndex;
+    final int last = _setup.nStages - 1;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Text(
+          k == last
+              ? 'Shorten the setup by deleting this last stage.'
+              : 'Shorten the setup: delete Stage $k and every stage above it '
+                  '(Stages $k–$last), keeping Stages 0–${k - 1}.',
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
+        const SizedBox(height: 8),
+        OutlinedButton.icon(
+          onPressed: _truncate,
+          icon: const Icon(Icons.content_cut),
+          label: Text('Delete Stage $k & above'),
+        ),
+      ],
+    );
+  }
+
+  Future<void> _truncate() async {
+    final int k = _setup.displayStageIndex;
+    if (k < 1) return;
+    final int last = _setup.nStages - 1;
+    final String kept =
+        k == 1 ? 'only the salt/pepper text' : 'Stages 0–${k - 1}';
+    final bool ok = await _consoleConfirm(
+      message: k == last
+          ? 'Delete Stage $k? The setup keeps $kept. This cannot be undone.'
+          : 'Delete Stages $k–$last? The setup keeps $kept. '
+              'This cannot be undone.',
+      confirmLabel: 'Delete',
+    );
+    if (!ok || !mounted) return;
+    _setup.truncateFrom(k);
+    _sounds.play(UiSound.undo);
+    _toast(k - 1 >= 1
+        ? 'Truncated — setup now has ${k - 1} stage${k - 1 == 1 ? '' : 's'}.'
+        : 'Truncated to the salt/pepper text (no point stages).');
   }
 
   /// The blind BIP39 seed-phrase copy. Operates on whatever has been recalled so
