@@ -162,6 +162,13 @@ class _SetupScreenState extends State<SetupScreen> {
   /// (the `R` edit): the next canvas click sets the new point. Esc cancels.
   bool _editPointMode = false;
 
+  /// The stage whose point is being replaced by import (the `I` edit), or null
+  /// when the inline bit editor is closed.
+  int? _pointImportStage;
+  _ImportFormat _pointImportFmt = _ImportFormat.words;
+  final TextEditingController _pointImport = TextEditingController();
+  final FocusNode _pointImportFocus = FocusNode(debugLabel: 'point-import');
+
   /// True while a master-secret export's Argon2id pass is in flight, so a second
   /// tap on "Copy master secret" is ignored until it finishes.
   bool _exporting = false;
@@ -208,6 +215,10 @@ class _SetupScreenState extends State<SetupScreen> {
       _shownStage = _setup.displayStageIndex;
       _deepRender = false;
       _editPointMode = false; // cancel an armed point edit if the view moved
+      if (_pointImportStage != null) {
+        _pointImport.clear();
+        _pointImportStage = null;
+      }
     }
     _updateEta();
     setState(() {});
@@ -363,6 +374,8 @@ class _SetupScreenState extends State<SetupScreen> {
     _iterationsField.dispose();
     _exportLabel.dispose();
     _mnemonic.dispose();
+    _pointImport.dispose();
+    _pointImportFocus.dispose();
     _stage0.dispose();
     _hotkeys.dispose();
     _stage0Focus.dispose();
@@ -663,7 +676,11 @@ class _SetupScreenState extends State<SetupScreen> {
       return KeyEventResult.handled;
     }
     if (event.logicalKey == LogicalKeyboardKey.keyI) {
-      _setSource(_SourceMode.import, focusInput: true);
+      if (_setup.canEditCurrentPoint) {
+        _changePointImport();
+      } else {
+        _setSource(_SourceMode.import, focusInput: true);
+      }
       return KeyEventResult.handled;
     }
     if (event.logicalKey == LogicalKeyboardKey.keyR) {
@@ -1084,7 +1101,7 @@ class _SetupScreenState extends State<SetupScreen> {
     'Esc  return to the fractal (leave a text field) · Tab cycles fields',
     'M  console   9  stage bar   Z  reset (asks first)',
     '0–8  go to that stage (recenters); press again to zoom to its point',
-    'N / I / R  New seed / Import / Recall (config) · on a stage: N/R change its point',
+    'N / I / R  New seed / Import / Recall (config) · on a stage: change its point',
     'S salt / export label · P profile · D derivation steps · C colour',
     'Enter  start (Generate / Encode / Begin recall) from a field',
     'K  copy the master secret ("the key")    H  halt derivation (keeps progress)',
@@ -1379,6 +1396,12 @@ class _SetupScreenState extends State<SetupScreen> {
           if (_setup.canResume) ...<Widget>[
             const Divider(height: 32),
             _haltedNotice(),
+          ],
+
+          // Inline editor for replacing the displayed stage's point by import.
+          if (_pointImportStage != null) ...<Widget>[
+            const Divider(height: 32),
+            _pointImportEditor(),
           ],
 
           // Truncation: delete the displayed stage and every stage above it.
@@ -1983,6 +2006,125 @@ class _SetupScreenState extends State<SetupScreen> {
     setState(() => _editPointMode = true);
     _sounds.play(UiSound.click);
     _toast('Click the new point on Stage $k (Esc to cancel).');
+  }
+
+  /// Open the inline bit editor to replace the displayed stage's point by import
+  /// (the `I` edit): 8 hex digits or 3 words → 32 bits.
+  Future<void> _changePointImport() async {
+    final int k = _setup.displayStageIndex;
+    final bool ok = await _consoleConfirm(
+      message: 'Replace Stage $k\'s point by import${_editTail(k)}? '
+          'This cannot be undone.',
+      confirmLabel: 'Import',
+    );
+    if (!ok || !mounted || !_setup.canEditCurrentPoint) return;
+    _pointImport.clear();
+    setState(() => _pointImportStage = k);
+    _pointImportFocus.requestFocus();
+  }
+
+  void _applyPointImport() {
+    final String text = _pointImport.text;
+    final String? err = _pointImportFmt == _ImportFormat.hex
+        ? _setup.changeCurrentPointHex(text)
+        : _setup.changeCurrentPointWords(text);
+    if (err != null) {
+      _sounds.play(UiSound.denyInput);
+      _toast(err);
+      return;
+    }
+    final int k = _setup.displayStageIndex;
+    _cancelPointImport();
+    _sounds.play(UiSound.changePoint);
+    _toast('Stage $k point changed.');
+  }
+
+  void _cancelPointImport() {
+    _pointImport.clear();
+    setState(() => _pointImportStage = null);
+    _focusViewer();
+  }
+
+  /// The inline editor shown while replacing a stage's point by import.
+  Widget _pointImportEditor() {
+    final int k = _pointImportStage!;
+    final bool hex = _pointImportFmt == _ImportFormat.hex;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Text('Import a new point for Stage $k${_editTail(k)}.',
+            style: Theme.of(context).textTheme.bodySmall),
+        const SizedBox(height: 8),
+        SegmentedButton<_ImportFormat>(
+          segments: const <ButtonSegment<_ImportFormat>>[
+            ButtonSegment<_ImportFormat>(
+                value: _ImportFormat.words, label: Text('3 words')),
+            ButtonSegment<_ImportFormat>(
+                value: _ImportFormat.hex, label: Text('8 hex')),
+          ],
+          selected: <_ImportFormat>{_pointImportFmt},
+          showSelectedIcon: false,
+          style: const ButtonStyle(visualDensity: VisualDensity.compact),
+          onSelectionChanged: (Set<_ImportFormat> s) {
+            setState(() {
+              _pointImportFmt = s.first;
+              _pointImport.clear();
+            });
+          },
+        ),
+        const SizedBox(height: 8),
+        TextField(
+          controller: _pointImport,
+          focusNode: _pointImportFocus,
+          obscureText: _mnemonicHidden,
+          maxLines: 1,
+          autocorrect: false,
+          enableSuggestions: false,
+          inputFormatters: hex
+              ? <TextInputFormatter>[
+                  FilteringTextInputFormatter.allow(RegExp(r'[0-9a-fA-F ]')),
+                  TextInputFormatter.withFunction(
+                    (TextEditingValue o, TextEditingValue n) =>
+                        n.copyWith(text: n.text.toUpperCase()),
+                  ),
+                ]
+              : null,
+          decoration: InputDecoration(
+            isDense: true,
+            border: const OutlineInputBorder(),
+            labelText: hex ? '8 hex digits' : '3 words',
+            hintText: hex ? 'A1B2C3D4' : 'word word word',
+            suffixIcon: IconButton(
+              tooltip: _mnemonicHidden ? 'Show' : 'Hide',
+              icon: Icon(
+                _mnemonicHidden ? Icons.visibility : Icons.visibility_off,
+              ),
+              onPressed: () =>
+                  setState(() => _mnemonicHidden = !_mnemonicHidden),
+            ),
+          ),
+          onChanged: (_) {
+            _sounds.play(UiSound.tickSoft);
+            setState(() {});
+          },
+          onSubmitted: (_) => _applyPointImport(),
+        ),
+        const SizedBox(height: 8),
+        Row(
+          children: <Widget>[
+            FilledButton(
+              onPressed: _applyPointImport,
+              child: const Text('Apply'),
+            ),
+            const SizedBox(width: 8),
+            OutlinedButton(
+              onPressed: _cancelPointImport,
+              child: const Text('Cancel'),
+            ),
+          ],
+        ),
+      ],
+    );
   }
 
   /// Truncation control: exclude the displayed stage and every stage above it.

@@ -1259,6 +1259,47 @@ class SetupController extends ChangeNotifier {
     return SelectionOutcome.marked;
   }
 
+  /// Change the displayed stage's point from blind uppercase hex (the `I` edit):
+  /// exactly 8 digits = 32 bits. Returns an error message on invalid input (no
+  /// content echoed), else null on success.
+  String? changeCurrentPointHex(String hex) {
+    final int k = _displayStageIndex;
+    if (!_canEditPointAt(k)) return 'This stage cannot be edited.';
+    List<int> bits;
+    try {
+      bits = Entropy.hexToBits(hex);
+    } on FormatException {
+      return 'Invalid hex — use uppercase 0–9 A–F.';
+    }
+    if (bits.length != EncodingConstants.bitsPerPoint) {
+      Entropy.wipe(bits);
+      return 'A point is 32 bits — exactly 8 hex digits.';
+    }
+    _setStagePoint(k, bits);
+    Entropy.wipe(bits);
+    return null;
+  }
+
+  /// Change the displayed stage's point from 3 BIP39 words (32 bits + checksum).
+  /// Returns an error message on invalid input, else null on success.
+  String? changeCurrentPointWords(String words) {
+    final int k = _displayStageIndex;
+    if (!_canEditPointAt(k)) return 'This stage cannot be edited.';
+    List<int> bits;
+    try {
+      bits = Bip39.mnemonicToEntropyBits(words);
+    } on FormatException catch (e) {
+      return e.message;
+    }
+    if (bits.length != EncodingConstants.bitsPerPoint) {
+      Entropy.wipe(bits);
+      return 'A point is one stage — exactly 3 words.';
+    }
+    _setStagePoint(k, bits);
+    Entropy.wipe(bits);
+    return null;
+  }
+
   /// Derive the **first not-yet-derived** stage's fractal — the explicit step
   /// that advances the chain, triggered by selecting that stage. The fractal is
   /// the memory-hard hash of the Stage-0 text plus every preceding point
