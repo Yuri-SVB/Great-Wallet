@@ -1279,6 +1279,12 @@ class _SetupScreenState extends State<SetupScreen> {
             _generationNotice(),
           ],
 
+          // A halted generation: its progress is preserved; offer to resume.
+          if (_setup.canResume) ...<Widget>[
+            const Divider(height: 32),
+            _haltedNotice(),
+          ],
+
           // The cold-start recall walk shows a per-stage hint while the user
           // clicks their points back. There is no select-mode toggle: a recall
           // session selects implicitly (the answer is hidden), and a
@@ -1790,6 +1796,34 @@ class _SetupScreenState extends State<SetupScreen> {
       'the stages already done are ready to study now.',
       style: Theme.of(context).textTheme.bodySmall,
     );
+  }
+
+  /// The halted-derivation notice: how much of the stalled stage was preserved,
+  /// and a button to resume it (and the rest of the chain).
+  Widget _haltedNotice() {
+    final int k = _setup.haltedStage;
+    final int last = _setup.nStages - 1;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Text(
+          'Halted at Stage $k/$last — pass ${_setup.haltedPass}/'
+          '${_setup.haltedTotal} kept. Resume picks up where it stopped.',
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
+        const SizedBox(height: 8),
+        FilledButton.icon(
+          onPressed: _resumeDerivation,
+          icon: const Icon(Icons.play_arrow),
+          label: Text('Resume Stage $k'),
+        ),
+      ],
+    );
+  }
+
+  void _resumeDerivation() {
+    _sounds.play(UiSound.select);
+    _setup.resumeDerivation();
   }
 
   /// The blind BIP39 seed-phrase copy. Operates on whatever has been recalled so
