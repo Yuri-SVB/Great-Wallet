@@ -389,15 +389,29 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   KeyEventResult _onKey(FocusNode node, KeyEvent event) {
-    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    if (event is KeyUpEvent) return KeyEventResult.ignored;
     // While a text field (salt, seed phrase, …) holds focus, let it consume the
     // keystroke — never fire canvas shortcuts. Press Esc to leave the field and
     // return to the viewer (handled globally below).
     if (_textInputHasFocus) return KeyEventResult.ignored;
-    // Scheme A: all hotkeys are single, unmodified keys, active when the viewer
-    // (not a text field) has focus. If a modifier is held, bail so OS combos are
-    // left alone.
     final HardwareKeyboard kb = HardwareKeyboard.instance;
+    // V + ↑/↓ — sound volume. A held-key chord (not a Scheme-A single key), so
+    // it is handled before the key-down-only guard below and may auto-repeat
+    // while the arrow is held, ramping the level. Level 0 is silence == muted.
+    if (kb.isLogicalKeyPressed(LogicalKeyboardKey.keyV)) {
+      if (event.logicalKey == LogicalKeyboardKey.arrowUp) {
+        _changeVolume(up: true);
+        return KeyEventResult.handled;
+      }
+      if (event.logicalKey == LogicalKeyboardKey.arrowDown) {
+        _changeVolume(up: false);
+        return KeyEventResult.handled;
+      }
+    }
+    // Scheme A: all hotkeys are single, unmodified keys, active when the viewer
+    // (not a text field) has focus, fired once per press. If a modifier is held,
+    // bail so OS combos are left alone.
+    if (event is! KeyDownEvent) return KeyEventResult.ignored;
     if (kb.isAltPressed || kb.isControlPressed || kb.isMetaPressed) {
       return KeyEventResult.ignored;
     }
@@ -475,6 +489,15 @@ class _SetupScreenState extends State<SetupScreen> {
       return KeyEventResult.handled;
     }
     return KeyEventResult.ignored;
+  }
+
+  /// Step the UI sound-cue volume one level (bound to `V` + ↑/↓). Plays a cue at
+  /// the new level as feedback — silent at level 0, which *is* the cue that the
+  /// app is now muted — and notes the level in the console.
+  void _changeVolume({required bool up}) {
+    final int level = up ? _sounds.volumeUp() : _sounds.volumeDown();
+    _sounds.play(UiSound.click);
+    _toast(level == 0 ? 'Volume muted.' : 'Volume $level/$kMaxVolumeLevel.');
   }
 
   /// Select stage [index]: focus it if it is already available (Stage 0, or a
@@ -817,6 +840,7 @@ class _SetupScreenState extends State<SetupScreen> {
     'S salt / export label · P profile · D derivation steps · C colour',
     'Enter  start (Generate / Encode / Begin recall) from a field',
     'K  copy the master secret ("the key")    A  abort a running derivation',
+    'V+↑/↓  sound volume (level 0 = muted)',
     'L+scroll brightness · scroll zoom · drag pan (over the canvas)',
   ];
 
@@ -1906,6 +1930,11 @@ class _HueWheelControl extends StatelessWidget {
 
   KeyEventResult _onKey(FocusNode node, KeyEvent event) {
     if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    // Let the V + ↑/↓ volume chord bubble up to the screen handler instead of
+    // cycling the hue, so volume works the same while the wheel holds focus.
+    if (HardwareKeyboard.instance.isLogicalKeyPressed(LogicalKeyboardKey.keyV)) {
+      return KeyEventResult.ignored;
+    }
     final LogicalKeyboardKey k = event.logicalKey;
     if (k == LogicalKeyboardKey.arrowRight || k == LogicalKeyboardKey.arrowUp) {
       _step(1);
