@@ -34,6 +34,18 @@ class _SetupScreenState extends State<SetupScreen> {
       PanZoomController(initial: _initialViewport);
   final BrightnessController _brightness = BrightnessController();
 
+  /// Deep render mode (Alt+L). When on, the canvas escape-count cap rises from
+  /// [EncodingConstants.renderMaxIterFast] to the engine's encode cap, so the
+  /// rendered boundary matches where the encoder lands leaves. Off by default
+  /// and reset per stage — it is an exceptional escape hatch for the rare leaf
+  /// sitting deep in a high-escape-count void, and it makes interior rendering
+  /// laggy (hence the persistent on-canvas marker).
+  bool _deepRender = false;
+
+  /// The displayed stage last seen, so deep render can snap back to fast when
+  /// the view moves to a new stage (mirrors the per-stage brightness reset).
+  int _shownStage = 0;
+
   /// UI sound cues. The canvas plays the tap "click"; the selection-outcome
   /// cues (select / confirm / deny) are dispatched from [_onCanvasSelect],
   /// where the decode result is known.
@@ -180,8 +192,13 @@ class _SetupScreenState extends State<SetupScreen> {
 
   void _onSetupChanged() {
     if (!mounted) return;
-    // Reset brightness to its session default when a new render stage appears,
-    // honouring the "beo reset each session, never persisted" invariant.
+    // Snap deep render back to fast when the view moves to a new stage — it is a
+    // per-view escalation, not a sticky preference (mirrors the brightness
+    // per-stage reset).
+    if (_setup.displayStageIndex != _shownStage) {
+      _shownStage = _setup.displayStageIndex;
+      _deepRender = false;
+    }
     setState(() {});
   }
 
@@ -312,6 +329,14 @@ class _SetupScreenState extends State<SetupScreen> {
                             left: 12,
                             child: _Badge('Recall — click your point'),
                           ),
+                        // Deep render reminder: explains the lag while the high
+                        // escape-count cap is active, and how to turn it off.
+                        if (_deepRender && !_setup.isTextStage)
+                          const Positioned(
+                            top: 56,
+                            right: 12,
+                            child: _Badge('Deep render · Alt+L to exit'),
+                          ),
                         // Stage tabs hover over the top of the viewer with a
                         // transparent background, so they never squeeze the
                         // canvas. Hidden when the chrome is minimized.
@@ -412,6 +437,16 @@ class _SetupScreenState extends State<SetupScreen> {
     // (not a text field) has focus, fired once per press. If a modifier is held,
     // bail so OS combos are left alone.
     if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    // Alt+L — toggle deep render. Exceptionally takes Alt (the only Alt hotkey)
+    // because it is a rare escape hatch for high escape-count voids; handled
+    // before the modifier bail just below.
+    if (kb.isAltPressed &&
+        !kb.isControlPressed &&
+        !kb.isMetaPressed &&
+        event.logicalKey == LogicalKeyboardKey.keyL) {
+      _toggleDeepRender();
+      return KeyEventResult.handled;
+    }
     if (kb.isAltPressed || kb.isControlPressed || kb.isMetaPressed) {
       return KeyEventResult.ignored;
     }
@@ -498,6 +533,24 @@ class _SetupScreenState extends State<SetupScreen> {
     final int level = up ? _sounds.volumeUp() : _sounds.volumeDown();
     _sounds.play(UiSound.click);
     _toast(level == 0 ? 'Volume muted.' : 'Volume $level/$kMaxVolumeLevel.');
+  }
+
+  /// Current render escape-count cap: the fast default, or the engine's encode
+  /// cap when deep render (Alt+L) is on.
+  int get _renderMaxIter => _deepRender
+      ? widget.core.encodeParams.maxIter
+      : EncodingConstants.renderMaxIterFast;
+
+  /// Toggle deep render mode (Alt+L). Raises/lowers the canvas escape-count cap
+  /// so the rendered boundary matches the encoder in high escape-count voids;
+  /// laggy while on (see the on-canvas marker).
+  void _toggleDeepRender() {
+    setState(() => _deepRender = !_deepRender);
+    _sounds.play(UiSound.click);
+    _toast(_deepRender
+        ? 'Deep render ON — ${widget.core.encodeParams.maxIter} iterations '
+            '(slower in voids).'
+        : 'Deep render off — ${EncodingConstants.renderMaxIterFast} iterations.');
   }
 
   /// Select stage [index]: focus it if it is already available (Stage 0, or a
@@ -644,7 +697,7 @@ class _SetupScreenState extends State<SetupScreen> {
       stage: stage,
       stageParameters:
           stage == Stage.stage2 ? _setup.displayStageParams : null,
-      maxIterations: EncodingConstants.renderMaxIter,
+      maxIterations: _renderMaxIter,
       // Generated points (white, after Generate) plus selected points (green,
       // in select mode). Empty until there is something to show.
       overlays: _setup.overlaysForDisplayStage(),
@@ -841,6 +894,7 @@ class _SetupScreenState extends State<SetupScreen> {
     'Enter  start (Generate / Encode / Begin recall) from a field',
     'K  copy the master secret ("the key")    A  abort a running derivation',
     'V+↑/↓  sound volume (level 0 = muted)',
+    'Alt+L  deep render — reveal leaves in escape-count voids (slower)',
     'L+scroll brightness · scroll zoom · drag pan (over the canvas)',
   ];
 
