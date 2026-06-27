@@ -35,6 +35,12 @@ dependencies:
   # great-wall-core/burning_ship/argon2_pipeline.py: derive_stage2_params().
   crypto: ^3.0.3
 
+  # AES-256-GCM (NIST SP 800-38D) + Argon2id (RFC 9106) for the provisional-key
+  # vault's password encryption. Deliberately conventional, vetted primitives;
+  # pure-Dart implementations, so no platform plugins are required. See
+  # lib/src/setup/setup_crypto.dart.
+  cryptography: ^2.7.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
@@ -13,6 +14,8 @@ import '../core/master_secret.dart';
 import '../ffi/core_bindings.dart';
 import '../ffi/fixed.dart';
 import '../core/stage_params.dart';
+import 'setup_crypto.dart';
+import 'setup_vault.dart';
 
 /// Phases of the Setup flow.
 ///
@@ -1859,6 +1862,155 @@ class SetupController extends ChangeNotifier {
     final List<int>? bits = _expandImportBits;
     if (bits != null) Entropy.wipe(bits);
     _expandImportBits = null;
+  }
+
+  // --- Provisional-key vault: export / restore the setup ---------------------
+
+  /// Whether the current setup can be exported as a [SetupVault]: a settled
+  /// setup (not mid-derivation) where every point stage carries a point. The
+  /// recall-complete state qualifies too (its points are reconstructed).
+  bool get canExportVault {
+    if (_isGenerating || _stageCount <= 1) return false;
+    for (int k = 1; k < nStages; k++) {
+      if (k >= _stageRecords.length || _stageRecords[k] == null) return false;
+    }
+    return true;
+  }
+
+  /// Capture the current setup as a [SetupVault] (the provisional key). Each
+  /// stage contributes its `(o, p, q)` and the centre of its point's leaf — one
+  /// coordinate inside the leaf, which decodes back to the same point and bits.
+  /// Encoded and manually-selected points are captured identically (both
+  /// populate [StageRecord]). The caller owns the returned vault and MUST wipe
+  /// it; it must only be persisted encrypted (never in plaintext).
+  SetupVault exportVault() {
+    final List<VaultStage> stages = <VaultStage>[];
+    for (int k = 1; k < nStages; k++) {
+      final StageRecord r = _stageRecords[k]!;
+      stages.add(VaultStage(
+        o: r.o,
+        p: r.p,
+        q: r.q,
+        reRaw: r.leafReRaw,
+        imRaw: r.leafImRaw,
+      ));
+    }
+    return SetupVault(
+      text: _chainText,
+      iterations: _iterations,
+      profile: _profile,
+      stages: stages,
+    );
+  }
+
+  /// Rebuild a full, settled (memorise) setup from a [SetupVault] — no Argon2:
+  /// each stage's `(o, p, q)` + leaf coordinate is decoded back into its fractal
+  /// reservoirs and encoded point. Every stage is validated before the current
+  /// session is torn down, so a corrupt vault (e.g. a wrong-password decrypt)
+  /// throws a generic [FormatException] and leaves the live session untouched.
+  void restoreVault(SetupVault vault) {
+    final int n = vault.stages.length + 1; // + the Stage-0 text stage
+    // Decode + validate every stage first, into locals.
+    final List<StageReservoirs?> reservoirs = <StageReservoirs?>[null];
+    final List<EncodedPoint?> points = <EncodedPoint?>[null];
+    final List<StageRecord?> records = <StageRecord?>[null];
+    final List<FixedRect?> leafRects = <FixedRect?>[null];
+    for (final VaultStage s in vault.stages) {
+      final CoreDecodeResult d = _core.decodePoint(
+        reRaw: s.reRaw,
+        imRaw: s.imRaw,
+        o: s.o,
+        p: s.p,
+        q: s.q,
+      );
+      if (!d.valid) throw const FormatException('bad vault');
+      reservoirs.add(StageReservoirs(o: s.o, p: s.p, q: s.q));
+      points.add(EncodedPoint(reRaw: s.reRaw, imRaw: s.imRaw, leafRect: d.leafRect));
+      leafRects.add(d.leafRect);
+      final ({int re, int im}) leaf = MasterSecret.leafCentreRaw(d.leafRect);
+      records.add(StageRecord(
+        o: s.o,
+        p: s.p,
+        q: s.q,
+        leafReRaw: leaf.re,
+        leafImRaw: leaf.im,
+      ));
+    }
+
+    // All stages decoded — safe to replace the current session.
+    _resetSecrets();
+    _chainText = vault.text;
+    _iterations = vault.iterations;
+    _profile = vault.profile;
+    _stageCount = n;
+    _pointStages = n - 1;
+    _points = points;
+    _reservoirs = reservoirs;
+    _stageRecords = records;
+    _leafRects = leafRects;
+    _selectedChunks = List<List<int>?>.filled(n, null);
+    _selectedMarks = List<({double re, double im})?>.filled(n, null);
+    _isRecallSession = false;
+    _applyDisplayStage(1); // land on the first point stage
+    _setPhase(SetupPhase.memorise);
+  }
+
+  /// Encrypt the current setup into a provisional-key envelope (AES-256-GCM /
+  /// Argon2id) under [password] — the only out-of-memory form, shared by the
+  /// file save and the QR export. Returns the ciphertext, or null if the setup
+  /// is not exportable. The plaintext vault is wiped before returning.
+  Future<Uint8List?> sealCurrentVault(String password) async {
+    if (!canExportVault) return null;
+    final SetupVault vault = exportVault();
+    try {
+      return await SetupCrypto.sealVault(vault, password);
+    } finally {
+      vault.wipe();
+    }
+  }
+
+  /// Save the current setup to [path], encrypted under [password]. Returns null
+  /// on success, else a generic error message (never echoes secret content).
+  Future<String?> saveVaultToFile(String path, String password) async {
+    if (!canExportVault) return 'This setup cannot be saved yet.';
+    if (password.isEmpty) return 'Enter a password.';
+    try {
+      final Uint8List? bytes = await sealCurrentVault(password);
+      if (bytes == null) return 'This setup cannot be saved yet.';
+      await File(path).writeAsBytes(bytes, flush: true);
+      return null;
+    } catch (e) {
+      return 'Could not save the file (${e.runtimeType}).';
+    }
+  }
+
+  /// Decrypt + restore a setup from the encrypted file at [path] under
+  /// [password]. The live session is replaced only once decryption and
+  /// validation succeed. Returns null on success, else a generic error message.
+  Future<String?> loadVaultFromFile(String path, String password) async {
+    if (password.isEmpty) return 'Enter a password.';
+    Uint8List bytes;
+    try {
+      bytes = await File(path).readAsBytes();
+    } catch (_) {
+      return 'Could not read that file.';
+    }
+    SetupVault vault;
+    try {
+      vault = await SetupCrypto.openVault(bytes, password);
+    } on FormatException catch (e) {
+      return e.message;
+    } catch (e) {
+      return 'Could not load the file (${e.runtimeType}).';
+    }
+    try {
+      restoreVault(vault);
+      return null;
+    } on FormatException catch (e) {
+      return e.message;
+    } finally {
+      vault.wipe();
+    }
   }
 
   /// True once every point stage (1..N) carries a selected point.
