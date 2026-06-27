@@ -170,14 +170,60 @@ class GreatWallCore {
     }
 
     final ReceivePort port = ReceivePort();
-    final Completer<StageReservoirs> completer = Completer<StageReservoirs>();
     final Isolate isolate = await Isolate.spawn<(SendPort, Uint8List, int, int)>(
       _argon2IsolateEntry,
       (port.sendPort, input, iterations, profile.value),
       onError: port.sendPort,
       errorsAreFatal: true,
     );
+    return _listenChain(port, isolate, total, onProgress, onCheckpoint);
+  }
 
+  /// Resume a halted stage's Argon2 chain from a preserved intermediary
+  /// [fromDigest] (its result after [fromPass] passes), running the remaining
+  /// `iterations - fromPass` passes and completing with the stage reservoirs.
+  /// The counterpart to [startStageDerivation] for the halt/resume flow; same
+  /// streaming, checkpointing, and cancel semantics.
+  Future<Argon2Job> resumeStageDerivation(
+    Uint8List fromDigest, {
+    required int fromPass,
+    required int iterations,
+    Argon2Profile profile = Argon2Profile.basic,
+    void Function(int completed, int total)? onProgress,
+    void Function(int completed, Uint8List digest)? onCheckpoint,
+  }) async {
+    final int total = iterations < 1 ? 1 : iterations;
+
+    if (fromPass >= total) {
+      // Nothing left to do — the stash already holds the final digest.
+      onProgress?.call(total, total);
+      onCheckpoint?.call(total, fromDigest);
+      final StageReservoirs r = StageReservoirs.fromArgon2Digest(fromDigest);
+      return Argon2Job(Future<StageReservoirs>.value(r), () {});
+    }
+
+    final ReceivePort port = ReceivePort();
+    final Isolate isolate =
+        await Isolate.spawn<(SendPort, Uint8List, int, int, int)>(
+      _argon2ResumeIsolateEntry,
+      (port.sendPort, fromDigest, fromPass, iterations, profile.value),
+      onError: port.sendPort,
+      errorsAreFatal: true,
+    );
+    return _listenChain(port, isolate, total, onProgress, onCheckpoint);
+  }
+
+  /// Wire a spawned chain isolate's `(pass, digest)` stream to an [Argon2Job]:
+  /// forward progress + checkpoints, resolve on the final pass, and expose a
+  /// cancel that kills the isolate. Shared by start and resume.
+  Argon2Job _listenChain(
+    ReceivePort port,
+    Isolate isolate,
+    int total,
+    void Function(int completed, int total)? onProgress,
+    void Function(int completed, Uint8List digest)? onCheckpoint,
+  ) {
+    final Completer<StageReservoirs> completer = Completer<StageReservoirs>();
     void cleanup() => port.close();
 
     port.listen((dynamic msg) {
@@ -269,6 +315,22 @@ void _argon2IsolateEntry((SendPort, Uint8List, int, int) args) {
   Uint8List digest = bindings.argon2Single(input, profile);
   send.send((1, digest));
   for (int i = 1; i < iterations; i++) {
+    digest = bindings.argon2Single(digest, profile);
+    send.send((i + 1, digest));
+  }
+}
+
+/// Worker-isolate entry for a resumed stage: continue the chain from
+/// [fromDigest] (the result after [fromPass] passes) for the remaining passes,
+/// streaming each `(pass, digest)` exactly like [_argon2IsolateEntry] so the
+/// pass indices stay continuous with what the halt had already counted.
+void _argon2ResumeIsolateEntry((SendPort, Uint8List, int, int, int) args) {
+  final (SendPort send, Uint8List fromDigest, int fromPass, int iterations,
+      int profileValue) = args;
+  final Argon2Profile profile = Argon2Profile.values[profileValue];
+  final GreatWallCoreBindings bindings = GreatWallCoreBindings.open();
+  Uint8List digest = fromDigest;
+  for (int i = fromPass; i < iterations; i++) {
     digest = bindings.argon2Single(digest, profile);
     send.send((i + 1, digest));
   }

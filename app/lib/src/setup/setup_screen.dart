@@ -176,9 +176,13 @@ class _SetupScreenState extends State<SetupScreen> {
   /// Whether the hotkey manual is shown in the console. On at launch.
   bool _manualVisible = true;
 
-  /// Whether the console and the stage-tab bar are collapsed to a thin status
-  /// line. Toggled by the console's button (and, later, a hotkey).
+  /// Whether the console is collapsed to a thin status line (the `M` hotkey /
+  /// the console's button). Independent of the stage-tab bar.
   bool _chromeMinimized = false;
+
+  /// Whether the stage-tab bar is hidden (the `9` hotkey). Independent of the
+  /// console so the user can dismiss either alone.
+  bool _stageBarHidden = false;
 
   /// A confirmation awaiting an inline answer in the console (replaces modal
   /// dialogs). Resolved by the console's action buttons.
@@ -476,8 +480,8 @@ class _SetupScreenState extends State<SetupScreen> {
                           ),
                         // Stage tabs hover over the top of the viewer with a
                         // transparent background, so they never squeeze the
-                        // canvas. Hidden when the chrome is minimized.
-                        if (!_chromeMinimized)
+                        // canvas. Toggled independently of the console (key 9).
+                        if (!_stageBarHidden)
                           Positioned(
                             top: 0,
                             left: 0,
@@ -605,11 +609,24 @@ class _SetupScreenState extends State<SetupScreen> {
       _abortDerivation();
       return KeyEventResult.handled;
     }
-    // M — minimize / restore the console + stage tabs.
+    // M — collapse / restore the console (independent of the stage bar).
     if (event.logicalKey == LogicalKeyboardKey.keyM) {
       final bool minimizing = !_chromeMinimized;
       _sounds.play(minimizing ? UiSound.chromeDown : UiSound.chromeUp);
       setState(() => _chromeMinimized = minimizing);
+      return KeyEventResult.handled;
+    }
+    // 9 — show / hide the stage-tab bar (independent of the console).
+    if (event.logicalKey == LogicalKeyboardKey.digit9 ||
+        event.logicalKey == LogicalKeyboardKey.numpad9) {
+      final bool hiding = !_stageBarHidden;
+      _sounds.play(hiding ? UiSound.chromeDown : UiSound.chromeUp);
+      setState(() => _stageBarHidden = hiding);
+      return KeyEventResult.handled;
+    }
+    // X — exclude the displayed stage and every stage above it (truncate).
+    if (event.logicalKey == LogicalKeyboardKey.keyX) {
+      _truncate();
       return KeyEventResult.handled;
     }
     // C — focus the colour wheel (then ← → cycle hues).
@@ -631,14 +648,14 @@ class _SetupScreenState extends State<SetupScreen> {
       return KeyEventResult.handled;
     }
     // Field focus (uniform coverage): S salt/export · P profile · D derivation
-    // steps. The salt (config) and export-label (session) fields never coexist,
-    // so S covers whichever is on screen. Each no-ops with a console note if its
-    // field is not in the current mode.
+    // steps. The salt (config screen) and export-label (live setup) fields never
+    // coexist, so pick by session state rather than a focus node's context
+    // (which could be stale): a live setup means the export label.
     if (event.logicalKey == LogicalKeyboardKey.keyS) {
-      if (_stage0Focus.context != null) {
-        _focusField(_stage0Focus, 'salt / pepper');
-      } else {
+      if (_hasSession) {
         _focusField(_exportLabelFocus, 'export label');
+      } else {
+        _focusField(_stage0Focus, 'salt / pepper');
       }
       return KeyEventResult.handled;
     }
@@ -1020,12 +1037,13 @@ class _SetupScreenState extends State<SetupScreen> {
   static const List<String> _manualLines = <String>[
     'F1 manual · F2 Setup · F3 Train · F4 Accelerate · F5 Inherit',
     'Esc  return to the fractal (leave a text field) · Tab cycles fields',
-    'M  minimize / restore chrome   Z  reset (asks first)',
+    'M  console   9  stage bar   Z  reset (asks first)',
     '0–8  go to that stage (recenters); press again to zoom to its point',
     'N / I / R  New seed / Import / Recall (also focuses its input)',
     'S salt / export label · P profile · D derivation steps · C colour',
     'Enter  start (Generate / Encode / Begin recall) from a field',
     'K  copy the master secret ("the key")    H  halt derivation (keeps progress)',
+    'X  exclude this stage & above (shorten the setup)',
     'V+↑/↓  sound volume (level 0 = muted)',
     'Alt+K  copy the full export digest (not just the first 32 chars)',
     'Alt+L  deep render — reveal leaves in escape-count voids (slower)',
@@ -1038,6 +1056,21 @@ class _SetupScreenState extends State<SetupScreen> {
   /// than an abstract flat grey; it stays unsaturated enough to sit neutrally
   /// against all six fractal hue schemes. See great-wall-ux/SCOPE.md
   /// §"Console palette" for the rationale.
+  /// Memorise-mode guidance. Lives in the console (not the control panel) so the
+  /// panel stays a stable, compact action surface.
+  static const String _memoriseHelp =
+      'Memorise your points. Stage 0 is the salt/pepper you entered; each later '
+      'stage is its own fractal carrying one point. Study the marked location on '
+      'every fractal until you can find it from memory, then finish — the seed '
+      'is then held only in your recall.';
+
+  /// Whether the user is studying a settled generated/imported setup (the state
+  /// the [_memoriseHelp] guidance applies to).
+  bool get _inMemoriseStudy =>
+      _setup.phase == SetupPhase.memorise &&
+      !_setup.isGenerating &&
+      !_setup.isRecallSession;
+
   static const Color _kConsoleBg = Color(0xE6131519); // ~90% opaque gunmetal
   static const Color _kConsoleFg = Color(0xFFE9EDF2); // cool off-white
   static const Color _kConsoleAccent = Color(0xFFB8C2CC); // brighter, same cast
@@ -1059,6 +1092,7 @@ class _SetupScreenState extends State<SetupScreen> {
         ? _prompt!.message
         : _derivationStatus() ??
             focusHelp ??
+            (_inMemoriseStudy ? _memoriseHelp : null) ??
             (_consoleLog.isEmpty ? 'Ready.' : _consoleLog.last);
     return Material(
       color: _kConsoleBg,
@@ -1158,6 +1192,23 @@ class _SetupScreenState extends State<SetupScreen> {
                 const Icon(Icons.info_outline, size: 14),
                 const SizedBox(width: 6),
                 Expanded(child: Text(_fieldHelp(_focusedField!))),
+              ],
+            ),
+          ),
+        // Memorise guidance — relocated here from the control panel so the panel
+        // stays stable. Shown only when nothing more urgent is.
+        if (_prompt == null &&
+            _setup.derivingStageIndex == null &&
+            _focusedField == null &&
+            _inMemoriseStudy)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                const Icon(Icons.menu_book, size: 14),
+                const SizedBox(width: 6),
+                Expanded(child: Text(_memoriseHelp)),
               ],
             ),
           ),
@@ -1277,6 +1328,18 @@ class _SetupScreenState extends State<SetupScreen> {
           if (_setup.isGenerating || _setup.generationError != null) ...<Widget>[
             const Divider(height: 32),
             _generationNotice(),
+          ],
+
+          // A halted generation: its progress is preserved; offer to resume.
+          if (_setup.canResume) ...<Widget>[
+            const Divider(height: 32),
+            _haltedNotice(),
+          ],
+
+          // Truncation: delete the displayed stage and every stage above it.
+          if (_setup.canTruncateFromDisplayed) ...<Widget>[
+            const Divider(height: 32),
+            _truncateControl(),
           ],
 
           // The cold-start recall walk shows a per-stage hint while the user
@@ -1719,20 +1782,9 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   List<Widget> _memoriseControls() {
+    // The "what to do" guidance lives in the console now (see _memoriseHelp), so
+    // the panel stays a stable, compact action surface.
     return <Widget>[
-      const Text('Memorise your points'),
-      const SizedBox(height: 16),
-      // Stage 0 is the salt/pepper text (no point); stages 1..N-1 are the
-      // chain-derived fractals, one point each. Step through with the 0–8 tab
-      // bar or number keys (press a stage again to zoom to its point).
-      Text(
-        'Stage 0 is the salt/pepper you entered; each later stage is its own '
-        'fractal carrying one point. Study the marked location on every fractal '
-        'until you can find it from memory. When confident, finish — the seed '
-        'is then held only in your recall.',
-        style: Theme.of(context).textTheme.bodySmall,
-      ),
-      const SizedBox(height: 16),
       FilledButton(
         onPressed: () {
           _sounds.play(UiSound.confirm);
@@ -1790,6 +1842,85 @@ class _SetupScreenState extends State<SetupScreen> {
       'the stages already done are ready to study now.',
       style: Theme.of(context).textTheme.bodySmall,
     );
+  }
+
+  /// The halted-derivation notice: how much of the stalled stage was preserved,
+  /// and a button to resume it (and the rest of the chain).
+  Widget _haltedNotice() {
+    final int k = _setup.haltedStage;
+    final int last = _setup.nStages - 1;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Text(
+          'Halted at Stage $k/$last — pass ${_setup.haltedPass}/'
+          '${_setup.haltedTotal} kept. Resume picks up where it stopped.',
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
+        const SizedBox(height: 8),
+        FilledButton.icon(
+          onPressed: _resumeDerivation,
+          icon: const Icon(Icons.play_arrow),
+          label: Text('Resume Stage $k'),
+        ),
+      ],
+    );
+  }
+
+  void _resumeDerivation() {
+    _sounds.play(UiSound.select);
+    _setup.resumeDerivation();
+  }
+
+  /// Truncation control: exclude the displayed stage and every stage above it.
+  Widget _truncateControl() {
+    final int k = _setup.displayStageIndex;
+    final int last = _setup.nStages - 1;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Text(
+          k == last
+              ? 'Shorten the setup by excluding this last stage.'
+              : 'Shorten the setup: exclude Stage $k and every stage above it '
+                  '(Stages $k–$last), keeping Stages 0–${k - 1}.',
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
+        const SizedBox(height: 8),
+        OutlinedButton.icon(
+          onPressed: _truncate,
+          icon: const Icon(Icons.content_cut),
+          label: Text('Exclude Stage $k & above (X)'),
+        ),
+      ],
+    );
+  }
+
+  /// Exclude the displayed stage and every stage above it. Bound to the `X`
+  /// hotkey and the truncate button; denies when the displayed stage cannot be
+  /// truncated (Stage 0, or a not-yet-settled / recall setup).
+  Future<void> _truncate() async {
+    if (!_setup.canTruncateFromDisplayed) {
+      _sounds.play(UiSound.deny);
+      return;
+    }
+    final int k = _setup.displayStageIndex;
+    final int last = _setup.nStages - 1;
+    final String kept =
+        k == 1 ? 'only the salt/pepper text' : 'Stages 0–${k - 1}';
+    final bool ok = await _consoleConfirm(
+      message: k == last
+          ? 'Exclude Stage $k? The setup keeps $kept. This cannot be undone.'
+          : 'Exclude Stages $k–$last? The setup keeps $kept. '
+              'This cannot be undone.',
+      confirmLabel: 'Exclude',
+    );
+    if (!ok || !mounted) return;
+    _setup.truncateFrom(k);
+    _sounds.play(UiSound.undo);
+    _toast(k - 1 >= 1
+        ? 'Excluded — setup now has ${k - 1} stage${k - 1 == 1 ? '' : 's'}.'
+        : 'Excluded down to the salt/pepper text (no point stages).');
   }
 
   /// The blind BIP39 seed-phrase copy. Operates on whatever has been recalled so

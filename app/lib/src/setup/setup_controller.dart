@@ -239,6 +239,23 @@ class SetupController extends ChangeNotifier {
   /// Whether a stage is currently halted with preserved progress.
   bool get isHalted => _halted != null;
 
+  /// Whether [resumeDerivation] can run: a generation (not a recall walk) is
+  /// halted and still holds its entropy root. A halted recall-walk derive is not
+  /// resumable from the stash here — re-deriving that stage supersedes it.
+  bool get canResume =>
+      _halted != null && _entropyBits != null && !_isRecallSession;
+
+  /// Whether the displayed stage can be truncated from (it and every stage above
+  /// it deleted): a settled generated/imported setup (memorise, not deriving or
+  /// generating) showing a point stage (≥ 1). Recall reconstructs a fixed setup,
+  /// so it is not editable this way.
+  bool get canTruncateFromDisplayed =>
+      _phase == SetupPhase.memorise &&
+      !_isGenerating &&
+      !_isRecallSession &&
+      _displayStageIndex >= 1 &&
+      _displayStageIndex < nStages;
+
   /// The stage index a halt left paused (0 when none).
   int get haltedStage => _halted?.stage ?? 0;
 
@@ -672,12 +689,25 @@ class SetupController extends ChangeNotifier {
     _argon2Job = null;
     _clearInFlight(); // stage's chain finished — its digest is no longer a checkpoint
     Entropy.wipe(priorPointBits);
-    // Drop the result if the session was reset/aborted mid-flight, rather than
-    // writing into the torn-down arrays.
+    return _storeAndEncode(k, bits, reservoirs, foreground: foreground);
+  }
+
+  /// Store stage [k]'s [reservoirs], encode its 32-bit point (entropy chunk
+  /// k-1), and record its master-secret transcript contribution. Returns `false`
+  /// (after wiping [reservoirs]) if the session was torn down mid-flight, so
+  /// nothing is written into the cleared arrays. Shared by fresh and resumed
+  /// stage derivations.
+  bool _storeAndEncode(
+    int k,
+    List<int> bits,
+    StageReservoirs reservoirs, {
+    required bool foreground,
+  }) {
     if (_entropyBits == null || k >= _reservoirs.length) {
       reservoirs.clear();
       return false;
     }
+    const int bpp = EncodingConstants.bitsPerPoint;
     _reservoirs[k] = reservoirs;
 
     // Encode this stage's single 32-bit point (entropy chunk k-1).
@@ -705,6 +735,44 @@ class SetupController extends ChangeNotifier {
     Entropy.wipe(chunk);
     notifyListeners();
     return true;
+  }
+
+  /// Finish a **halted** stage [k] by resuming its Argon2 chain from the
+  /// preserved [fromDigest] (its result after [fromPass] passes), then store and
+  /// encode it like a fresh stage. Mirrors [_deriveAndEncodeStage] but continues
+  /// the work the halt kept instead of restarting from the chain input.
+  Future<bool> _resumeAndEncodeStage(
+    int k,
+    List<int> bits,
+    Uint8List fromDigest,
+    int fromPass,
+  ) async {
+    _workingStageIndex = k;
+    _argon2Total = _iterations < 1 ? 1 : _iterations;
+    _argon2Done = fromPass; // progress / ETA continue from where the halt left off
+    notifyListeners();
+    final Argon2Job job = await _core.resumeStageDerivation(
+      fromDigest,
+      fromPass: fromPass,
+      iterations: _iterations,
+      profile: _profile,
+      onProgress: (int done, int total) {
+        _argon2Done = done;
+        _argon2Total = total;
+        notifyListeners();
+      },
+      onCheckpoint: (int completed, Uint8List digest) =>
+          _setInFlight(k, completed, _argon2Total, digest),
+    );
+    // The isolate has its own copy now; wipe the stash digest we passed in.
+    fromDigest.fillRange(0, fromDigest.length, 0);
+    _argon2Job = job;
+    final StageReservoirs reservoirs = await job.result;
+    _argon2Job = null;
+    _clearInFlight();
+    // Resume always runs in the background (the prefix is already studyable), so
+    // foreground: false — no full-screen encode phase.
+    return _storeAndEncode(k, bits, reservoirs, foreground: false);
   }
 
   /// Derive the stages after Stage 1 in the background, one at a time, while the
@@ -739,6 +807,67 @@ class SetupController extends ChangeNotifier {
         _generatingStage = 0;
         // The entropy root is no longer needed once every stage carries its
         // point (skip if a reset already wiped it).
+        if (_entropyBits != null) {
+          Entropy.wipe(bits);
+          _entropyBits = null;
+        }
+        notifyListeners();
+      }
+    }
+  }
+
+  /// Resume a halted derivation: finish the halted stage from its preserved
+  /// progress ([_halted]), then derive the rest of the chain in the background —
+  /// exactly the tail of the original generation. No-op if nothing is halted,
+  /// the entropy root is gone, or a derivation is already running.
+  void resumeDerivation() {
+    final _HaltCheckpoint? cp = _halted;
+    if (!canResume ||
+        cp == null ||
+        _isGenerating ||
+        _phase == SetupPhase.deriving ||
+        _phase == SetupPhase.encoding) {
+      return;
+    }
+    _halted = null; // ownership of cp moves into the resume flow
+    final List<int> bits = _entropyBits!;
+    final int pointStages = nStages - 1;
+    _isGenerating = true;
+    _generatingStage = cp.stage;
+    _generationError = null;
+    notifyListeners();
+    unawaited(_resumeRemaining(bits, cp, pointStages));
+  }
+
+  /// Finish the halted [cp] stage from its preserved digest, then derive stages
+  /// after it (full chains) in the background. Mirrors [_generateRemaining]'s
+  /// halt/teardown handling so a re-halt during resume preserves progress again.
+  Future<void> _resumeRemaining(
+    List<int> bits,
+    _HaltCheckpoint cp,
+    int pointStages,
+  ) async {
+    try {
+      final bool ok = await _resumeAndEncodeStage(cp.stage, bits, cp.digest, cp.pass);
+      if (!ok) return; // session torn down — finally cleans up
+      for (int k = cp.stage + 1; k <= pointStages; k++) {
+        _generatingStage = k;
+        notifyListeners();
+        final bool ok2 = await _deriveAndEncodeStage(k, bits, foreground: false);
+        if (!ok2) return;
+      }
+    } on Argon2Cancelled {
+      return; // re-halted mid-resume — the finally promotes the new stash
+    } catch (e) {
+      _generationError =
+          'Stage $_generatingStage failed to derive (${e.runtimeType}); '
+          'the earlier stages are still usable.';
+    } finally {
+      if (_halting) {
+        _enterHalted();
+      } else {
+        _isGenerating = false;
+        _generatingStage = 0;
         if (_entropyBits != null) {
           Entropy.wipe(bits);
           _entropyBits = null;
@@ -1079,6 +1208,56 @@ class SetupController extends ChangeNotifier {
     final List<int>? rec = _recalledEntropyBits;
     if (rec != null) Entropy.wipe(rec);
     _recalledEntropyBits = null;
+  }
+
+  /// Truncate the setup: delete stage [k] and every stage above it, leaving a
+  /// setup of stages `0..k-1`. The kept prefix is fully derived, so the entropy
+  /// root and any halt stash (which belong to the removed tail) are wiped. The
+  /// display lands on the new last stage. No-op unless
+  /// [canTruncateFromDisplayed] applies (so `k >= 1`).
+  void truncateFrom(int k) {
+    if (_phase != SetupPhase.memorise ||
+        _isGenerating ||
+        _isRecallSession ||
+        k < 1 ||
+        k >= nStages) {
+      return;
+    }
+    // Wipe the secret material of every removed stage.
+    for (int j = k; j < nStages; j++) {
+      _reservoirs[j]?.clear();
+      final List<int>? chunk = _selectedChunks[j];
+      if (chunk != null) Entropy.wipe(chunk);
+    }
+    // The entropy root and any halt stash describe the (now-deleted) tail; the
+    // kept prefix is already derived, so neither is needed.
+    if (_halted != null) {
+      _halted!.wipe();
+      _halted = null;
+    }
+    if (_entropyBits != null) {
+      Entropy.wipe(_entropyBits!);
+      _entropyBits = null;
+    }
+    final List<int>? rec = _recalledEntropyBits;
+    if (rec != null) Entropy.wipe(rec);
+    _recalledEntropyBits = null;
+
+    // Shrink to k stages (k-1 point stages) and trim every per-stage array.
+    final int n = k;
+    _points = _points.sublist(0, n);
+    _reservoirs = _reservoirs.sublist(0, n);
+    _stageRecords = _stageRecords.sublist(0, n);
+    _leafRects = _leafRects.sublist(0, n);
+    _selectedChunks = _selectedChunks.sublist(0, n);
+    _selectedMarks = _selectedMarks.sublist(0, n);
+    _stageCount = n;
+    _pointStages = n - 1;
+    _generationError = null;
+
+    // Land on the new last stage (Stage 0 if truncated to text-only).
+    _applyDisplayStage(n - 1);
+    notifyListeners();
   }
 
   /// True once every point stage (1..N) carries a selected point.
