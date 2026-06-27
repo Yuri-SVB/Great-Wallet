@@ -178,6 +178,13 @@ class _SetupScreenState extends State<SetupScreen> {
   /// (the two import editors are mutually exclusive). Null otherwise.
   int? _expandImportTarget;
 
+  /// True during a **manual** expansion (the R method): the new stages derive
+  /// one at a time and the user clicks each point on its fresh fractal. Canvas
+  /// selection is enabled while this is on; [_expandManualTarget] is the
+  /// point-stage count the walk grows to.
+  bool _expandManualActive = false;
+  int? _expandManualTarget;
+
   /// True while a master-secret export's Argon2id pass is in flight, so a second
   /// tap on "Copy master secret" is ignored until it finishes.
   bool _exporting = false;
@@ -467,6 +474,7 @@ class _SetupScreenState extends State<SetupScreen> {
       _pointImport.clear();
       setState(() => _expandImportTarget = null);
     }
+    if (_expandManualActive) _endManualExpand();
     _hotkeys.requestFocus();
   }
 
@@ -509,10 +517,12 @@ class _SetupScreenState extends State<SetupScreen> {
                         ),
                         if (_busy) Positioned.fill(child: _progressOverlay()),
                         if (_selectMode && !_setup.isTextStage)
-                          const Positioned(
+                          Positioned(
                             top: 56,
                             left: 12,
-                            child: _Badge('Recall — click your point'),
+                            child: _Badge(_expandManualActive
+                                ? 'Add stage — click your point'
+                                : 'Recall — click your point'),
                           ),
                         if (_editPointMode && !_setup.isTextStage)
                           const Positioned(
@@ -731,8 +741,7 @@ class _SetupScreenState extends State<SetupScreen> {
     }
     if (event.logicalKey == LogicalKeyboardKey.keyR) {
       if (_expandTarget != null) {
-        // Manual expansion is wired next; consume R so it does not fall through
-        // to the config/point-edit handlers while the picker is open.
+        _expandManual();
         return KeyEventResult.handled;
       }
       if (_setup.canEditCurrentPoint) {
@@ -1060,6 +1069,13 @@ class _SetupScreenState extends State<SetupScreen> {
       }
       return;
     }
+    // During a manual expansion, only the fresh (point-less) new stages accept a
+    // click; an existing stage's point is never clobbered by a stray tap.
+    if (_expandManualActive && _setup.hasPointAt(_setup.displayStageIndex)) {
+      _sounds.play(UiSound.denyBlocked);
+      _toast('Stage ${_setup.displayStageIndex} already has its point.');
+      return;
+    }
     SelectionOutcome outcome = _setup.selectPoint(sel);
     // A valid click that would clobber a re-selected stage's later fractals asks
     // for confirmation before discarding them.
@@ -1077,6 +1093,20 @@ class _SetupScreenState extends State<SetupScreen> {
       case SelectionOutcome.marked:
         _sounds.play(UiSound.selectPoint);
         final int k = _setup.displayStageIndex;
+        // Manual expansion: the click set this new stage's point; advance to the
+        // next new stage (deriving it) until the target is reached.
+        if (_expandManualActive) {
+          final int g = _expandManualTarget ?? k;
+          if (k < g) {
+            _toast('Point set on Stage $k — deriving Stage ${k + 1}…');
+            await _deriveNextStage();
+          } else {
+            _endManualExpand();
+            _sounds.play(UiSound.finalReady);
+            _toast('Expansion complete — Stage $g added.');
+          }
+          return;
+        }
         msg = k < _setup.nStages - 1
             ? 'Point marked on Stage $k/${_setup.nStages - 1} — '
                 'select Stage ${k + 1} to derive it.'
@@ -1498,9 +1528,14 @@ class _SetupScreenState extends State<SetupScreen> {
               _setup.phase != SetupPhase.recallComplete) ...<Widget>[
             const Divider(height: 32),
             Text(
-              'Recalling Stage ${_setup.displayStageIndex}/'
-              '${_setup.nStages - 1} — click your point to mark it, then select '
-              'the next stage (tab or number key) to derive it.',
+              _expandManualActive
+                  ? 'Adding Stage ${_setup.displayStageIndex}/'
+                      '${_expandManualTarget ?? _setup.nStages - 1} — click your '
+                      'point on this fractal; the next stage then derives '
+                      'automatically.'
+                  : 'Recalling Stage ${_setup.displayStageIndex}/'
+                      '${_setup.nStages - 1} — click your point to mark it, then '
+                      'select the next stage (tab or number key) to derive it.',
             ),
           ],
 
@@ -2335,6 +2370,7 @@ class _SetupScreenState extends State<SetupScreen> {
           children: <Widget>[
             _expandPickButton('New (N)', _expandNew),
             _expandPickButton('Import (I)', () => _expandImport(hex: false)),
+            _expandPickButton('Manual (R)', _expandManual),
             _expandPickButton('Cancel (Esc)', _cancelExpand),
           ],
         ),
@@ -2351,6 +2387,42 @@ class _SetupScreenState extends State<SetupScreen> {
   void _cancelExpand() {
     setState(() => _expandTarget = null);
     _focusViewer();
+  }
+
+  /// Grow the setup by hand (the R method): derive each new stage in turn and
+  /// click its point on the fresh fractal. Confirms first, grows empty stages,
+  /// enables canvas selection, and derives the first new stage; each click then
+  /// advances to the next ([_onCanvasSelect]).
+  Future<void> _expandManual() async {
+    final int? g = _expandTarget;
+    if (g == null) return;
+    final int firstNew = _setup.firstExpansionStage;
+    final int m = g - firstNew + 1;
+    setState(() => _expandTarget = null);
+    final bool ok = await _consoleConfirm(
+      message: 'Add $m new stage${m == 1 ? '' : 's'} '
+          '(Stage${m == 1 ? ' $g' : 's $firstNew–$g'}) by hand? Each derives in '
+          'turn; click your chosen point on every new fractal.',
+      confirmLabel: 'Add',
+    );
+    if (!ok || !mounted || !_setup.canExpand) return;
+    _setup.beginManualExpansion(g);
+    setState(() {
+      _expandManualActive = true;
+      _expandManualTarget = g;
+      _selectMode = true; // enable canvas point selection on the new stages
+    });
+    _sounds.play(UiSound.confirm);
+    await _deriveNextStage(); // derive Stage firstNew; the user clicks its point
+  }
+
+  /// Leave manual-expansion mode (completed or cancelled), disabling selection.
+  void _endManualExpand() {
+    setState(() {
+      _expandManualActive = false;
+      _expandManualTarget = null;
+      _selectMode = false;
+    });
   }
 
   /// Truncation control: exclude the displayed stage and every stage above it.
