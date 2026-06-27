@@ -152,6 +152,7 @@ class _SetupScreenState extends State<SetupScreen> {
   /// (possibly sub-standard) BIP39 phrase, or recall an existing setup from its
   /// salt (cold-start recall — no encode, the points come back from clicks).
   _SourceMode _source = _SourceMode.fresh;
+  _ImportFormat _importFormat = _ImportFormat.words;
 
   /// Select mode: when on, tapping the canvas decodes the point under the
   /// cursor instead of panning. Toggled by the panel button or the `S` key.
@@ -1519,8 +1520,11 @@ class _SetupScreenState extends State<SetupScreen> {
                       _mnemonic.text.trim().isEmpty))
               ? null
               : _start,
-          child: Text(
-              _source == _SourceMode.import ? 'Encode phrase' : 'Generate'),
+          child: Text(_source == _SourceMode.import
+              ? (_importFormat == _ImportFormat.hex
+                  ? 'Encode hex'
+                  : 'Encode phrase')
+              : 'Generate'),
         ),
       if (_setup.phase == SetupPhase.error && _setup.errorMessage != null) ...<Widget>[
         const SizedBox(height: 12),
@@ -1678,7 +1682,26 @@ class _SetupScreenState extends State<SetupScreen> {
   /// The instruction and live word-count are shown in the console on focus
   /// ([_fieldHelp]).
   List<Widget> _mnemonicInput() {
+    final bool hex = _importFormat == _ImportFormat.hex;
     return <Widget>[
+      SegmentedButton<_ImportFormat>(
+        segments: const <ButtonSegment<_ImportFormat>>[
+          ButtonSegment<_ImportFormat>(
+              value: _ImportFormat.words, label: Text('Words')),
+          ButtonSegment<_ImportFormat>(
+              value: _ImportFormat.hex, label: Text('Hex')),
+        ],
+        selected: <_ImportFormat>{_importFormat},
+        showSelectedIcon: false,
+        style: const ButtonStyle(visualDensity: VisualDensity.compact),
+        onSelectionChanged: (Set<_ImportFormat> s) {
+          setState(() {
+            _importFormat = s.first;
+            _mnemonic.clear(); // the two formats are not interchangeable
+          });
+        },
+      ),
+      const SizedBox(height: 8),
       _track(
         _Field.mnemonic,
         TextField(
@@ -1689,13 +1712,24 @@ class _SetupScreenState extends State<SetupScreen> {
           maxLines: 1,
           autocorrect: false,
           enableSuggestions: false,
+          // Hex is constrained to grouped uppercase 0-9 A-F; words are free text.
+          inputFormatters: hex
+              ? <TextInputFormatter>[
+                  FilteringTextInputFormatter.allow(RegExp(r'[0-9a-fA-F ]')),
+                  TextInputFormatter.withFunction(
+                    (TextEditingValue o, TextEditingValue n) =>
+                        n.copyWith(text: n.text.toUpperCase()),
+                  ),
+                ]
+              : null,
           decoration: InputDecoration(
             isDense: true,
             border: const OutlineInputBorder(),
-            labelText: 'Import phrase (BIP39)',
-            hintText: 'word1 word2 …',
+            labelText:
+                hex ? 'Import hex (8 digits / stage)' : 'Import phrase (BIP39)',
+            hintText: hex ? 'A1B2C3D4 …' : 'word1 word2 …',
             suffixIcon: IconButton(
-              tooltip: _mnemonicHidden ? 'Show phrase' : 'Hide phrase',
+              tooltip: _mnemonicHidden ? 'Show' : 'Hide',
               icon: Icon(
                 _mnemonicHidden ? Icons.visibility : Icons.visibility_off,
               ),
@@ -2108,6 +2142,18 @@ class _SetupScreenState extends State<SetupScreen> {
         return 'Stage 0 salt/pepper: seeds the fractal chain. A public label or '
             'a secret pasted pepper (uppercase letters, digits, hyphen).';
       case _Field.mnemonic:
+        if (_importFormat == _ImportFormat.hex) {
+          final int digits = _mnemonic.text.replaceAll(RegExp(r'\s'), '').length;
+          if (digits == 0) {
+            return 'Import hex: paste uppercase 0–9 A–F from a randomness source '
+                'you trust over the device (kept hidden). 8 digits = one stage.';
+          }
+          if (digits % 8 != 0) {
+            return 'Import hex: $digits digits — must be a multiple of 8 '
+                '(8 = 32 bits = one stage).';
+          }
+          return 'Import hex: $digits digits → ${digits ~/ 8} stages.';
+        }
         final int wc = _mnemonic.text
             .trim()
             .split(RegExp(r'\s+'))
@@ -2115,7 +2161,7 @@ class _SetupScreenState extends State<SetupScreen> {
             .length;
         if (wc == 0) {
           return 'Import phrase: type or paste your existing BIP39 seed phrase '
-              '(kept hidden).';
+              '(kept hidden). 3 words = one stage.';
         }
         if (wc % 3 != 0 || wc > 24) {
           return 'Import phrase: $wc words — must be a multiple of 3 (3–24).';
@@ -2150,12 +2196,21 @@ class _SetupScreenState extends State<SetupScreen> {
     setState(() => _selectMode = false);
     final String text = _stage0.text;
     if (_source == _SourceMode.import) {
-      await _setup.beginFromMnemonic(
-        _mnemonic.text,
-        text: text,
-        argon2Iterations: _iterations,
-        profile: _profile,
-      );
+      if (_importFormat == _ImportFormat.hex) {
+        await _setup.beginFromHex(
+          _mnemonic.text,
+          text: text,
+          argon2Iterations: _iterations,
+          profile: _profile,
+        );
+      } else {
+        await _setup.beginFromMnemonic(
+          _mnemonic.text,
+          text: text,
+          argon2Iterations: _iterations,
+          profile: _profile,
+        );
+      }
       // Setup is write-only on memory: once the phrase is encoded onto the
       // fractals, wipe the plaintext from the field (keep it on error so the
       // user can fix it).
@@ -2258,6 +2313,10 @@ class _SetupScreenState extends State<SetupScreen> {
 /// imported BIP39 phrase, or a cold-start recall of an existing setup (derive
 /// from the salt and reconstruct the seed from the user's clicks).
 enum _SourceMode { fresh, import, recall }
+
+/// How imported entropy is entered: BIP39 words, or blind uppercase hex (for
+/// users who trust an external randomness source over the device RNG).
+enum _ImportFormat { words, hex }
 
 /// The input controls whose label + live value are conveyed in the console while
 /// focused (so the panel itself can stay label-free).

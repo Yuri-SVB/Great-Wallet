@@ -583,6 +583,39 @@ class SetupController extends ChangeNotifier {
     );
   }
 
+  /// Run the chained Setup pipeline on **blind hex entropy input** (8 hex digits
+  /// per 32-bit stage) — for users who trust an external randomness source over
+  /// the device RNG. [text] is the Stage-0 salt/pepper. Invalid or non-whole-
+  /// stage input enters the error phase with a generic message (no content).
+  Future<void> beginFromHex(
+    String hex, {
+    required String text,
+    required int argon2Iterations,
+    Argon2Profile profile = Argon2Profile.basic,
+  }) {
+    final List<int> bits;
+    try {
+      bits = Entropy.hexToBits(hex);
+    } on FormatException {
+      _errorMessage = 'Invalid hex — use uppercase 0–9 A–F.';
+      _setPhase(SetupPhase.error);
+      return Future<void>.value();
+    }
+    if (bits.length % EncodingConstants.bitsPerPoint != 0) {
+      Entropy.wipe(bits);
+      _errorMessage =
+          'Hex must be a whole number of stages (8 digits = 32 bits each).';
+      _setPhase(SetupPhase.error);
+      return Future<void>.value();
+    }
+    return _encodeRoot(
+      bits,
+      text: text,
+      argon2Iterations: argon2Iterations,
+      profile: profile,
+    );
+  }
+
   /// The shared chained-encode pipeline over a ready entropy [bits] root.
   ///
   /// Stage 0 is the salt/pepper [text] — it carries no point; it seeds the
