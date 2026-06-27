@@ -317,6 +317,37 @@ class SetupController extends ChangeNotifier {
   bool hasSelectedPoint(int k) =>
       k >= 1 && k < _selectedChunks.length && _selectedChunks[k] != null;
 
+  /// Whether stage [k] carries a point at all — selected during a recall walk,
+  /// or already encoded in a generated/imported setup. This is the chain-forward
+  /// precondition: a stage can only be derived once every prior point exists.
+  bool _hasPointAt(int k) =>
+      hasSelectedPoint(k) ||
+      (k >= 1 && k < _points.length && _points[k] != null);
+
+  /// Stage [k]'s 32-bit point chunk — the recall selection if present, otherwise
+  /// decoded on demand from the stored encoded point. No extra secret is kept in
+  /// memory: the displayed marker already *is* this chunk (a placed point
+  /// decodes back to it), so decoding when needed avoids a redundant stored copy
+  /// while keeping chain-extension setup-agnostic.
+  List<int> _pointChunk(int k) {
+    final List<int>? sel = _selectedChunks[k];
+    if (sel != null) return sel;
+    final EncodedPoint? pt = (k >= 1 && k < _points.length) ? _points[k] : null;
+    final StageReservoirs? res =
+        (k >= 1 && k < _reservoirs.length) ? _reservoirs[k] : null;
+    if (pt == null || res == null) {
+      throw StateError('stage $k has no point to chain from');
+    }
+    final CoreDecodeResult d = _core.decodePoint(
+      reRaw: pt.reRaw,
+      imRaw: pt.imRaw,
+      o: res.o,
+      p: res.p,
+      q: res.q,
+    );
+    return d.bits;
+  }
+
   /// The green marker selected on stage [index], if any (for the canvas overlay).
   ({double re, double im})? selectedMarkAt(int index) =>
       (index >= 0 && index < _selectedMarks.length)
@@ -1129,13 +1160,14 @@ class SetupController extends ChangeNotifier {
     if (_phase == SetupPhase.deriving) return DeriveOutcome.busy;
     final int target = firstUnderivedStage;
     if (target >= nStages) return DeriveOutcome.none; // all derived
-    // The next fractal hashes the points of every prior stage; they must exist.
+    // The next fractal hashes the points of every prior stage; they must exist
+    // (selected during recall, or already encoded in a generated/imported setup).
     for (int k = 1; k < target; k++) {
-      if (!hasSelectedPoint(k)) return DeriveOutcome.noPriorPoint;
+      if (!_hasPointAt(k)) return DeriveOutcome.noPriorPoint;
     }
 
     final List<int> priorPointBits = <int>[
-      for (int k = 1; k < target; k++) ..._selectedChunks[k]!,
+      for (int k = 1; k < target; k++) ..._pointChunk(k),
     ];
     final Uint8List input = _core.chainInput(_chainText, priorPointBits);
     try {
