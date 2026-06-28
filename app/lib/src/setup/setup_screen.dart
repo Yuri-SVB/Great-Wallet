@@ -1273,7 +1273,7 @@ class _SetupScreenState extends State<SetupScreen> {
     'K  copy the master secret ("the key")    H  halt derivation (keeps progress)',
     'X  exclude this stage & above (shorten the setup)',
     'Vault: F file path · W write/save · O open file · T blank templates',
-    'In Write: Q QR · Alt+Q copy · press again to switch 128/256-bit · I own key',
+    'In Write: Q QR · Alt+Q copy · press again to switch 128/256-bit · I scan QR to reuse key · Alt+I own key',
     'In Open: Q scan QR · Alt+Q type key (32 or 64 hex) · Esc cancel',
     'V+↑/↓  sound volume (level 0 = muted) · Alt+V reveal/hide sensitive text',
     'Alt+K  copy the full export digest (not just the first 32 chars)',
@@ -2521,6 +2521,7 @@ class _SetupScreenState extends State<SetupScreen> {
     Uint8List key = keyBytes;
     int keyLen = key.length; // 16 (128-bit) or 32 (256-bit)
     qr.QrImage matrix = _keyMatrix(key);
+    final bool canScan = _scanSupported || _desktopScanSupported;
     bool showQr = false;
     bool copiedOnce = false;
     bool busy = false;
@@ -2582,6 +2583,26 @@ class _SetupScreenState extends State<SetupScreen> {
             }
           }
 
+          // Scan an existing provisional-key QR and re-seal the file under it,
+          // so saving the same setup again reuses the QR you already
+          // hand-coloured instead of producing a fresh code to copy. The scanned
+          // bytes are validated as a key length before use, and wiped by reseal.
+          Future<void> scanOwnKey() async {
+            if (busy) return;
+            final Uint8List? scanned = await _scanKey();
+            if (scanned == null) return;
+            if (!SetupCrypto.isValidKeyLen(scanned.length)) {
+              _wipeBytes(scanned);
+              _sounds.play(UiSound.denyInput);
+              _toast('That QR is not a valid provisional key.');
+              return;
+            }
+            if (await reseal(ownKey: scanned, newLen: scanned.length)) {
+              _toast('Re-saved with the scanned key — your existing QR still '
+                  'opens this file.');
+            }
+          }
+
           // Q reveals the QR; pressing it again switches 128↔256 (a fresh key,
           // overwriting the file). Alt+Q copies; pressing it again switches too.
           void onShowQr() {
@@ -2610,7 +2631,11 @@ class _SetupScreenState extends State<SetupScreen> {
             bindings: <ShortcutActivator, VoidCallback>{
               const SingleActivator(LogicalKeyboardKey.keyQ): onShowQr,
               const SingleActivator(LogicalKeyboardKey.keyQ, alt: true): onCopy,
-              const SingleActivator(LogicalKeyboardKey.keyI): () =>
+              // I — scan an existing QR to reuse its key; Alt+I — type your own
+              // hex key. (I is a no-op where no camera backend exists.)
+              if (canScan)
+                const SingleActivator(LogicalKeyboardKey.keyI): scanOwnKey,
+              const SingleActivator(LogicalKeyboardKey.keyI, alt: true): () =>
                   hexFocus.requestFocus(),
               const SingleActivator(LogicalKeyboardKey.escape): () =>
                   Navigator.of(ctx).pop(),
@@ -2638,7 +2663,10 @@ class _SetupScreenState extends State<SetupScreen> {
                           'template (T).  Alt+Q — copy the key for a password '
                           'manager (blind).  Press Q or Alt+Q again to switch to '
                           '${otherLen() * 8}-bit (a fresh key, overwriting the '
-                          'file).  I — use your own 32- or 64-hex key (Enter).  '
+                          'file).  '
+                          '${canScan ? 'I — scan an existing QR to reuse its key '
+                              '(re-seals this setup under it).  ' : ''}'
+                          'Alt+I — type your own 32- or 64-hex key (Enter).  '
                           'Esc — close.',
                           style: const TextStyle(fontSize: 11),
                         ),
@@ -2694,6 +2722,12 @@ class _SetupScreenState extends State<SetupScreen> {
                     icon: const Icon(Icons.copy),
                     label: const Text('Copy key (Alt+Q)'),
                   ),
+                  if (canScan)
+                    TextButton.icon(
+                      onPressed: busy ? null : scanOwnKey,
+                      icon: const Icon(Icons.qr_code_scanner),
+                      label: const Text('Scan to reuse (I)'),
+                    ),
                   TextButton(
                     onPressed: () => Navigator.of(ctx).pop(),
                     child: const Text('Done'),
