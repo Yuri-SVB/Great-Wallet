@@ -41,9 +41,17 @@ dependencies:
   # lib/src/setup/setup_crypto.dart.
   cryptography: ^2.7.0
 
-  # QR rendering for the provisional-key paper export (print, then destroy at
-  # graduation). Renders the same encrypted envelope the file save produces.
-  qr_flutter: ^4.1.0
+  # QR module matrix for the provisional-key code. The 16-byte key is encoded in
+  # byte mode (so it rides a v1 21x21 symbol), which qr_flutter's string-only API
+  # can't express, so we build the matrix with the qr package and render both the
+  # scannable code and the hand-fill template ourselves with a CustomPainter.
+  qr: ^3.0.0
+
+  # Webcam scanning of the provisional-key QR on the platforms its authors
+  # support (Android / iOS / macOS / web). The Scan button is platform-gated, so
+  # Linux/Windows simply omit it and fall back to typing the key. Camera
+  # permission entries must be added to the app's platform configs.
+  mobile_scanner: ^5.2.3
 
 dev_dependencies:
   flutter_test:

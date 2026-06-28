@@ -6,46 +6,58 @@ import 'package:cryptography/cryptography.dart';
 
 import 'setup_vault.dart';
 
-/// Password encryption for the provisional-key [SetupVault] — deliberately
-/// conventional: **AES-256-GCM** (NIST SP 800-38D) for authenticated
-/// encryption, keyed by **Argon2id** (RFC 9106) over the password and a random
-/// per-file salt. This is the *only* representation in which the vault leaves
-/// memory: [sealVault] is the sole producer of bytes for the file (and, later,
-/// the QR), and the plaintext vault JSON is zeroed the instant it is encrypted.
+/// Result of sealing a vault: the ciphertext [fileBytes] (stored on disk) and
+/// the 16-byte provisional [key] (rendered by the caller as a byte-mode QR
+/// and/or 32 hex digits, then wiped). File + key are a lock and its key — keep
+/// the file anywhere, guard the key, destroy the key to render the file
+/// unrecoverable.
+class SealedVault {
+  SealedVault(this.fileBytes, this.key);
+  final Uint8List fileBytes;
+  final Uint8List key;
+}
+
+/// Password-free encryption for the provisional-key [SetupVault]: **AES-256-GCM**
+/// (NIST SP 800-38D) keyed by **Argon2id** (RFC 9106) over a **128-bit key** and
+/// a random per-file salt. The bulky ciphertext goes to a file; the only secret
+/// the user guards is the 16-byte key.
 ///
-/// The protection is cryptographically strong; "provisional" refers to the key
-/// being a *transient external crutch* held only across the consolidation window
-/// and destroyed at graduation (see
-/// `next-steps/provisional-key-bootstrapping.md`), not to any weakness here.
+/// The key is never an arbitrary password — always 128 bits, handled three ways
+/// (KISS): generated → byte-mode QR (hand-coloured, scanned back, never read);
+/// generated → 32 hex (blindly copied into a password manager); or supplied by
+/// the user as 32 hex (own entropy source). All three are the same 16 bytes fed
+/// to `Argon2id(keyBytes, salt)`, so load is one path. 16 raw bytes ride a QR
+/// **version 1 (21×21)** in byte mode at EC level L (17-byte capacity).
 class SetupCrypto {
   SetupCrypto._();
 
-  /// File envelope marker + version (so a wrong/old file is rejected, not
-  /// misread).
   static const String magic = 'greatwall-provisional-vault';
-  static const int version = 1;
+  static const int version = 3; // 3: 128-bit raw-byte key (2 was password/key)
 
-  // RFC 9106 §4 "second recommended" Argon2id parameters: 64 MiB, t=3, p=4 —
-  // memory-hard yet feasible on mobile. Stored in the envelope so the value can
-  // evolve, but clamped to sane bounds on read so a hostile file cannot force an
-  // out-of-memory KDF.
-  static const int _argonMemKiB = 64 * 1024; // 64 MiB
+  /// 128-bit key = 16 bytes = 32 hex digits. 16 bytes fit a byte-mode QR v1 at
+  /// EC level L (capacity 17 bytes).
+  static const int keyBits = 128;
+  static const int keyLenBytes = keyBits ~/ 8; // 16
+  static const int keyHexDigits = keyLenBytes * 2; // 32
+
+  // RFC 9106 §4 "second recommended" Argon2id parameters: 64 MiB, t=3, p=4.
+  static const int _argonMemKiB = 64 * 1024;
   static const int _argonIterations = 3;
   static const int _argonParallelism = 4;
-  static const int _keyLen = 32; // AES-256
-  static const int _saltLen = 16; // 128-bit KDF salt
-  static const int _nonceLen = 12; // 96-bit GCM nonce (SP 800-38D default)
+  static const int _aesKeyLen = 32; // AES-256
+  static const int _saltLen = 16;
+  static const int _nonceLen = 12; // 96-bit GCM nonce
 
   // Bounds for envelope-supplied KDF parameters (anti-DoS on load).
-  static const int _minMemKiB = 8 * 1024; // 8 MiB
-  static const int _maxMemKiB = 2 * 1024 * 1024; // 2 GiB
+  static const int _minMemKiB = 8 * 1024;
+  static const int _maxMemKiB = 2 * 1024 * 1024;
   static const int _maxIterations = 16;
   static const int _maxParallelism = 16;
 
   static final AesGcm _aes = AesGcm.with256bits();
 
-  static Future<SecretKey> _deriveKey(
-    String password,
+  static Future<SecretKey> _deriveAesKey(
+    List<int> keyBytes,
     List<int> salt, {
     required int memKiB,
     required int iterations,
@@ -55,34 +67,38 @@ class SetupCrypto {
       memory: memKiB,
       iterations: iterations,
       parallelism: parallelism,
-      hashLength: _keyLen,
+      hashLength: _aesKeyLen,
     );
     return argon2.deriveKey(
-      secretKey: SecretKey(utf8.encode(password)),
+      secretKey: SecretKey(keyBytes),
       nonce: salt, // the package names the Argon2 salt `nonce`
     );
   }
 
-  /// Encrypt [vault] under [password] into the self-describing UTF-8 JSON
-  /// envelope written to disk (and rendered as a QR). The caller still owns and
-  /// wipes [vault]; the derived plaintext JSON is zeroed here once sealed.
-  static Future<Uint8List> sealVault(SetupVault vault, String password) async {
+  /// Encrypt [vault] and return the ciphertext envelope plus the 16-byte key.
+  /// Uses [providedKey] (the user's own entropy) if given, else generates a
+  /// fresh key. The caller owns and wipes [SealedVault.key]; the plaintext JSON
+  /// is zeroed here.
+  static Future<SealedVault> sealVault(
+    SetupVault vault, {
+    Uint8List? providedKey,
+  }) async {
+    final Uint8List key = providedKey != null
+        ? Uint8List.fromList(providedKey)
+        : _randomBytes(keyLenBytes);
     final Uint8List salt = _randomBytes(_saltLen);
-    final SecretKey key = await _deriveKey(
-      password,
-      salt,
-      memKiB: _argonMemKiB,
-      iterations: _argonIterations,
-      parallelism: _argonParallelism,
-    );
     final Uint8List nonce = _randomBytes(_nonceLen);
     final List<int> plaintext = utf8.encode(jsonEncode(vault.toJson()));
     try {
-      final SecretBox box = await _aes.encrypt(
-        plaintext,
-        secretKey: key,
-        nonce: nonce,
+      final SecretKey aesKey = await _deriveAesKey(
+        key,
+        salt,
+        memKiB: _argonMemKiB,
+        iterations: _argonIterations,
+        parallelism: _argonParallelism,
       );
+      final SecretBox box =
+          await _aes.encrypt(plaintext, secretKey: aesKey, nonce: nonce);
       final Map<String, dynamic> envelope = <String, dynamic>{
         'f': magic,
         'v': version,
@@ -98,18 +114,21 @@ class SetupCrypto {
         'ct': base64.encode(box.cipherText),
         'tag': base64.encode(box.mac.bytes),
       };
-      return Uint8List.fromList(utf8.encode(jsonEncode(envelope)));
+      return SealedVault(
+        Uint8List.fromList(utf8.encode(jsonEncode(envelope))),
+        key,
+      );
     } finally {
       _zero(plaintext);
     }
   }
 
-  /// Decrypt an envelope produced by [sealVault] back into a [SetupVault]. Throws
-  /// a generic [FormatException] (no value echoed) on a non-vault file,
-  /// unsupported version, out-of-bounds KDF parameters, a wrong password, or any
-  /// tampering — GCM authentication makes "wrong password" and "corrupt"
-  /// indistinguishable, as intended.
-  static Future<SetupVault> openVault(Uint8List bytes, String password) async {
+  /// Decrypt an envelope produced by [sealVault] back into a [SetupVault], using
+  /// the 16-byte [keyBytes] (from a scanned QR or parsed from 32 hex). Throws a
+  /// generic [FormatException] on a non-vault file, unsupported version, wrong
+  /// key, or tampering — GCM authentication makes "wrong key" and "corrupt"
+  /// indistinguishable.
+  static Future<SetupVault> openVault(Uint8List bytes, Uint8List keyBytes) async {
     final Map<String, dynamic> env;
     try {
       env = jsonDecode(utf8.decode(bytes)) as Map<String, dynamic>;
@@ -131,8 +150,8 @@ class SetupCrypto {
     final List<int> ct = _b64(env['ct']);
     final List<int> tag = _b64(env['tag']);
 
-    final SecretKey key = await _deriveKey(
-      password,
+    final SecretKey aesKey = await _deriveAesKey(
+      keyBytes,
       salt,
       memKiB: memKiB,
       iterations: iterations,
@@ -141,10 +160,10 @@ class SetupCrypto {
     final SecretBox box = SecretBox(ct, nonce: nonce, mac: Mac(tag));
     List<int> plaintext;
     try {
-      plaintext = await _aes.decrypt(box, secretKey: key);
+      plaintext = await _aes.decrypt(box, secretKey: aesKey);
     } on SecretBoxAuthenticationError {
       throw const FormatException(
-          'Could not decrypt — wrong password or corrupt file.');
+          'Could not decrypt — wrong key or corrupt file.');
     }
     try {
       final Object? decoded = jsonDecode(utf8.decode(plaintext));
@@ -155,6 +174,29 @@ class SetupCrypto {
     } finally {
       _zero(plaintext);
     }
+  }
+
+  /// Parse [keyHexDigits] hex digits (whitespace ignored, any case) into the
+  /// 16-byte key. Throws a generic [FormatException] on bad input.
+  static Uint8List hexToKey(String hex) {
+    final String clean = hex.replaceAll(RegExp(r'\s'), '').toUpperCase();
+    if (clean.length != keyHexDigits || !RegExp(r'^[0-9A-F]+$').hasMatch(clean)) {
+      throw const FormatException('A key is exactly 32 hex digits (0–9 A–F).');
+    }
+    final Uint8List out = Uint8List(keyLenBytes);
+    for (int i = 0; i < keyLenBytes; i++) {
+      out[i] = int.parse(clean.substring(i * 2, i * 2 + 2), radix: 16);
+    }
+    return out;
+  }
+
+  /// The 16-byte key as 32 uppercase hex digits (the manager / manual form).
+  static String keyToHex(Uint8List key) {
+    final StringBuffer sb = StringBuffer();
+    for (final int b in key) {
+      sb.write(b.toRadixString(16).padLeft(2, '0').toUpperCase());
+    }
+    return sb.toString();
   }
 
   static int _boundedInt(Object? v, int lo, int hi) {

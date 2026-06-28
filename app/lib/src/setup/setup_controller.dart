@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -1956,71 +1955,49 @@ class SetupController extends ChangeNotifier {
     _setPhase(SetupPhase.memorise);
   }
 
-  /// Encrypt the current setup into a provisional-key envelope (AES-256-GCM /
-  /// Argon2id) under [password] — the only out-of-memory form, shared by the
-  /// file save and the QR export. Returns the ciphertext, or null if the setup
-  /// is not exportable. The plaintext vault is wiped before returning.
-  Future<Uint8List?> sealCurrentVault(String password) async {
-    if (!canExportVault) return null;
+  /// Save the current setup, encrypted, to [path]. Uses [providedKey] (the
+  /// user's own 16-byte entropy) if given, else generates a fresh 128-bit key.
+  /// On success returns the 16-byte key (the caller renders it as a QR / hex and
+  /// wipes it), else an [error]. The file holds only ciphertext; the key is
+  /// never written to it.
+  Future<({String? error, Uint8List? key})> saveVaultToFile(
+    String path, {
+    Uint8List? providedKey,
+  }) async {
+    if (!canExportVault) {
+      return (error: 'This setup cannot be saved yet.', key: null);
+    }
     final SetupVault vault = exportVault();
     try {
-      return await SetupCrypto.sealVault(vault, password);
+      final SealedVault sealed =
+          await SetupCrypto.sealVault(vault, providedKey: providedKey);
+      await File(path).writeAsBytes(sealed.fileBytes, flush: true);
+      return (error: null, key: sealed.key);
+    } catch (e) {
+      return (error: 'Could not save the file (${e.runtimeType}).', key: null);
     } finally {
       vault.wipe();
     }
   }
 
-  /// Save the current setup to [path], encrypted under [password]. Returns null
-  /// on success, else a generic error message (never echoes secret content).
-  Future<String?> saveVaultToFile(String path, String password) async {
-    if (!canExportVault) return 'This setup cannot be saved yet.';
-    if (password.isEmpty) return 'Enter a password.';
-    try {
-      final Uint8List? bytes = await sealCurrentVault(password);
-      if (bytes == null) return 'This setup cannot be saved yet.';
-      await File(path).writeAsBytes(bytes, flush: true);
-      return null;
-    } catch (e) {
-      return 'Could not save the file (${e.runtimeType}).';
+  /// Decrypt + restore a setup from the encrypted file at [path] using the
+  /// 16-byte provisional [keyBytes] (from a scanned QR or parsed hex). The live
+  /// session is replaced only once decryption and validation succeed. Returns
+  /// null on success, else a generic error message. The caller owns/wipes
+  /// [keyBytes].
+  Future<String?> loadVaultFromFile(String path, Uint8List keyBytes) async {
+    if (keyBytes.length != SetupCrypto.keyLenBytes) {
+      return 'That is not a valid provisional key.';
     }
-  }
-
-  /// Decrypt + restore a setup from the encrypted file at [path] under
-  /// [password]. The live session is replaced only once decryption and
-  /// validation succeed. Returns null on success, else a generic error message.
-  Future<String?> loadVaultFromFile(String path, String password) async {
-    if (password.isEmpty) return 'Enter a password.';
     Uint8List bytes;
     try {
       bytes = await File(path).readAsBytes();
     } catch (_) {
       return 'Could not read that file.';
     }
-    return _loadVaultFromBytes(bytes, password);
-  }
-
-  /// Decrypt + restore from a pasted/scanned envelope [text] (the same string a
-  /// QR carries) under [password]. Returns null on success, else a generic
-  /// error message.
-  Future<String?> loadVaultFromText(String text, String password) async {
-    if (password.isEmpty) return 'Enter a password.';
-    final String trimmed = text.trim();
-    if (trimmed.isEmpty) return 'Paste the provisional-key text.';
-    final Uint8List bytes;
-    try {
-      bytes = Uint8List.fromList(utf8.encode(trimmed));
-    } catch (_) {
-      return 'That is not a provisional key.';
-    }
-    return _loadVaultFromBytes(bytes, password);
-  }
-
-  /// Shared decrypt + restore for file and text/QR loads. The live session is
-  /// replaced only once decryption and validation both succeed.
-  Future<String?> _loadVaultFromBytes(Uint8List bytes, String password) async {
     SetupVault vault;
     try {
-      vault = await SetupCrypto.openVault(bytes, password);
+      vault = await SetupCrypto.openVault(bytes, keyBytes);
     } on FormatException catch (e) {
       return e.message;
     } catch (e) {
