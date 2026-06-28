@@ -936,6 +936,12 @@ class SetupController extends ChangeNotifier {
       _resumeExpansion(cp, plan);
       return;
     }
+    // Seed the in-flight stash with the resume's starting checkpoint (an owned
+    // copy). The first *new* checkpoint only lands once a full resumed pass
+    // completes — possibly a very long wait — so without this seed a re-halt in
+    // that window would find _inFlight null, leaving _enterHalted nothing to
+    // promote and the setup unresumable (the second-halt bug).
+    _setInFlight(cp.stage, cp.pass, cp.total, cp.digest);
     _halted = null; // ownership of cp moves into the resume flow
     final List<int> bits = _entropyBits!;
     final int pointStages = nStages - 1;
@@ -1753,6 +1759,9 @@ class SetupController extends ChangeNotifier {
   /// [_resumeRemaining] for generation; called by [resumeDerivation] when the
   /// halted work is an expansion.
   void _resumeExpansion(_HaltCheckpoint cp, _ExpandPlan plan) {
+    // See resumeDerivation: seed the in-flight stash so a re-halt before the
+    // first resumed pass completes still leaves a resumable checkpoint.
+    _setInFlight(cp.stage, cp.pass, cp.total, cp.digest);
     _halted = null; // ownership of cp moves into the resume flow
     _isGenerating = true;
     _generatingStage = cp.stage;
