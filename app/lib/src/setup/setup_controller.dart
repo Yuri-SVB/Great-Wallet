@@ -1886,18 +1886,22 @@ class SetupController extends ChangeNotifier {
     return true;
   }
 
-  /// Whether the current setup is a **halted, mid-derivation** plain generation
-  /// that can be saved as a *resumable* vault: a stage is halted with preserved
-  /// progress and the entropy root is still held, and it is neither a recall
-  /// walk nor an N/I expansion (whose halt state is not persisted). Such a save
-  /// carries the seed root, so it is the strongest secret the app writes — see
-  /// [VaultResume]'s security note.
+  /// Whether the current setup is a **mid-derivation** plain generation that can
+  /// be saved as a *resumable* vault — either halted (preserved [_halted]
+  /// progress) or still deriving in the foreground/background (a live [_inFlight]
+  /// checkpoint of the working stage). It must hold the entropy root and be
+  /// neither a recall walk nor an N/I expansion (whose resume state is not
+  /// persisted). A save snapshots the current checkpoint without disturbing a
+  /// derivation in progress. Such a save carries the seed root, so it is the
+  /// strongest secret the app writes — see [VaultResume]'s security note.
+  ///
+  /// Briefly false between stages (after one stage is stored and before the next
+  /// stage's first pass completes), when there is no checkpoint to snapshot yet.
   bool get canExportResumable =>
-      _halted != null &&
+      (_halted != null || _inFlight != null) &&
       _entropyBits != null &&
       _expandPlan == null &&
-      !_isRecallSession &&
-      !_isGenerating;
+      !_isRecallSession;
 
   /// Capture the current setup as a [SetupVault] (the provisional key). Each
   /// stage contributes its `(o, p, q)` and the centre of its point's leaf — one
@@ -1977,13 +1981,17 @@ class SetupController extends ChangeNotifier {
     _setPhase(SetupPhase.memorise);
   }
 
-  /// Capture a halted generation as a **resumable** [SetupVault]: the derived
-  /// prefix stages (stages 1..halted-1, each a cheap-to-decode [VaultStage])
-  /// plus the [VaultResume] state — the entropy root, the halt checkpoint, and
-  /// the stage geometry — needed to finish the chain in a later session. Caller
-  /// owns/wipes it and MUST persist it encrypted only (it holds the seed root).
+  /// Capture a mid-derivation generation as a **resumable** [SetupVault]: the
+  /// derived prefix stages (stages 1..working-1, each a cheap-to-decode
+  /// [VaultStage]) plus the [VaultResume] state — the entropy root, the working
+  /// stage's checkpoint, and the stage geometry — needed to finish the chain in
+  /// a later session. The checkpoint is the halted stash when paused, else the
+  /// live in-flight checkpoint (its digest is copied, so an ongoing derivation
+  /// that wipes/replaces the live buffer on the next pass is unaffected). Caller
+  /// owns/wipes the vault and MUST persist it encrypted only (it holds the seed
+  /// root).
   SetupVault exportResumableVault() {
-    final _HaltCheckpoint cp = _halted!;
+    final _HaltCheckpoint cp = _halted ?? _inFlight!;
     final List<int> bits = _entropyBits!;
     final List<VaultStage> stages = <VaultStage>[];
     for (int k = 1; k < cp.stage; k++) {
@@ -2104,9 +2112,9 @@ class SetupController extends ChangeNotifier {
     Uint8List? providedKey,
     int genLenBytes = SetupCrypto.keyLenBytes,
   }) async {
-    // A settled setup saves as a provisional key; a halted one saves its
-    // resume-state (the seed root + checkpoint) so the derivation can continue
-    // in a later session.
+    // A settled setup saves as a provisional key; a mid-derivation one (halted
+    // or still deriving) snapshots its resume-state (the seed root + working
+    // checkpoint) so the derivation can continue in a later session.
     final bool resumable = !canExportVault && canExportResumable;
     if (!canExportVault && !resumable) {
       return (error: 'This setup cannot be saved yet.', key: null);

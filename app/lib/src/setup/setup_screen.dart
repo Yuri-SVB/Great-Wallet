@@ -2215,7 +2215,9 @@ class _SetupScreenState extends State<SetupScreen> {
     // fills), so this notice is just the explanatory line.
     return Text(
       'Deriving stage ${_setup.generatingStage}/$total in the background — '
-      'the stages already done are ready to study now.',
+      'the stages already done are ready to study now.'
+      '${_setup.canExportResumable ? ' Write (W) snapshots the progress so far '
+          'to resume in a later session.' : ''}',
       style: Theme.of(context).textTheme.bodySmall,
     );
   }
