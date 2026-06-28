@@ -1305,6 +1305,11 @@ class _SetupScreenState extends State<SetupScreen> {
   static const Color _kConsoleBg = Color(0xE6131519); // ~90% opaque gunmetal
   static const Color _kConsoleFg = Color(0xFFE9EDF2); // cool off-white
   static const Color _kConsoleAccent = Color(0xFFB8C2CC); // brighter, same cast
+
+  /// Shared height of the source-specific input (the Stages slider for New seed
+  /// / Recall, the import field for Import). Pinning both to one value keeps the
+  /// fields below from shifting vertically when the source mode is toggled.
+  static const double _kSourceRowHeight = 48;
   static const TextStyle _termStyle = TextStyle(
     color: _kConsoleFg,
     fontFamily: GreatWallTypography.fontFamily,
@@ -1818,28 +1823,33 @@ class _SetupScreenState extends State<SetupScreen> {
     return <Widget>[
       _track(
         _Field.stages,
-        Row(
-          children: <Widget>[
-            _sliderLabel('Stages'),
-            Expanded(
-              child: Slider(
-                focusNode: _stagesFocus,
-                value: n.toDouble(),
-                min: 0,
-                max: maxN.toDouble(),
-                divisions: maxN,
-                label: '$n',
-                onChanged: _busy
-                    ? null
-                    : (double v) {
-                        final int next = v.round();
-                        if (next == _pointStages) return;
-                        _sounds.play(UiSound.tickSoft);
-                        setState(() => _pointStages = next);
-                      },
+        // Pinned to the same height as the import field so toggling the source
+        // mode never shifts the fields below.
+        SizedBox(
+          height: _kSourceRowHeight,
+          child: Row(
+            children: <Widget>[
+              _sliderLabel('Stages'),
+              Expanded(
+                child: Slider(
+                  focusNode: _stagesFocus,
+                  value: n.toDouble(),
+                  min: 0,
+                  max: maxN.toDouble(),
+                  divisions: maxN,
+                  label: '$n',
+                  onChanged: _busy
+                      ? null
+                      : (double v) {
+                          final int next = v.round();
+                          if (next == _pointStages) return;
+                          _sounds.play(UiSound.tickSoft);
+                          setState(() => _pointStages = next);
+                        },
+                ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     ];
@@ -1950,68 +1960,131 @@ class _SetupScreenState extends State<SetupScreen> {
   /// ([_fieldHelp]).
   List<Widget> _mnemonicInput() {
     final bool hex = _importFormat == _ImportFormat.hex;
+    // No standalone toggle row: a lightweight "BIP39 · Hex" text-link sits on
+    // the field's top edge as a real (clickable) overlay — straddling the
+    // outline like a caption — with the active format emphasised. Tapping a
+    // side selects it (the I / Alt+I shortcuts do the same). The whole block is
+    // pinned to [_kSourceRowHeight] so it matches the Stages slider and the
+    // fields below never shift when toggling New seed · Import · Recall.
     return <Widget>[
-      SegmentedButton<_ImportFormat>(
-        segments: const <ButtonSegment<_ImportFormat>>[
-          ButtonSegment<_ImportFormat>(
-              value: _ImportFormat.words, label: Text('Words')),
-          ButtonSegment<_ImportFormat>(
-              value: _ImportFormat.hex, label: Text('Hex')),
-        ],
-        selected: <_ImportFormat>{_importFormat},
-        showSelectedIcon: false,
-        style: const ButtonStyle(visualDensity: VisualDensity.compact),
-        onSelectionChanged: (Set<_ImportFormat> s) {
-          setState(() {
-            _importFormat = s.first;
-            _mnemonic.clear(); // the two formats are not interchangeable
-          });
-        },
-      ),
-      const SizedBox(height: 8),
       _track(
         _Field.mnemonic,
-        TextField(
-          controller: _mnemonic,
-          focusNode: _mnemonicFocus,
-          obscureText: _mnemonicHidden,
-          enabled: !_busy,
-          maxLines: 1,
-          autocorrect: false,
-          enableSuggestions: false,
-          // Hex is constrained to grouped uppercase 0-9 A-F; words are free text.
-          inputFormatters: hex
-              ? <TextInputFormatter>[
-                  FilteringTextInputFormatter.allow(RegExp(r'[0-9a-fA-F ]')),
-                  TextInputFormatter.withFunction(
-                    (TextEditingValue o, TextEditingValue n) =>
-                        n.copyWith(text: n.text.toUpperCase()),
+        SizedBox(
+          height: _kSourceRowHeight,
+          child: Stack(
+            clipBehavior: Clip.none,
+            children: <Widget>[
+              // The field is bottom-anchored full-width, leaving the top strip
+              // for the caption to straddle its outline; a compact reveal icon
+              // keeps the field short enough to sit inside the pinned height.
+              Positioned(
+                left: 0,
+                right: 0,
+                bottom: 0,
+                child: TextField(
+                  controller: _mnemonic,
+                  focusNode: _mnemonicFocus,
+                  obscureText: _mnemonicHidden,
+                  enabled: !_busy,
+                  maxLines: 1,
+                  autocorrect: false,
+                  enableSuggestions: false,
+                  // Hex is constrained to grouped uppercase 0-9 A-F; words are
+                  // free text.
+                  inputFormatters: hex
+                      ? <TextInputFormatter>[
+                          FilteringTextInputFormatter.allow(
+                              RegExp(r'[0-9a-fA-F ]')),
+                          TextInputFormatter.withFunction(
+                            (TextEditingValue o, TextEditingValue n) =>
+                                n.copyWith(text: n.text.toUpperCase()),
+                          ),
+                        ]
+                      : null,
+                  decoration: InputDecoration(
+                    isDense: true,
+                    contentPadding:
+                        const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    border: const OutlineInputBorder(),
+                    hintText: hex ? 'A1B2C3D4 …' : 'word1 word2 …',
+                    suffixIcon: IconButton(
+                      tooltip: _mnemonicHidden ? 'Show' : 'Hide',
+                      iconSize: 18,
+                      padding: EdgeInsets.zero,
+                      constraints:
+                          const BoxConstraints(minWidth: 36, minHeight: 36),
+                      icon: Icon(
+                        _mnemonicHidden ? Icons.visibility : Icons.visibility_off,
+                      ),
+                      onPressed: () =>
+                          setState(() => _mnemonicHidden = !_mnemonicHidden),
+                    ),
                   ),
-                ]
-              : null,
-          decoration: InputDecoration(
-            isDense: true,
-            border: const OutlineInputBorder(),
-            labelText:
-                hex ? 'Import hex (8 digits / stage)' : 'Import phrase (BIP39)',
-            hintText: hex ? 'A1B2C3D4 …' : 'word1 word2 …',
-            suffixIcon: IconButton(
-              tooltip: _mnemonicHidden ? 'Show' : 'Hide',
-              icon: Icon(
-                _mnemonicHidden ? Icons.visibility : Icons.visibility_off,
+                  onChanged: (_) {
+                    _sounds.play(UiSound.tickSoft);
+                    setState(() {});
+                  },
+                  onSubmitted: (_) => _submitConfig(),
+                ),
               ),
-              onPressed: () =>
-                  setState(() => _mnemonicHidden = !_mnemonicHidden),
-            ),
+              Positioned(top: 0, left: 10, child: _importFormatLabel()),
+            ],
           ),
-          onChanged: (_) {
-            _sounds.play(UiSound.tickSoft);
-            setState(() {});
-          },
-          onSubmitted: (_) => _submitConfig(),
         ),
       ),
     ];
+  }
+
+  /// The "BIP39 · Hex" text-link that straddles the import field's top edge in
+  /// place of a bulky toggle. The active format is emphasised; tapping the
+  /// other side switches (clearing the field, since the formats are not
+  /// interchangeable). Mirrors the I / Alt+I shortcuts. Painted over the field
+  /// with the panel background so it notches the outline like a caption, with
+  /// generous padding so each side is an easy tap target.
+  Widget _importFormatLabel() {
+    void select(_ImportFormat fmt) {
+      if (_busy || fmt == _importFormat) return;
+      setState(() {
+        _importFormat = fmt;
+        _mnemonic.clear();
+      });
+    }
+
+    final TextStyle base =
+        Theme.of(context).textTheme.labelMedium ?? const TextStyle();
+    final Color? on = base.color;
+    Widget side(String text, _ImportFormat fmt, String tip) {
+      final bool active = _importFormat == fmt;
+      return Tooltip(
+        message: tip,
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: () => select(fmt),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+            child: Text(
+              text,
+              style: base.copyWith(
+                fontWeight: active ? FontWeight.w700 : FontWeight.w400,
+                color: active ? on : on?.withOpacity(0.45),
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    return Container(
+      color: Theme.of(context).colorScheme.surface,
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          side('BIP39', _ImportFormat.words, 'Import an existing BIP39 phrase'),
+          Text('·', style: base.copyWith(color: on?.withOpacity(0.45))),
+          side('Hex', _ImportFormat.hex, 'Import raw hex (8 digits / stage)'),
+        ],
+      ),
+    );
   }
 
   /// The Stage-0 salt/pepper field: obscured by default with a reveal toggle,
