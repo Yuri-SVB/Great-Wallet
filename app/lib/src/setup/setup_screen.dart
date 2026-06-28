@@ -4,6 +4,8 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart'
+    show defaultTargetPlatform, kIsWeb, TargetPlatform;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:great_wall_ux/great_wall_ux.dart';
@@ -13,6 +15,7 @@ import 'package:qr/qr.dart' as qr;
 import '../core/encoding_constants.dart';
 import '../core/great_wall_core.dart';
 import '../ffi/core_bindings.dart';
+import 'desktop_qr_scanner.dart';
 import 'setup_controller.dart';
 import 'setup_crypto.dart';
 
@@ -89,7 +92,7 @@ class _SetupScreenState extends State<SetupScreen> {
       if (!mounted || _exportLabelRestricted == adjusted) return;
       setState(() => _exportLabelRestricted = adjusted);
       if (adjusted) {
-        _warnOnConsole('Export label adjusted to A–Z, 0–9 and "-" so it stays '
+        _warnOnConsole('Export salt adjusted to A–Z, 0–9 and "-" so it stays '
             'reproducible.');
       }
     });
@@ -191,13 +194,12 @@ class _SetupScreenState extends State<SetupScreen> {
   bool _expandManualActive = false;
   int? _expandManualTarget;
 
-  /// Provisional-key save/load: the destination/source file path and the
-  /// provisional key (a decimal string, for loading). Save generates a fresh
-  /// key and shows it; this field is only read on load. [_vaultBusy] disables
+  /// Provisional-key save/load: the destination/source file path. The
+  /// provisional key itself is never kept in a screen field — it is entered,
+  /// shown, or copied only inside the Write/Open dialogs. [_vaultBusy] disables
   /// the controls while an encrypt/decrypt pass runs.
   final TextEditingController _vaultPath = TextEditingController();
-  final TextEditingController _vaultKey = TextEditingController();
-  bool _vaultKeyHidden = true;
+  final FocusNode _vaultPathFocus = FocusNode(debugLabel: 'vault-path');
   bool _vaultBusy = false;
 
   /// True while a master-secret export's Argon2id pass is in flight, so a second
@@ -414,7 +416,7 @@ class _SetupScreenState extends State<SetupScreen> {
     _pointImport.dispose();
     _pointImportFocus.dispose();
     _vaultPath.dispose();
-    _vaultKey.dispose();
+    _vaultPathFocus.dispose();
     _stage0.dispose();
     _hotkeys.dispose();
     _stage0Focus.dispose();
@@ -439,6 +441,14 @@ class _SetupScreenState extends State<SetupScreen> {
       (defaultTargetPlatform == TargetPlatform.android ||
           defaultTargetPlatform == TargetPlatform.iOS ||
           defaultTargetPlatform == TargetPlatform.macOS);
+
+  /// Whether the desktop (flutter_webrtc + zxing2) scan path applies — Linux and
+  /// Windows, where `mobile_scanner` has no backend. Best-effort: the camera may
+  /// fail to open on some setups, in which case the user falls back to hex-load.
+  bool get _desktopScanSupported =>
+      !kIsWeb &&
+      (defaultTargetPlatform == TargetPlatform.linux ||
+          defaultTargetPlatform == TargetPlatform.windows);
 
   /// Whether a setup session is live (stages exist to navigate / focus): not the
   /// initial config screen, an error, or a finished/wiped session.
@@ -705,6 +715,12 @@ class _SetupScreenState extends State<SetupScreen> {
         }
         return KeyEventResult.handled;
       }
+      // Alt+V — reveal / hide the obscured sensitive text fields together (the
+      // visibility counterpart of V's volume control).
+      if (event.logicalKey == LogicalKeyboardKey.keyV) {
+        _toggleSensitiveVisibility();
+        return KeyEventResult.handled;
+      }
     }
     if (kb.isAltPressed || kb.isControlPressed || kb.isMetaPressed) {
       return KeyEventResult.ignored;
@@ -783,7 +799,7 @@ class _SetupScreenState extends State<SetupScreen> {
     // (which could be stale): a live setup means the export label.
     if (event.logicalKey == LogicalKeyboardKey.keyS) {
       if (_hasSession) {
-        _focusField(_exportLabelFocus, 'export label');
+        _focusField(_exportLabelFocus, 'export salt');
       } else {
         _focusField(_stage0Focus, 'salt / pepper');
       }
@@ -810,6 +826,26 @@ class _SetupScreenState extends State<SetupScreen> {
       if (!_busy) _copyMasterSecret();
       return KeyEventResult.handled;
     }
+    // Provisional-key panel (when shown): F focus file path · W write/save ·
+    // O open setup file · T blank template. W/O/T no-op while a vault pass runs.
+    if (_vaultPanelShown) {
+      if (event.logicalKey == LogicalKeyboardKey.keyF) {
+        _focusVaultPath();
+        return KeyEventResult.handled;
+      }
+      if (event.logicalKey == LogicalKeyboardKey.keyW) {
+        if (!_vaultBusy) _writeSetup();
+        return KeyEventResult.handled;
+      }
+      if (event.logicalKey == LogicalKeyboardKey.keyO) {
+        if (!_vaultBusy) _openSetup();
+        return KeyEventResult.handled;
+      }
+      if (event.logicalKey == LogicalKeyboardKey.keyT) {
+        if (!_vaultBusy) _exportBlankTemplate();
+        return KeyEventResult.handled;
+      }
+    }
     // 0–8 — select that stage: focus it, or derive it if it is next.
     final int? digit = _digitKeys[event.logicalKey];
     if (digit != null) {
@@ -817,6 +853,19 @@ class _SetupScreenState extends State<SetupScreen> {
       return KeyEventResult.handled;
     }
     return KeyEventResult.ignored;
+  }
+
+  /// Alt+V — reveal or hide the obscured sensitive text fields (the salt/pepper
+  /// and the import phrase/hex) together: if any is hidden, reveal all; if all
+  /// are shown, hide all. The counterpart of V's volume control.
+  void _toggleSensitiveVisibility() {
+    final bool reveal = _stage0Hidden || _mnemonicHidden;
+    _sounds.play(UiSound.click);
+    setState(() {
+      _stage0Hidden = !reveal;
+      _mnemonicHidden = !reveal;
+    });
+    _toast(reveal ? 'Sensitive text revealed.' : 'Sensitive text hidden.');
   }
 
   /// Step the UI sound-cue volume one level (bound to `V` + ↑/↓). Plays a cue at
@@ -1219,11 +1268,14 @@ class _SetupScreenState extends State<SetupScreen> {
     'N / I / R  New seed / Import / Recall (config) · on a stage: change its point',
     'I import = BIP39 words · Alt+I import = hex (config & point edit alike)',
     'Click/press a ghost slot past the last stage to grow the setup (N/I/R)',
-    'S salt / export label · P profile · D derivation steps · C colour',
+    'S salt / export salt · P profile · D derivation steps · C colour',
     'Enter  start (Generate / Encode / Begin recall) from a field',
     'K  copy the master secret ("the key")    H  halt derivation (keeps progress)',
     'X  exclude this stage & above (shorten the setup)',
-    'V+↑/↓  sound volume (level 0 = muted)',
+    'Vault: F file path · W write/save · O open file · T blank templates',
+    'In Write: Q QR · Alt+Q copy · press again to switch 128/256-bit · I own key',
+    'In Open: Q scan QR · Alt+Q type key (32 or 64 hex) · Esc cancel',
+    'V+↑/↓  sound volume (level 0 = muted) · Alt+V reveal/hide sensitive text',
     'Alt+K  copy the full export digest (not just the first 32 chars)',
     'Alt+L  deep render — reveal leaves in escape-count voids (slower)',
     'L+scroll brightness · scroll zoom · drag pan (over the canvas)',
@@ -2134,6 +2186,7 @@ class _SetupScreenState extends State<SetupScreen> {
           _Field.vault,
           TextField(
             controller: _vaultPath,
+            focusNode: _vaultPathFocus,
             enabled: !_vaultBusy,
             maxLines: 1,
             autocorrect: false,
@@ -2141,69 +2194,37 @@ class _SetupScreenState extends State<SetupScreen> {
             decoration: const InputDecoration(
               isDense: true,
               border: OutlineInputBorder(),
-              labelText: 'File path',
+              labelText: 'File path  (F)',
               hintText: '/path/to/setup.gwvault',
             ),
           ),
         ),
         const SizedBox(height: 8),
-        _track(
-          _Field.vault,
-          TextField(
-            controller: _vaultKey,
-            enabled: !_vaultBusy,
-            obscureText: _vaultKeyHidden,
-            maxLines: 1,
-            autocorrect: false,
-            enableSuggestions: false,
-            decoration: InputDecoration(
-              isDense: true,
-              border: const OutlineInputBorder(),
-              labelText: 'Key — 32 hex digits (to load)',
-              hintText: 'paste from your manager, then Load',
-              suffixIcon: IconButton(
-                tooltip: _vaultKeyHidden ? 'Show' : 'Hide',
-                icon: Icon(
-                    _vaultKeyHidden ? Icons.visibility : Icons.visibility_off),
-                onPressed: () =>
-                    setState(() => _vaultKeyHidden = !_vaultKeyHidden),
-              ),
-            ),
-          ),
-        ),
-        const SizedBox(height: 8),
+        // The provisional key is entered / shown / copied only inside the
+        // Write and Open dialogs — never in a panel field — so it is never an
+        // idle on-screen artifact. F focuses the path; W writes; O opens; T
+        // prints a blank template.
         Wrap(
           spacing: 8,
           runSpacing: 8,
           crossAxisAlignment: WrapCrossAlignment.center,
           children: <Widget>[
-            if (canSave)
-              FilledButton.icon(
-                onPressed: _vaultBusy ? null : _saveGenerated,
-                icon: const Icon(Icons.qr_code_2),
-                label: const Text('Generate key'),
-              ),
-            if (canSave)
-              OutlinedButton.icon(
-                onPressed: _vaultBusy ? null : _saveEnteredKey,
-                icon: const Icon(Icons.casino),
-                label: const Text('Enter key'),
-              ),
-            if (_scanSupported)
-              OutlinedButton.icon(
-                onPressed: _vaultBusy ? null : _scanAndLoad,
-                icon: const Icon(Icons.qr_code_scanner),
-                label: const Text('Scan & load'),
-              ),
+            // Always present (greyed out when there is nothing to save yet) so
+            // the panel layout stays stable.
+            FilledButton.icon(
+              onPressed: (_vaultBusy || !canSave) ? null : _writeSetup,
+              icon: const Icon(Icons.save_alt),
+              label: const Text('Write (save)  (W)'),
+            ),
             OutlinedButton.icon(
-              onPressed: _vaultBusy ? null : _loadWithHex,
+              onPressed: _vaultBusy ? null : _openSetup,
               icon: const Icon(Icons.lock_open),
-              label: const Text('Load (hex)'),
+              label: const Text('Open setup file  (O)'),
             ),
             OutlinedButton.icon(
               onPressed: _vaultBusy ? null : _exportBlankTemplate,
               icon: const Icon(Icons.print),
-              label: const Text('Blank template'),
+              label: const Text('Blank templates  (T)'),
             ),
             if (_vaultBusy)
               const SizedBox(
@@ -2217,9 +2238,23 @@ class _SetupScreenState extends State<SetupScreen> {
     );
   }
 
-  /// Save with an app-generated 128-bit key (modes 1 & 2), then show its QR /
-  /// hex to record offline.
-  Future<void> _saveGenerated() async {
+  /// Move keyboard focus to the vault file-path field (F).
+  void _focusVaultPath() => _focusField(_vaultPathFocus, 'vault file path');
+
+  /// Whether the provisional-key panel is on screen — the config screen (to open
+  /// a saved setup) or a settled setup (to write one). Gates the F/W/O/T keys.
+  bool get _vaultPanelShown =>
+      _setup.phase == SetupPhase.idle || _setup.canExportVault;
+
+  /// Write (save) the settled setup to the file path, encrypted under a fresh
+  /// app-generated 128-bit key, then open the key dialog (W). The key can be
+  /// overridden with the user's own entropy from inside that dialog.
+  Future<void> _writeSetup() async {
+    if (!_setup.canExportVault) {
+      _sounds.play(UiSound.denyInput);
+      _toast('Finish a setup first — there is nothing to write yet.');
+      return;
+    }
     final String path = _vaultPath.text.trim();
     if (path.isEmpty) {
       _sounds.play(UiSound.denyInput);
@@ -2237,96 +2272,127 @@ class _SetupScreenState extends State<SetupScreen> {
       return;
     }
     _sounds.play(UiSound.exportOk);
-    await _showKeyDialog(result.key!);
+    await _showKeyDialog(path, result.key!);
   }
 
-  /// Save with the user's own 128-bit entropy (mode 3): prompt for 32 hex, then
-  /// show the matching QR.
-  Future<void> _saveEnteredKey() async {
+  /// Open (load) a saved setup from the file path (O): scan the QR (Q) or type
+  /// the 32-hex key (Alt+Q focuses the field, Enter loads), Esc to cancel. The
+  /// key is never displayed.
+  Future<void> _openSetup() async {
     final String path = _vaultPath.text.trim();
     if (path.isEmpty) {
       _sounds.play(UiSound.denyInput);
       _toast('Enter a file path.');
       return;
     }
-    final TextEditingController input = TextEditingController();
-    final bool? go = await showDialog<bool>(
+    final bool canScan = _scanSupported || _desktopScanSupported;
+    final TextEditingController hexInput = TextEditingController();
+    final FocusNode hexFocus = FocusNode(debugLabel: 'open-hex');
+    Uint8List? keyBytes;
+
+    await showDialog<void>(
       context: context,
-      builder: (BuildContext ctx) => AlertDialog(
-        title: const Text('Use your own key'),
-        content: SizedBox(
-          width: 320,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: <Widget>[
-              const Text(
-                'Enter 32 hex digits (128 bits) from your own trusted entropy '
-                '(e.g. dice) if you distrust the device RNG. The app encrypts '
-                'with these and shows the matching QR.',
-                style: TextStyle(fontSize: 12),
-              ),
-              const SizedBox(height: 8),
-              TextField(
-                controller: input,
-                maxLines: 1,
-                autocorrect: false,
-                enableSuggestions: false,
-                decoration: const InputDecoration(
-                  border: OutlineInputBorder(),
-                  hintText: '32 hex digits (0–9 A–F)',
+      builder: (BuildContext ctx) {
+        void loadHex() {
+          try {
+            keyBytes = SetupCrypto.hexToKey(hexInput.text);
+          } on FormatException catch (e) {
+            _sounds.play(UiSound.denyInput);
+            _toast(e.message);
+            return;
+          }
+          Navigator.of(ctx).pop();
+        }
+
+        Future<void> scan() async {
+          final Uint8List? k = await _scanKey();
+          if (k == null) return;
+          keyBytes = k;
+          if (ctx.mounted) Navigator.of(ctx).pop();
+        }
+
+        return CallbackShortcuts(
+          bindings: <ShortcutActivator, VoidCallback>{
+            if (canScan) const SingleActivator(LogicalKeyboardKey.keyQ): scan,
+            const SingleActivator(LogicalKeyboardKey.keyQ, alt: true): () =>
+                hexFocus.requestFocus(),
+            const SingleActivator(LogicalKeyboardKey.escape): () =>
+                Navigator.of(ctx).pop(),
+          },
+          child: Focus(
+            autofocus: true,
+            child: AlertDialog(
+              title: const Text('Open setup file'),
+              content: SizedBox(
+                width: 340,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: <Widget>[
+                    Text(
+                      canScan
+                          ? 'Q — scan the QR with the camera.  Alt+Q — type the '
+                              '32-hex key instead.  Esc — cancel.'
+                          : 'Alt+Q — type the 32-hex key (live scanning needs a '
+                              'camera this platform does not expose).  '
+                              'Esc — cancel.',
+                      style: const TextStyle(fontSize: 12),
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: hexInput,
+                      focusNode: hexFocus,
+                      autocorrect: false,
+                      enableSuggestions: false,
+                      maxLines: 1,
+                      onSubmitted: (_) => loadHex(),
+                      decoration: const InputDecoration(
+                        isDense: true,
+                        border: OutlineInputBorder(),
+                        labelText: 'Key — 32 hex digits',
+                        hintText: 'paste from your manager, then Enter',
+                      ),
+                    ),
+                  ],
                 ),
               ),
-            ],
+              actions: <Widget>[
+                if (canScan)
+                  TextButton.icon(
+                    onPressed: scan,
+                    icon: const Icon(Icons.qr_code_scanner),
+                    label: const Text('Scan (Q)'),
+                  ),
+                TextButton(
+                  onPressed: () => Navigator.of(ctx).pop(),
+                  child: const Text('Cancel'),
+                ),
+                FilledButton(
+                  onPressed: loadHex,
+                  child: const Text('Load'),
+                ),
+              ],
+            ),
           ),
-        ),
-        actions: <Widget>[
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop(false),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.of(ctx).pop(true),
-            child: const Text('Use'),
-          ),
-        ],
-      ),
+        );
+      },
     );
-    final String text = input.text;
-    input.dispose();
-    if (go != true || !mounted) return;
-    Uint8List keyBytes;
-    try {
-      keyBytes = SetupCrypto.hexToKey(text);
-    } on FormatException catch (e) {
-      _sounds.play(UiSound.denyInput);
-      _toast(e.message);
-      return;
-    }
-    setState(() => _vaultBusy = true);
-    final ({String? error, Uint8List? key}) result =
-        await _setup.saveVaultToFile(path, providedKey: keyBytes);
-    _wipeBytes(keyBytes);
-    if (!mounted) return;
-    setState(() => _vaultBusy = false);
-    if (result.error != null || result.key == null) {
-      _sounds.play(UiSound.denyInput);
-      _toast(result.error ?? 'Could not save.');
-      return;
-    }
-    _sounds.play(UiSound.exportOk);
-    await _showKeyDialog(result.key!);
+    hexInput.dispose();
+    hexFocus.dispose();
+    if (!mounted || keyBytes == null) return;
+    await _loadWithBytes(path, keyBytes!);
   }
 
-  /// Open the webcam, decode the key QR's raw bytes, and load+decrypt the file
-  /// directly — the key is never shown or typed. Only where [_scanSupported].
-  Future<void> _scanAndLoad() async {
-    final String path = _vaultPath.text.trim();
-    if (path.isEmpty) {
-      _sounds.play(UiSound.denyInput);
-      _toast('Enter a file path.');
-      return;
-    }
+  /// Scan the provisional-key QR, returning the 16 raw key bytes or null. Uses
+  /// `mobile_scanner` where it has a backend, else the flutter_webrtc + zxing2
+  /// desktop scanner.
+  Future<Uint8List?> _scanKey() => _desktopScanSupported
+      ? DesktopKeyScanner.show(context)
+      : _scanWithMobileScanner();
+
+  /// The `mobile_scanner` dialog (Android / iOS / macOS): returns the 16 raw key
+  /// bytes from the QR's byte segment, or null if cancelled.
+  Future<Uint8List?> _scanWithMobileScanner() async {
     Uint8List? keyBytes;
     await showDialog<void>(
       context: context,
@@ -2339,7 +2405,7 @@ class _SetupScreenState extends State<SetupScreen> {
             onDetect: (BarcodeCapture capture) {
               if (keyBytes != null || capture.barcodes.isEmpty) return;
               final Uint8List? raw = capture.barcodes.first.rawBytes;
-              if (raw == null || raw.length != SetupCrypto.keyLenBytes) return;
+              if (raw == null || !SetupCrypto.isValidKeyLen(raw.length)) return;
               keyBytes = Uint8List.fromList(raw);
               Navigator.of(ctx).pop();
             },
@@ -2353,27 +2419,7 @@ class _SetupScreenState extends State<SetupScreen> {
         ],
       ),
     );
-    if (!mounted || keyBytes == null) return;
-    await _loadWithBytes(path, keyBytes!);
-  }
-
-  /// Load using the 32-hex key from the field (pasted from a manager / your own).
-  Future<void> _loadWithHex() async {
-    final String path = _vaultPath.text.trim();
-    if (path.isEmpty) {
-      _sounds.play(UiSound.denyInput);
-      _toast('Enter a file path.');
-      return;
-    }
-    Uint8List keyBytes;
-    try {
-      keyBytes = SetupCrypto.hexToKey(_vaultKey.text);
-    } on FormatException catch (e) {
-      _sounds.play(UiSound.denyInput);
-      _toast(e.message);
-      return;
-    }
-    await _loadWithBytes(path, keyBytes);
+    return keyBytes;
   }
 
   /// Shared decrypt+restore from a file path and 16-byte key, wiping the key.
@@ -2388,136 +2434,217 @@ class _SetupScreenState extends State<SetupScreen> {
       _toast(err);
       return;
     }
-    _vaultKey.clear();
     _sounds.play(UiSound.confirm);
     _toast('Setup loaded.');
   }
 
-  /// Show the 16-byte [keyBytes] as a byte-mode v1 QR — a "Scan" view and a
-  /// "Hand-fill" template (key-independent cells pre-inked, only the rest to
-  /// colour) — with the hex hidden behind a reveal (for a password manager). The
-  /// key copy is wiped when the dialog closes.
-  Future<void> _showKeyDialog(Uint8List keyBytes) async {
-    final String hex = SetupCrypto.keyToHex(keyBytes);
-    final qr.QrImage matrix = qr.QrImage(
-      qr.QrCode(1, qr.QrErrorCorrectLevel.L)
-        ..addByteData(ByteData.sublistView(keyBytes)),
-    );
-    bool handFill = false;
-    bool showHex = false;
+  /// After a write, present the provisional [keyBytes] for the file at [path]:
+  /// reveal the byte-mode v1 QR to hand-copy (Q), copy the 32-hex key blind to
+  /// the clipboard for a password manager (Alt+Q), or overwrite the key with the
+  /// user's own 32-hex entropy (I focuses the field, Enter applies). Esc closes.
+  /// The key is never shown as text — only as a QR or copied blind — and the
+  /// in-memory copy is wiped when the dialog closes.
+  Future<void> _showKeyDialog(String path, Uint8List keyBytes) async {
+    Uint8List key = keyBytes;
+    int keyLen = key.length; // 16 (128-bit) or 32 (256-bit)
+    qr.QrImage matrix = _keyMatrix(key);
+    bool showQr = false;
+    bool copiedOnce = false;
+    bool busy = false;
+    final TextEditingController hexInput = TextEditingController();
+    final FocusNode hexFocus = FocusNode(debugLabel: 'write-hex');
+
     await showDialog<void>(
       context: context,
       builder: (BuildContext ctx) => StatefulBuilder(
-        builder: (BuildContext ctx, void Function(void Function()) setLocal) =>
-            AlertDialog(
-          title: const Text('Provisional key'),
-          content: SizedBox(
-            width: 320,
-            child: SingleChildScrollView(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: <Widget>[
-                  SegmentedButton<bool>(
-                    segments: const <ButtonSegment<bool>>[
-                      ButtonSegment<bool>(value: false, label: Text('Scan')),
-                      ButtonSegment<bool>(value: true, label: Text('Hand-fill')),
-                    ],
-                    selected: <bool>{handFill},
-                    showSelectedIcon: false,
-                    onSelectionChanged: (Set<bool> s) =>
-                        setLocal(() => handFill = s.first),
-                  ),
-                  const SizedBox(height: 12),
-                  Center(
-                    child: Container(
-                      color: Colors.white,
-                      padding: const EdgeInsets.all(12),
-                      child: CustomPaint(
-                        size: const Size(252, 252),
-                        painter: _QrPainter(
-                            matrix, handFill ? _QrView.template : _QrView.scan),
-                      ),
+        builder: (BuildContext ctx, void Function(void Function()) setLocal) {
+          void copyHex() {
+            Clipboard.setData(ClipboardData(text: SetupCrypto.keyToHex(key)));
+            _toast('${keyLen * 8}-bit key copied. The clipboard is not '
+                'air-gapped — clear it after pasting into your manager.');
+          }
+
+          // Re-seal the file with either the user's own key or a fresh
+          // [newLen]-byte generated key, overwriting the previous key + file,
+          // and redraw. Shared by the 128↔256 toggle and the own-key path.
+          Future<bool> reseal({Uint8List? ownKey, required int newLen}) async {
+            setLocal(() => busy = true);
+            final ({String? error, Uint8List? key}) r = await _setup
+                .saveVaultToFile(path, providedKey: ownKey, genLenBytes: newLen);
+            if (ownKey != null) _wipeBytes(ownKey);
+            if (!ctx.mounted) return false;
+            if (r.error != null || r.key == null) {
+              setLocal(() => busy = false);
+              _sounds.play(UiSound.denyInput);
+              _toast(r.error ?? 'Could not save.');
+              return false;
+            }
+            _wipeBytes(key); // drop the superseded key
+            _sounds.play(UiSound.exportOk);
+            setLocal(() {
+              key = r.key!;
+              keyLen = key.length;
+              matrix = _keyMatrix(key);
+              busy = false;
+            });
+            return true;
+          }
+
+          int otherLen() => keyLen == SetupCrypto.keyLenBytes
+              ? SetupCrypto.keyLenBytes256
+              : SetupCrypto.keyLenBytes;
+
+          Future<void> applyOwnKey() async {
+            Uint8List ownKey;
+            try {
+              ownKey = SetupCrypto.hexToKey(hexInput.text);
+            } on FormatException catch (e) {
+              _sounds.play(UiSound.denyInput);
+              _toast(e.message);
+              return;
+            }
+            if (await reseal(ownKey: ownKey, newLen: ownKey.length)) {
+              setLocal(hexInput.clear);
+              _toast('Re-saved with your own ${keyLen * 8}-bit key.');
+            }
+          }
+
+          // Q reveals the QR; pressing it again switches 128↔256 (a fresh key,
+          // overwriting the file). Alt+Q copies; pressing it again switches too.
+          void onShowQr() {
+            if (busy) return;
+            if (!showQr) {
+              setLocal(() => showQr = true);
+            } else {
+              reseal(newLen: otherLen());
+            }
+          }
+
+          void onCopy() {
+            if (busy) return;
+            if (!copiedOnce) {
+              copyHex();
+              setLocal(() => copiedOnce = true);
+            } else {
+              reseal(newLen: otherLen()).then((bool ok) {
+                if (ok && ctx.mounted) copyHex();
+              });
+            }
+          }
+
+          final int version = keyLen > SetupCrypto.keyLenBytes ? 2 : 1;
+          return CallbackShortcuts(
+            bindings: <ShortcutActivator, VoidCallback>{
+              const SingleActivator(LogicalKeyboardKey.keyQ): onShowQr,
+              const SingleActivator(LogicalKeyboardKey.keyQ, alt: true): onCopy,
+              const SingleActivator(LogicalKeyboardKey.keyI): () =>
+                  hexFocus.requestFocus(),
+              const SingleActivator(LogicalKeyboardKey.escape): () =>
+                  Navigator.of(ctx).pop(),
+            },
+            child: Focus(
+              autofocus: true,
+              child: AlertDialog(
+                title: Text('Provisional key — ${keyLen * 8}-bit'),
+                content: SizedBox(
+                  width: 340,
+                  child: SingleChildScrollView(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: <Widget>[
+                        const Text(
+                          'Saved. Keep the key OFFLINE and destroy it at '
+                          'graduation (shred / burn). Lose it and the file is '
+                          'unrecoverable — that is the point.',
+                          style: TextStyle(fontSize: 12),
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          'Q — show the QR to hand-copy onto a printed blank '
+                          'template (T).  Alt+Q — copy the key for a password '
+                          'manager (blind).  Press Q or Alt+Q again to switch to '
+                          '${otherLen() * 8}-bit (a fresh key, overwriting the '
+                          'file).  I — use your own 32- or 64-hex key (Enter).  '
+                          'Esc — close.',
+                          style: const TextStyle(fontSize: 11),
+                        ),
+                        if (showQr) ...<Widget>[
+                          const SizedBox(height: 12),
+                          Center(
+                            child: Container(
+                              color: Colors.white,
+                              padding: const EdgeInsets.all(12),
+                              child: CustomPaint(
+                                size: const Size(252, 252),
+                                painter: _QrPainter(matrix, _QrView.scan),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            '${keyLen * 8}-bit · QR v$version. Do this alone, no '
+                            'cameras. At EC-L the code still scans with up to ~2 '
+                            'stray mis-coloured cells, so work carefully.',
+                            style: const TextStyle(fontSize: 11),
+                          ),
+                        ],
+                        const SizedBox(height: 12),
+                        TextField(
+                          controller: hexInput,
+                          focusNode: hexFocus,
+                          enabled: !busy,
+                          autocorrect: false,
+                          enableSuggestions: false,
+                          maxLines: 1,
+                          onSubmitted: (_) => applyOwnKey(),
+                          decoration: const InputDecoration(
+                            isDense: true,
+                            border: OutlineInputBorder(),
+                            labelText:
+                                'Your own key — 32 or 64 hex digits (optional)',
+                            hintText: 'from dice etc., then Enter to apply',
+                          ),
+                        ),
+                      ],
                     ),
                   ),
-                  const SizedBox(height: 8),
-                  Text(
-                    handFill
-                        ? 'Colour ONLY the grey cells solid black — the black '
-                            'cells (finders/timing) are already correct. Do this '
-                            'alone, in a private room, no cameras. At EC-L the '
-                            'code still scans with up to ~2 stray mis-coloured '
-                            'cells, so work carefully.'
-                        : 'The full code, for reference. Hand-colour it onto a '
-                            'printed blank template (in private); restore later '
-                            'by scanning it.',
-                    style: const TextStyle(fontSize: 11),
+                ),
+                actions: <Widget>[
+                  TextButton.icon(
+                    onPressed: busy ? null : onShowQr,
+                    icon: const Icon(Icons.qr_code_2),
+                    label: Text(showQr ? 'Switch bits (Q)' : 'Show QR (Q)'),
                   ),
-                  const SizedBox(height: 12),
-                  const Text(
-                    'This is the ONLY key to the saved file. Keep it OFFLINE and '
-                    'destroy it at graduation (shred/burn). Lose it and the file '
-                    'is unrecoverable — that is the point.',
-                    style: TextStyle(fontSize: 12),
+                  TextButton.icon(
+                    onPressed: busy ? null : onCopy,
+                    icon: const Icon(Icons.copy),
+                    label: const Text('Copy key (Alt+Q)'),
                   ),
-                  const SizedBox(height: 8),
-                  Align(
-                    alignment: Alignment.centerLeft,
-                    child: TextButton.icon(
-                      icon: Icon(showHex
-                          ? Icons.visibility_off
-                          : Icons.visibility),
-                      label: Text(showHex
-                          ? 'Hide hex'
-                          : 'Show hex (to store in a manager)'),
-                      onPressed: () => setLocal(() => showHex = !showHex),
-                    ),
+                  TextButton(
+                    onPressed: () => Navigator.of(ctx).pop(),
+                    child: const Text('Done'),
                   ),
-                  if (showHex) ...<Widget>[
-                    SelectableText(
-                      _groupHex(hex),
-                      textAlign: TextAlign.center,
-                      style: const TextStyle(
-                          fontFamily: 'monospace',
-                          fontSize: 15,
-                          letterSpacing: 1),
-                    ),
-                    Align(
-                      alignment: Alignment.centerRight,
-                      child: TextButton(
-                        onPressed: () {
-                          Clipboard.setData(ClipboardData(text: hex));
-                          _toast('Copied. Clipboard is not air-gapped — clear '
-                              'it after use.');
-                        },
-                        child: const Text('Copy hex'),
-                      ),
-                    ),
-                  ],
                 ],
               ),
             ),
-          ),
-          actions: <Widget>[
-            TextButton(
-              onPressed: () => Navigator.of(ctx).pop(),
-              child: const Text('Done'),
-            ),
-          ],
-        ),
+          );
+        },
       ),
     );
-    _wipeBytes(keyBytes); // recorded or abandoned — drop our copy
+    hexInput.dispose();
+    hexFocus.dispose();
+    _wipeBytes(key); // recorded or abandoned — drop our copy
   }
 
-  /// Group hex into space-separated runs of four, for legible transcription.
-  String _groupHex(String hex) {
-    final StringBuffer out = StringBuffer();
-    for (int i = 0; i < hex.length; i++) {
-      if (i > 0 && i % 4 == 0) out.write(' ');
-      out.write(hex[i]);
-    }
-    return out.toString();
+  /// Byte-mode QR matrix for a provisional key: v1 (21×21) for the 16-byte
+  /// key, v2 (25×25) for the 32-byte 256-bit key, both at EC level L.
+  qr.QrImage _keyMatrix(Uint8List key) {
+    final int version = key.length > SetupCrypto.keyLenBytes ? 2 : 1;
+    return qr.QrImage(
+      qr.QrCode(version, qr.QrErrorCorrectLevel.L)
+        ..addByteData(ByteData.sublistView(key)),
+    );
   }
 
   static void _wipeBytes(Uint8List b) {
@@ -2526,46 +2653,58 @@ class _SetupScreenState extends State<SetupScreen> {
     }
   }
 
-  /// Export a reusable **blank** hand-fill template (the key-independent
-  /// skeleton: finders, timing, dark module, on a v1 grid) as a PNG next to the
-  /// vault path, for printing and hand-colouring. Holds no secret.
+  /// Export both reusable **blank** hand-fill templates (the key-independent
+  /// skeleton: finders, timing, dark module, the v2 alignment pattern, over a
+  /// highlighted module grid) as PNGs in the vault path's folder — one per key
+  /// size, named `128-bit-…` / `256-bit-provisional-key-qr-template.png` so the
+  /// size leads the file name. They hold no secret; print and hand-colour.
   Future<void> _exportBlankTemplate() async {
     final String base = _vaultPath.text.trim();
     if (base.isEmpty) {
       _sounds.play(UiSound.denyInput);
-      _toast('Enter a file path first; the blank template saves beside it.');
+      _toast('Enter a file path first; the templates save in its folder.');
       return;
     }
-    final String path = '$base.blank-template.png';
+    final String dir = File(base).parent.path;
+    final String sep = Platform.pathSeparator;
     try {
-      // A dummy all-zero key just yields the v1 module geometry; only the
-      // key-independent (fixed) cells are drawn, so it leaks nothing.
-      final qr.QrImage matrix = qr.QrImage(
-        qr.QrCode(1, qr.QrErrorCorrectLevel.L)
-          ..addByteData(ByteData.sublistView(Uint8List(SetupCrypto.keyLenBytes))),
-      );
-      final int px = matrix.moduleCount * 24; // 24 px per module
-      final ui.PictureRecorder recorder = ui.PictureRecorder();
-      final Canvas canvas = Canvas(recorder);
-      _QrPainter(matrix, _QrView.blank)
-          .paint(canvas, Size(px.toDouble(), px.toDouble()));
-      final ui.Picture picture = recorder.endRecording();
-      final ui.Image image = await picture.toImage(px, px);
-      final ByteData? png =
-          await image.toByteData(format: ui.ImageByteFormat.png);
-      image.dispose();
-      picture.dispose();
-      if (png == null) {
-        if (mounted) _toast('Could not render the template.');
-        return;
+      final List<String> saved = <String>[];
+      for (final int lenBytes in <int>[
+        SetupCrypto.keyLenBytes,
+        SetupCrypto.keyLenBytes256,
+      ]) {
+        final Uint8List png = await _renderBlankTemplatePng(lenBytes);
+        final String name =
+            '${lenBytes * 8}-bit-provisional-key-qr-template.png';
+        await File('$dir$sep$name').writeAsBytes(png, flush: true);
+        saved.add(name);
       }
-      await File(path).writeAsBytes(png.buffer.asUint8List(), flush: true);
       if (!mounted) return;
       _sounds.play(UiSound.exportOk);
-      _toast('Blank template saved: $path');
+      _toast('Blank templates saved in $dir: ${saved.join(', ')}');
     } catch (e) {
-      if (mounted) _toast('Could not save the template (${e.runtimeType}).');
+      if (mounted) _toast('Could not save the templates (${e.runtimeType}).');
     }
+  }
+
+  /// Render the blank hand-fill skeleton PNG for a [lenBytes]-byte key (v1 for
+  /// 16, v2 for 32). A dummy all-zero key yields only the module geometry; only
+  /// the key-independent cells are drawn, so it leaks nothing.
+  Future<Uint8List> _renderBlankTemplatePng(int lenBytes) async {
+    final qr.QrImage matrix = _keyMatrix(Uint8List(lenBytes));
+    // 24 px per module, including the painter's 4-module quiet zone each side.
+    final int px = (matrix.moduleCount + 2 * _QrPainter.quiet) * 24;
+    final ui.PictureRecorder recorder = ui.PictureRecorder();
+    final Canvas canvas = Canvas(recorder);
+    _QrPainter(matrix, _QrView.blank)
+        .paint(canvas, Size(px.toDouble(), px.toDouble()));
+    final ui.Picture picture = recorder.endRecording();
+    final ui.Image image = await picture.toImage(px, px);
+    final ByteData? png = await image.toByteData(format: ui.ImageByteFormat.png);
+    image.dispose();
+    picture.dispose();
+    if (png == null) throw StateError('template render failed');
+    return png.buffer.asUint8List();
   }
 
   /// Common message tail for a point edit: what gets discarded above stage [k].
@@ -2910,26 +3049,20 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   /// Truncation control: exclude the displayed stage and every stage above it.
+  /// The explanation lives in the console (focus _Field.truncate); the panel
+  /// keeps only the action button for a stable, compact layout.
   Widget _truncateControl() {
     final int k = _setup.displayStageIndex;
-    final int last = _setup.nStages - 1;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: <Widget>[
-        Text(
-          k == last
-              ? 'Shorten the setup by excluding this last stage.'
-              : 'Shorten the setup: exclude Stage $k and every stage above it '
-                  '(Stages $k–$last), keeping Stages 0–${k - 1}.',
-          style: Theme.of(context).textTheme.bodySmall,
-        ),
-        const SizedBox(height: 8),
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: _track(
+        _Field.truncate,
         OutlinedButton.icon(
           onPressed: _truncate,
           icon: const Icon(Icons.content_cut),
           label: Text('Exclude Stage $k & above (X)'),
         ),
-      ],
+      ),
     );
   }
 
@@ -2993,7 +3126,7 @@ class _SetupScreenState extends State<SetupScreen> {
           decoration: const InputDecoration(
             isDense: true,
             border: OutlineInputBorder(),
-            labelText: 'Export label (optional)',
+            labelText: 'Export salt (optional)',
             hintText: 'e.g. SIGNING-1',
           ),
           style: const TextStyle(
@@ -3176,7 +3309,7 @@ class _SetupScreenState extends State<SetupScreen> {
         final int idx = _setup.displayStageIndex;
         return 'Key (master-secret export): Argon2id over your setup so far '
             '(stages 1–$idx). Paste into another wallet or use as a downstream '
-            'pepper. This optional label versions the key (e.g. SIGNING-1, '
+            'pepper. This optional salt versions the key (e.g. SIGNING-1, '
             'uppercase/digits/hyphen). Press K to derive and copy — blind, '
             'never shown.';
       case _Field.hue:
@@ -3187,6 +3320,14 @@ class _SetupScreenState extends State<SetupScreen> {
             'it at graduation. Protect it with your own password (managed/deleted '
             'in a password manager) or an app-generated key shown as a small QR '
             'to print and keep OFFLINE. The file is useless without its secret.';
+      case _Field.truncate:
+        final int k = _setup.displayStageIndex;
+        final int last = _setup.nStages - 1;
+        return k == last
+            ? 'Shorten the setup by excluding this last stage (Stage $k), '
+                'keeping Stages 0–${k - 1}. Cannot be undone.'
+            : 'Shorten the setup: exclude Stage $k and every stage above it '
+                '(Stages $k–$last), keeping Stages 0–${k - 1}. Cannot be undone.';
     }
   }
 
@@ -3329,7 +3470,17 @@ enum _ImportFormat { words, hex }
 
 /// The input controls whose label + live value are conveyed in the console while
 /// focused (so the panel itself can stay label-free).
-enum _Field { stages, iterations, profile, salt, mnemonic, exportLabel, hue, vault }
+enum _Field {
+  stages,
+  iterations,
+  profile,
+  salt,
+  mnemonic,
+  exportLabel,
+  hue,
+  vault,
+  truncate,
+}
 
 /// A compact, focusable colour wheel: six hue sectors, no rotate buttons (←/→
 /// cycle while focused) and no inline name (it is shown in the console). Tapping
@@ -3725,48 +3876,46 @@ class _Badge extends StatelessWidget {
 }
 
 /// Paints the provisional-key QR. In **scan** mode it draws the plain scannable
-/// code (solid black/white modules). In **template** mode it's a hand-fill aid:
-/// the cells that are the same for every key — the three finder patterns +
-/// separators, the timing patterns, and the dark module — are pre-inked solid,
-/// while every other dark cell (format info + the key's data/EC) is drawn as a
-/// grey "colour me" square over a light grid. Inking the grey cells reproduces
-/// this key's exact, scannable QR, so the bulky fixed patterns need not be drawn
-/// by hand. Correct for any mask: the variable cells come straight from the
-/// encoded matrix. (Byte-mode v1 has no alignment patterns.)
+/// code (solid black/white modules) — what the user reveals to hand-copy or to
+/// scan back. In **blank** mode it draws the reusable hand-fill skeleton: only
+/// the key-independent cells (the three finder patterns + separators, the timing
+/// patterns, and the dark module) are inked, every cell sits in a clearly drawn
+/// grid so the user can see exactly which squares to colour, and the data/EC
+/// cells are left empty to fill in by reading the scan code. (Byte-mode v1 has
+/// no alignment patterns.) Both views include the spec's 4-module quiet zone.
 class _QrPainter extends CustomPainter {
   _QrPainter(this.image, this.view);
 
   final qr.QrImage image;
   final _QrView view;
 
+  /// QR spec mandates a clear margin of at least 4 modules around the symbol;
+  /// without it decoders often fail to lock onto the finder patterns.
+  static const int quiet = 4;
+
   @override
   void paint(Canvas canvas, Size size) {
     final int n = image.moduleCount; // 21 for version 1
-    final double cell = size.width / n;
+    final double cell = size.width / (n + 2 * quiet);
+    final double off = quiet * cell; // top-left offset of the symbol proper
     final Paint inked = Paint()..color = Colors.black;
-    final Paint fill = Paint()..color = const Color(0xFFBDBDBD); // grey: colour me
+    // A visible grid so the hand-filler can tell the module divisions apart.
     final Paint grid = Paint()
-      ..color = const Color(0xFFE0E0E0)
+      ..color = const Color(0xFF9E9E9E)
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 0.5;
+      ..strokeWidth = 1;
     canvas.drawRect(Offset.zero & size, Paint()..color = Colors.white);
     for (int r = 0; r < n; r++) {
       for (int c = 0; c < n; c++) {
-        final Rect rect = Rect.fromLTWH(c * cell, r * cell, cell, cell);
+        final Rect rect = Rect.fromLTWH(off + c * cell, off + r * cell, cell, cell);
         final bool dark = image.isDark(r, c);
-        final bool fixed = _isFixed(r, c, n);
         switch (view) {
           case _QrView.scan:
             if (dark) canvas.drawRect(rect, inked);
-          case _QrView.template:
-            if (dark) {
-              canvas.drawRect(
-                  fixed ? rect : rect.deflate(cell * 0.16), fixed ? inked : fill);
-            }
-            canvas.drawRect(rect, grid);
           case _QrView.blank:
-            // Key-independent skeleton only — the user inks the rest by hand.
-            if (dark && fixed) canvas.drawRect(rect, inked);
+            // Key-independent skeleton only — the user inks the rest by hand,
+            // reading the scan code, guided by the highlighted module grid.
+            if (dark && _isFixed(r, c, n)) canvas.drawRect(rect, inked);
             canvas.drawRect(rect, grid);
         }
       }
@@ -3774,13 +3923,18 @@ class _QrPainter extends CustomPainter {
   }
 
   /// Key-independent modules: the three 8×8 finder+separator corners, the timing
-  /// rows/cols, and the dark module. (No alignment patterns at version 1.)
+  /// rows/cols, the dark module, and (at v2, n == 25) the single 5×5 alignment
+  /// pattern centred at (n-7, n-7). v1 has no alignment pattern.
   bool _isFixed(int r, int c, int n) {
     bool corner(int r0, int c0) =>
         r >= r0 && r < r0 + 8 && c >= c0 && c < c0 + 8;
     if (corner(0, 0) || corner(0, n - 8) || corner(n - 8, 0)) return true;
     if (r == 6 || c == 6) return true; // timing patterns
     if (r == n - 8 && c == 8) return true; // dark module
+    if (n >= 25) {
+      final int a = n - 7; // alignment-pattern centre (18 at v2)
+      if ((r - a).abs() <= 2 && (c - a).abs() <= 2) return true; // 5×5 ring
+    }
     return false;
   }
 
@@ -3789,7 +3943,7 @@ class _QrPainter extends CustomPainter {
       oldDelegate.image != image || oldDelegate.view != view;
 }
 
-/// How [_QrPainter] renders: the plain scannable code, the hand-fill template
-/// (fixed cells inked, the rest grey), or the reusable blank skeleton (only the
-/// key-independent cells, printed for hand-colouring).
-enum _QrView { scan, template, blank }
+/// How [_QrPainter] renders: the plain scannable code, or the reusable blank
+/// skeleton (only the key-independent cells, over a highlighted module grid,
+/// printed for hand-colouring).
+enum _QrView { scan, blank }

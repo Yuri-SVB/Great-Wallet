@@ -35,10 +35,20 @@ class SetupCrypto {
   static const int version = 3; // 3: 128-bit raw-byte key (2 was password/key)
 
   /// 128-bit key = 16 bytes = 32 hex digits. 16 bytes fit a byte-mode QR v1 at
-  /// EC level L (capacity 17 bytes).
+  /// EC level L (capacity 17 bytes). The optional 256-bit "tin-foil" key = 32
+  /// bytes = 64 hex digits, which rides a byte-mode QR v2 (25×25) at EC-L. Both
+  /// lengths feed Argon2id the same way; the length is the user's choice and is
+  /// never stored — load accepts either.
   static const int keyBits = 128;
   static const int keyLenBytes = keyBits ~/ 8; // 16
   static const int keyHexDigits = keyLenBytes * 2; // 32
+  static const int keyBits256 = 256;
+  static const int keyLenBytes256 = keyBits256 ~/ 8; // 32
+  static const int keyHexDigits256 = keyLenBytes256 * 2; // 64
+
+  /// Whether [n] is an accepted provisional-key length in bytes (16 or 32).
+  static bool isValidKeyLen(int n) =>
+      n == keyLenBytes || n == keyLenBytes256;
 
   // RFC 9106 §4 "second recommended" Argon2id parameters: 64 MiB, t=3, p=4.
   static const int _argonMemKiB = 64 * 1024;
@@ -75,17 +85,19 @@ class SetupCrypto {
     );
   }
 
-  /// Encrypt [vault] and return the ciphertext envelope plus the 16-byte key.
-  /// Uses [providedKey] (the user's own entropy) if given, else generates a
-  /// fresh key. The caller owns and wipes [SealedVault.key]; the plaintext JSON
-  /// is zeroed here.
+  /// Encrypt [vault] and return the ciphertext envelope plus the key. Uses
+  /// [providedKey] (the user's own entropy, 16 or 32 bytes) if given, else
+  /// generates a fresh [genLenBytes]-byte key (128-bit by default, 32 for the
+  /// 256-bit mode). The caller owns and wipes [SealedVault.key]; the plaintext
+  /// JSON is zeroed here.
   static Future<SealedVault> sealVault(
     SetupVault vault, {
     Uint8List? providedKey,
+    int genLenBytes = keyLenBytes,
   }) async {
     final Uint8List key = providedKey != null
         ? Uint8List.fromList(providedKey)
-        : _randomBytes(keyLenBytes);
+        : _randomBytes(genLenBytes);
     final Uint8List salt = _randomBytes(_saltLen);
     final Uint8List nonce = _randomBytes(_nonceLen);
     final List<int> plaintext = utf8.encode(jsonEncode(vault.toJson()));
@@ -124,7 +136,7 @@ class SetupCrypto {
   }
 
   /// Decrypt an envelope produced by [sealVault] back into a [SetupVault], using
-  /// the 16-byte [keyBytes] (from a scanned QR or parsed from 32 hex). Throws a
+  /// the 16- or 32-byte [keyBytes] (from a scanned QR or parsed hex). Throws a
   /// generic [FormatException] on a non-vault file, unsupported version, wrong
   /// key, or tampering — GCM authentication makes "wrong key" and "corrupt"
   /// indistinguishable.
@@ -176,21 +188,23 @@ class SetupCrypto {
     }
   }
 
-  /// Parse [keyHexDigits] hex digits (whitespace ignored, any case) into the
-  /// 16-byte key. Throws a generic [FormatException] on bad input.
+  /// Parse 32 hex digits (128-bit) or 64 (256-bit), whitespace ignored, any
+  /// case, into the key. Throws a generic [FormatException] on bad input.
   static Uint8List hexToKey(String hex) {
     final String clean = hex.replaceAll(RegExp(r'\s'), '').toUpperCase();
-    if (clean.length != keyHexDigits || !RegExp(r'^[0-9A-F]+$').hasMatch(clean)) {
-      throw const FormatException('A key is exactly 32 hex digits (0–9 A–F).');
+    if ((clean.length != keyHexDigits && clean.length != keyHexDigits256) ||
+        !RegExp(r'^[0-9A-F]+$').hasMatch(clean)) {
+      throw const FormatException('A key is 32 or 64 hex digits (0–9 A–F).');
     }
-    final Uint8List out = Uint8List(keyLenBytes);
-    for (int i = 0; i < keyLenBytes; i++) {
+    final int lenBytes = clean.length ~/ 2;
+    final Uint8List out = Uint8List(lenBytes);
+    for (int i = 0; i < lenBytes; i++) {
       out[i] = int.parse(clean.substring(i * 2, i * 2 + 2), radix: 16);
     }
     return out;
   }
 
-  /// The 16-byte key as 32 uppercase hex digits (the manager / manual form).
+  /// The key as uppercase hex digits (the manager / manual form).
   static String keyToHex(Uint8List key) {
     final StringBuffer sb = StringBuffer();
     for (final int b in key) {

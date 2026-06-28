@@ -48,10 +48,17 @@ dependencies:
   qr: ^3.0.0
 
   # Webcam scanning of the provisional-key QR on the platforms its authors
-  # support (Android / iOS / macOS / web). The Scan button is platform-gated, so
-  # Linux/Windows simply omit it and fall back to typing the key. Camera
-  # permission entries must be added to the app's platform configs.
+  # support (Android / iOS / macOS / web). Camera permission entries must be
+  # added to the app's platform configs.
   mobile_scanner: ^5.2.3
+
+  # Desktop (Linux / Windows) live-webcam scanning of the provisional-key QR,
+  # where mobile_scanner has no backend. flutter_webrtc drives the camera and
+  # zxing2 (pure Dart) decodes grabbed frames. Best-effort: desktop camera
+  # support in flutter_webrtc is young, so failures degrade to hex-load. See
+  # lib/src/setup/desktop_qr_scanner.dart.
+  flutter_webrtc: ^1.5.0
+  zxing2: ^0.2.4
 
 dev_dependencies:
   flutter_test:

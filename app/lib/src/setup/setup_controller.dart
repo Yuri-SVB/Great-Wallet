@@ -1956,21 +1956,22 @@ class SetupController extends ChangeNotifier {
   }
 
   /// Save the current setup, encrypted, to [path]. Uses [providedKey] (the
-  /// user's own 16-byte entropy) if given, else generates a fresh 128-bit key.
-  /// On success returns the 16-byte key (the caller renders it as a QR / hex and
-  /// wipes it), else an [error]. The file holds only ciphertext; the key is
-  /// never written to it.
+  /// user's own 16- or 32-byte entropy) if given, else generates a fresh key of
+  /// [genLenBytes] bytes (128-bit by default, 32 for the 256-bit mode). On
+  /// success returns the key (the caller renders it as a QR / hex and wipes it),
+  /// else an [error]. The file holds only ciphertext; the key is never in it.
   Future<({String? error, Uint8List? key})> saveVaultToFile(
     String path, {
     Uint8List? providedKey,
+    int genLenBytes = SetupCrypto.keyLenBytes,
   }) async {
     if (!canExportVault) {
       return (error: 'This setup cannot be saved yet.', key: null);
     }
     final SetupVault vault = exportVault();
     try {
-      final SealedVault sealed =
-          await SetupCrypto.sealVault(vault, providedKey: providedKey);
+      final SealedVault sealed = await SetupCrypto.sealVault(vault,
+          providedKey: providedKey, genLenBytes: genLenBytes);
       await File(path).writeAsBytes(sealed.fileBytes, flush: true);
       return (error: null, key: sealed.key);
     } catch (e) {
@@ -1986,7 +1987,7 @@ class SetupController extends ChangeNotifier {
   /// null on success, else a generic error message. The caller owns/wipes
   /// [keyBytes].
   Future<String?> loadVaultFromFile(String path, Uint8List keyBytes) async {
-    if (keyBytes.length != SetupCrypto.keyLenBytes) {
+    if (!SetupCrypto.isValidKeyLen(keyBytes.length)) {
       return 'That is not a valid provisional key.';
     }
     Uint8List bytes;
