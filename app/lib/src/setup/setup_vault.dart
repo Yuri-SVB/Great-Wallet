@@ -22,11 +22,18 @@ class SetupVault {
     required this.iterations,
     required this.profile,
     required this.stages,
+    this.resume,
   });
 
-  /// On-disk format version, so a future change can be detected and rejected
-  /// rather than silently misread.
+  /// On-disk format version of a **settled** provisional key, so a future change
+  /// can be detected and rejected rather than silently misread.
   static const int formatVersion = 1;
+
+  /// Format version of a **resumable** vault — one that also carries the
+  /// [resume] state of a halted, mid-derivation setup. Distinct from
+  /// [formatVersion] so a settled v1 file stays byte-for-byte unchanged and both
+  /// are still accepted on load.
+  static const int resumableVersion = 2;
 
   /// The canonicalised Stage-0 salt/pepper (may itself be a secret pepper).
   final String text;
@@ -37,15 +44,26 @@ class SetupVault {
   /// `m` — the Argon2 memory profile.
   final Argon2Profile profile;
 
-  /// One entry per point stage (stage 1..S), in chain order.
+  /// One entry per **already-derived** point stage, in chain order. For a
+  /// settled vault that is every stage (1..S); for a resumable one it is only
+  /// the prefix before the halted stage (which may be empty if the halt landed
+  /// on Stage 1).
   final List<VaultStage> stages;
 
+  /// Present only on a **resumable** vault: everything needed to continue the
+  /// memory-hard derivation in a later session (the entropy root, the halted
+  /// stage's checkpoint, and the stage geometry). Null for a settled key.
+  final VaultResume? resume;
+
+  int get _version => resume == null ? formatVersion : resumableVersion;
+
   Map<String, dynamic> toJson() => <String, dynamic>{
-        'v': formatVersion,
+        'v': _version,
         'text': text,
         'iterations': iterations,
         'profile': profile.value,
         'stages': <Map<String, dynamic>>[for (final VaultStage s in stages) s.toJson()],
+        if (resume != null) 'resume': resume!.toJson(),
       };
 
   /// Rebuild a vault from decoded JSON. Throws a generic [FormatException] on any
@@ -53,9 +71,10 @@ class SetupVault {
   /// values (a wrong-password decrypt that yields garbage must fail opaquely).
   factory SetupVault.fromJson(Map<String, dynamic> json) {
     final int v = _int(json, 'v');
-    if (v != formatVersion) {
+    if (v != formatVersion && v != resumableVersion) {
       throw const FormatException('unsupported vault version');
     }
+    final bool resumable = v == resumableVersion;
     final Object? text = json['text'];
     if (text is! String) throw const FormatException('bad vault');
     final int profileCode = _int(json, 'profile');
@@ -64,8 +83,18 @@ class SetupVault {
       orElse: () => throw const FormatException('bad vault'),
     );
     final Object? rawStages = json['stages'];
-    if (rawStages is! List || rawStages.isEmpty) {
+    // A settled vault must carry every stage; a resumable one may have an empty
+    // prefix (halted on Stage 1), so only the type is enforced there.
+    if (rawStages is! List || (!resumable && rawStages.isEmpty)) {
       throw const FormatException('bad vault');
+    }
+    VaultResume? resume;
+    if (resumable) {
+      final Object? rawResume = json['resume'];
+      if (rawResume is! Map<String, dynamic>) {
+        throw const FormatException('bad vault');
+      }
+      resume = VaultResume.fromJson(rawResume);
     }
     return SetupVault(
       text: text,
@@ -77,20 +106,93 @@ class SetupVault {
               ? s
               : throw const FormatException('bad vault')),
       ],
+      resume: resume,
     );
   }
 
-  /// Zero every stage's secret integers. The [text] is an immutable String and
-  /// cannot be overwritten (the controller's own salt/pepper has the same
-  /// limitation); drop all references to let it be collected.
+  /// Zero every stage's secret integers (and the [resume] secrets, if any). The
+  /// [text] is an immutable String and cannot be overwritten (the controller's
+  /// own salt/pepper has the same limitation); drop all references to let it be
+  /// collected.
   void wipe() {
     for (final VaultStage s in stages) {
       s.wipe();
     }
+    resume?.wipe();
   }
 
   @override
-  String toString() => 'SetupVault(<redacted>, ${stages.length} stages)';
+  String toString() => 'SetupVault(<redacted>, ${stages.length} stages'
+      '${resume == null ? '' : ', resumable'})';
+}
+
+/// The resume-state of a halted, mid-derivation setup — what a [SetupVault] must
+/// carry so the memory-hard Argon2 chain can be continued in a later session.
+///
+/// SECURITY — this is the **strongest** secret the app persists: [entropy] is
+/// the entire seed root, so the encrypted file plus its key reconstruct the
+/// whole wallet, not merely the consolidation-window provisional key. It exists
+/// only inside an encrypted [SetupVault] (never plaintext) and [wipe] zeroes the
+/// secret buffers. Treat a resumable vault with the same care as the seed.
+class VaultResume {
+  VaultResume({
+    required this.stage,
+    required this.pass,
+    required this.total,
+    required this.pointStages,
+    required this.digest,
+    required this.entropy,
+  });
+
+  /// The halted point stage (1..[pointStages]) — the one to resume.
+  final int stage;
+
+  /// Argon2 passes completed on the halted stage (the chain continues here).
+  final int pass;
+
+  /// `N` — total Argon2 passes per stage (sanity-checked against [pass]).
+  final int total;
+
+  /// `S` — total point stages, so a load knows how many remain after [stage].
+  final int pointStages;
+
+  /// The halted stage's preserved intermediary digest (its result after [pass]
+  /// passes). Coercion-relevant.
+  List<int> digest;
+
+  /// The entropy root (m × 32 bits, one bit per int) the rest of the chain
+  /// derives from. Coercion-relevant — the full seed; see the class note.
+  List<int> entropy;
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+        'stage': stage,
+        'pass': pass,
+        'total': total,
+        'pts': pointStages,
+        'digest': digest,
+        'entropy': entropy,
+      };
+
+  factory VaultResume.fromJson(Map<String, dynamic> json) => VaultResume(
+        stage: _int(json, 'stage'),
+        pass: _int(json, 'pass'),
+        total: _int(json, 'total'),
+        pointStages: _int(json, 'pts'),
+        digest: _intList(json, 'digest'),
+        entropy: _intList(json, 'entropy'),
+      );
+
+  void wipe() {
+    for (int i = 0; i < digest.length; i++) {
+      digest[i] = 0;
+    }
+    for (int i = 0; i < entropy.length; i++) {
+      entropy[i] = 0;
+    }
+  }
+
+  @override
+  String toString() => 'VaultResume(<redacted>)';
 }
 
 /// One point stage's reconstruction data: the `(o, p, q)` reservoirs and a raw
@@ -145,4 +247,14 @@ int _int(Map<String, dynamic> json, String key) {
   final Object? v = json[key];
   if (v is int) return v;
   throw const FormatException('bad vault');
+}
+
+/// Read a `List<int>` field (a decoded JSON array of ints), throwing a generic
+/// [FormatException] (no value echoed) if it is missing or ill-typed.
+List<int> _intList(Map<String, dynamic> json, String key) {
+  final Object? v = json[key];
+  if (v is! List) throw const FormatException('bad vault');
+  return <int>[
+    for (final Object? e in v) e is int ? e : throw const FormatException('bad vault'),
+  ];
 }

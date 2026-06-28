@@ -1654,10 +1654,12 @@ class _SetupScreenState extends State<SetupScreen> {
           ],
 
           // Provisional-key save / load: an encrypted on-disk copy of the setup
-          // for the consolidation window. Save needs a settled setup; Load is
-          // offered on the config screen too (to restore one).
+          // for the consolidation window. Save needs a settled setup, or a
+          // halted one (saved as resumable); Load is offered on the config
+          // screen too (to restore one).
           if (_setup.phase == SetupPhase.idle ||
-              _setup.canExportVault) ...<Widget>[
+              _setup.canExportVault ||
+              _setup.canExportResumable) ...<Widget>[
             const Divider(height: 32),
             _vaultControls(),
           ],
@@ -2228,7 +2230,9 @@ class _SetupScreenState extends State<SetupScreen> {
       children: <Widget>[
         Text(
           'Halted at Stage $k/$last — pass ${_setup.haltedPass}/'
-          '${_setup.haltedTotal} kept. Resume picks up where it stopped.',
+          '${_setup.haltedTotal} kept. Resume picks up where it stopped'
+          '${_setup.canExportResumable ? ', or Write (W) saves it to resume in a '
+              'later session (the file then holds the seed — guard it).' : '.'}',
           style: Theme.of(context).textTheme.bodySmall,
         ),
         const SizedBox(height: 8),
@@ -2249,7 +2253,7 @@ class _SetupScreenState extends State<SetupScreen> {
   /// Provisional-key save / load: an encrypted on-disk copy of the setup, kept
   /// only across the memorisation window and destroyed at graduation.
   Widget _vaultControls() {
-    final bool canSave = _setup.canExportVault;
+    final bool canSave = _setup.canExportVault || _setup.canExportResumable;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: <Widget>[
@@ -2317,13 +2321,15 @@ class _SetupScreenState extends State<SetupScreen> {
   /// Whether the provisional-key panel is on screen — the config screen (to open
   /// a saved setup) or a settled setup (to write one). Gates the F/W/O/T keys.
   bool get _vaultPanelShown =>
-      _setup.phase == SetupPhase.idle || _setup.canExportVault;
+      _setup.phase == SetupPhase.idle ||
+      _setup.canExportVault ||
+      _setup.canExportResumable;
 
   /// Write (save) the settled setup to the file path, encrypted under a fresh
   /// app-generated 128-bit key, then open the key dialog (W). The key can be
   /// overridden with the user's own entropy from inside that dialog.
   Future<void> _writeSetup() async {
-    if (!_setup.canExportVault) {
+    if (!_setup.canExportVault && !_setup.canExportResumable) {
       _sounds.play(UiSound.denyInput);
       _toast('Finish a setup first — there is nothing to write yet.');
       return;
