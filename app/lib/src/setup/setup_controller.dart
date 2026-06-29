@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
@@ -13,6 +14,8 @@ import '../core/master_secret.dart';
 import '../ffi/core_bindings.dart';
 import '../ffi/fixed.dart';
 import '../core/stage_params.dart';
+import 'setup_crypto.dart';
+import 'setup_vault.dart';
 
 /// Phases of the Setup flow.
 ///
@@ -933,6 +936,12 @@ class SetupController extends ChangeNotifier {
       _resumeExpansion(cp, plan);
       return;
     }
+    // Seed the in-flight stash with the resume's starting checkpoint (an owned
+    // copy). The first *new* checkpoint only lands once a full resumed pass
+    // completes — possibly a very long wait — so without this seed a re-halt in
+    // that window would find _inFlight null, leaving _enterHalted nothing to
+    // promote and the setup unresumable (the second-halt bug).
+    _setInFlight(cp.stage, cp.pass, cp.total, cp.digest);
     _halted = null; // ownership of cp moves into the resume flow
     final List<int> bits = _entropyBits!;
     final int pointStages = nStages - 1;
@@ -1750,6 +1759,9 @@ class SetupController extends ChangeNotifier {
   /// [_resumeRemaining] for generation; called by [resumeDerivation] when the
   /// halted work is an expansion.
   void _resumeExpansion(_HaltCheckpoint cp, _ExpandPlan plan) {
+    // See resumeDerivation: seed the in-flight stash so a re-halt before the
+    // first resumed pass completes still leaves a resumable checkpoint.
+    _setInFlight(cp.stage, cp.pass, cp.total, cp.digest);
     _halted = null; // ownership of cp moves into the resume flow
     _isGenerating = true;
     _generatingStage = cp.stage;
@@ -1859,6 +1871,302 @@ class SetupController extends ChangeNotifier {
     final List<int>? bits = _expandImportBits;
     if (bits != null) Entropy.wipe(bits);
     _expandImportBits = null;
+  }
+
+  // --- Provisional-key vault: export / restore the setup ---------------------
+
+  /// Whether the current setup can be exported as a [SetupVault]: a settled
+  /// setup (not mid-derivation) where every point stage carries a point. The
+  /// recall-complete state qualifies too (its points are reconstructed).
+  bool get canExportVault {
+    if (_isGenerating || _stageCount <= 1) return false;
+    for (int k = 1; k < nStages; k++) {
+      if (k >= _stageRecords.length || _stageRecords[k] == null) return false;
+    }
+    return true;
+  }
+
+  /// Whether the current setup is a **mid-derivation** plain generation that can
+  /// be saved as a *resumable* vault — either halted (preserved [_halted]
+  /// progress) or still deriving in the foreground/background (a live [_inFlight]
+  /// checkpoint of the working stage). It must hold the entropy root and be
+  /// neither a recall walk nor an N/I expansion (whose resume state is not
+  /// persisted). A save snapshots the current checkpoint without disturbing a
+  /// derivation in progress. Such a save carries the seed root, so it is the
+  /// strongest secret the app writes — see [VaultResume]'s security note.
+  ///
+  /// Briefly false between stages (after one stage is stored and before the next
+  /// stage's first pass completes), when there is no checkpoint to snapshot yet.
+  bool get canExportResumable =>
+      (_halted != null || _inFlight != null) &&
+      _entropyBits != null &&
+      _expandPlan == null &&
+      !_isRecallSession;
+
+  /// Capture the current setup as a [SetupVault] (the provisional key). Each
+  /// stage contributes its `(o, p, q)` and the centre of its point's leaf — one
+  /// coordinate inside the leaf, which decodes back to the same point and bits.
+  /// Encoded and manually-selected points are captured identically (both
+  /// populate [StageRecord]). The caller owns the returned vault and MUST wipe
+  /// it; it must only be persisted encrypted (never in plaintext).
+  SetupVault exportVault() {
+    final List<VaultStage> stages = <VaultStage>[];
+    for (int k = 1; k < nStages; k++) {
+      final StageRecord r = _stageRecords[k]!;
+      stages.add(VaultStage(
+        o: r.o,
+        p: r.p,
+        q: r.q,
+        reRaw: r.leafReRaw,
+        imRaw: r.leafImRaw,
+      ));
+    }
+    return SetupVault(
+      text: _chainText,
+      iterations: _iterations,
+      profile: _profile,
+      stages: stages,
+    );
+  }
+
+  /// Rebuild a full, settled (memorise) setup from a [SetupVault] — no Argon2:
+  /// each stage's `(o, p, q)` + leaf coordinate is decoded back into its fractal
+  /// reservoirs and encoded point. Every stage is validated before the current
+  /// session is torn down, so a corrupt vault (e.g. a wrong-password decrypt)
+  /// throws a generic [FormatException] and leaves the live session untouched.
+  void restoreVault(SetupVault vault) {
+    final int n = vault.stages.length + 1; // + the Stage-0 text stage
+    // Decode + validate every stage first, into locals.
+    final List<StageReservoirs?> reservoirs = <StageReservoirs?>[null];
+    final List<EncodedPoint?> points = <EncodedPoint?>[null];
+    final List<StageRecord?> records = <StageRecord?>[null];
+    final List<FixedRect?> leafRects = <FixedRect?>[null];
+    for (final VaultStage s in vault.stages) {
+      final CoreDecodeResult d = _core.decodePoint(
+        reRaw: s.reRaw,
+        imRaw: s.imRaw,
+        o: s.o,
+        p: s.p,
+        q: s.q,
+      );
+      if (!d.valid) throw const FormatException('bad vault');
+      reservoirs.add(StageReservoirs(o: s.o, p: s.p, q: s.q));
+      points.add(EncodedPoint(reRaw: s.reRaw, imRaw: s.imRaw, leafRect: d.leafRect));
+      leafRects.add(d.leafRect);
+      final ({int re, int im}) leaf = MasterSecret.leafCentreRaw(d.leafRect);
+      records.add(StageRecord(
+        o: s.o,
+        p: s.p,
+        q: s.q,
+        leafReRaw: leaf.re,
+        leafImRaw: leaf.im,
+      ));
+    }
+
+    // All stages decoded — safe to replace the current session.
+    _resetSecrets();
+    _chainText = vault.text;
+    _iterations = vault.iterations;
+    _profile = vault.profile;
+    _stageCount = n;
+    _pointStages = n - 1;
+    _points = points;
+    _reservoirs = reservoirs;
+    _stageRecords = records;
+    _leafRects = leafRects;
+    _selectedChunks = List<List<int>?>.filled(n, null);
+    _selectedMarks = List<({double re, double im})?>.filled(n, null);
+    _isRecallSession = false;
+    _applyDisplayStage(1); // land on the first point stage
+    _setPhase(SetupPhase.memorise);
+  }
+
+  /// Capture a mid-derivation generation as a **resumable** [SetupVault]: the
+  /// derived prefix stages (stages 1..working-1, each a cheap-to-decode
+  /// [VaultStage]) plus the [VaultResume] state — the entropy root, the working
+  /// stage's checkpoint, and the stage geometry — needed to finish the chain in
+  /// a later session. The checkpoint is the halted stash when paused, else the
+  /// live in-flight checkpoint (its digest is copied, so an ongoing derivation
+  /// that wipes/replaces the live buffer on the next pass is unaffected). Caller
+  /// owns/wipes the vault and MUST persist it encrypted only (it holds the seed
+  /// root).
+  SetupVault exportResumableVault() {
+    final _HaltCheckpoint cp = _halted ?? _inFlight!;
+    final List<int> bits = _entropyBits!;
+    final List<VaultStage> stages = <VaultStage>[];
+    for (int k = 1; k < cp.stage; k++) {
+      final StageRecord r = _stageRecords[k]!;
+      stages.add(VaultStage(
+        o: r.o,
+        p: r.p,
+        q: r.q,
+        reRaw: r.leafReRaw,
+        imRaw: r.leafImRaw,
+      ));
+    }
+    return SetupVault(
+      text: _chainText,
+      iterations: _iterations,
+      profile: _profile,
+      stages: stages,
+      resume: VaultResume(
+        stage: cp.stage,
+        pass: cp.pass,
+        total: cp.total,
+        pointStages: nStages - 1,
+        digest: List<int>.from(cp.digest),
+        entropy: List<int>.from(bits),
+      ),
+    );
+  }
+
+  /// Restore a halted generation from a **resumable** [vault] (see
+  /// [exportResumableVault]): decode the derived prefix cheaply, re-seat the
+  /// entropy root and halt checkpoint, and land in `memorise` with [canResume]
+  /// true so the user can continue the derivation. Everything is validated into
+  /// locals first, so a corrupt vault (e.g. a wrong-key decrypt) throws a
+  /// generic [FormatException] and leaves the live session untouched.
+  void restoreResumableVault(SetupVault vault) {
+    final VaultResume? r = vault.resume;
+    if (r == null) throw const FormatException('bad vault');
+    const int bpp = EncodingConstants.bitsPerPoint;
+    final int s = r.pointStages;
+    if (s < 1 ||
+        r.stage < 1 ||
+        r.stage > s ||
+        r.pass < 0 ||
+        r.pass > r.total ||
+        r.entropy.length != s * bpp ||
+        r.digest.isEmpty ||
+        vault.stages.length != r.stage - 1) {
+      throw const FormatException('bad vault');
+    }
+    final int n = s + 1; // + the Stage-0 text stage
+    final List<StageReservoirs?> reservoirs = List<StageReservoirs?>.filled(n, null);
+    final List<EncodedPoint?> points = List<EncodedPoint?>.filled(n, null);
+    final List<StageRecord?> records = List<StageRecord?>.filled(n, null);
+    final List<FixedRect?> leafRects = List<FixedRect?>.filled(n, null);
+    for (int i = 0; i < vault.stages.length; i++) {
+      final VaultStage st = vault.stages[i];
+      final CoreDecodeResult d = _core.decodePoint(
+        reRaw: st.reRaw,
+        imRaw: st.imRaw,
+        o: st.o,
+        p: st.p,
+        q: st.q,
+      );
+      if (!d.valid) throw const FormatException('bad vault');
+      final int k = i + 1;
+      reservoirs[k] = StageReservoirs(o: st.o, p: st.p, q: st.q);
+      points[k] =
+          EncodedPoint(reRaw: st.reRaw, imRaw: st.imRaw, leafRect: d.leafRect);
+      leafRects[k] = d.leafRect;
+      final ({int re, int im}) leaf = MasterSecret.leafCentreRaw(d.leafRect);
+      records[k] = StageRecord(
+        o: st.o,
+        p: st.p,
+        q: st.q,
+        leafReRaw: leaf.re,
+        leafImRaw: leaf.im,
+      );
+    }
+
+    // All prefix stages decoded — safe to replace the current session.
+    _resetSecrets();
+    _chainText = vault.text;
+    _iterations = vault.iterations;
+    _profile = vault.profile;
+    _stageCount = n;
+    _pointStages = s;
+    _points = points;
+    _reservoirs = reservoirs;
+    _stageRecords = records;
+    _leafRects = leafRects;
+    _selectedChunks = List<List<int>?>.filled(n, null);
+    _selectedMarks = List<({double re, double im})?>.filled(n, null);
+    _isRecallSession = false;
+    _entropyBits = List<int>.from(r.entropy);
+    _halted = _HaltCheckpoint(
+      r.stage,
+      r.pass,
+      r.total,
+      Uint8List.fromList(r.digest),
+    );
+    _isGenerating = false;
+    _generatingStage = 0;
+    _generationError = null;
+    // Land on the last derived prefix stage, or the Stage-0 text when the halt
+    // landed on Stage 1 (no derived fractal yet).
+    _applyDisplayStage(r.stage > 1 ? r.stage - 1 : 0);
+    _setPhase(SetupPhase.memorise);
+    notifyListeners();
+  }
+
+  /// Save the current setup, encrypted, to [path]. Uses [providedKey] (the
+  /// user's own 16- or 32-byte entropy) if given, else generates a fresh key of
+  /// [genLenBytes] bytes (128-bit by default, 32 for the 256-bit mode). On
+  /// success returns the key (the caller renders it as a QR / hex and wipes it),
+  /// else an [error]. The file holds only ciphertext; the key is never in it.
+  Future<({String? error, Uint8List? key})> saveVaultToFile(
+    String path, {
+    Uint8List? providedKey,
+    int genLenBytes = SetupCrypto.keyLenBytes,
+  }) async {
+    // A settled setup saves as a provisional key; a mid-derivation one (halted
+    // or still deriving) snapshots its resume-state (the seed root + working
+    // checkpoint) so the derivation can continue in a later session.
+    final bool resumable = !canExportVault && canExportResumable;
+    if (!canExportVault && !resumable) {
+      return (error: 'This setup cannot be saved yet.', key: null);
+    }
+    final SetupVault vault = resumable ? exportResumableVault() : exportVault();
+    try {
+      final SealedVault sealed = await SetupCrypto.sealVault(vault,
+          providedKey: providedKey, genLenBytes: genLenBytes);
+      await File(path).writeAsBytes(sealed.fileBytes, flush: true);
+      return (error: null, key: sealed.key);
+    } catch (e) {
+      return (error: 'Could not save the file (${e.runtimeType}).', key: null);
+    } finally {
+      vault.wipe();
+    }
+  }
+
+  /// Decrypt + restore a setup from the encrypted file at [path] using the
+  /// 16-byte provisional [keyBytes] (from a scanned QR or parsed hex). The live
+  /// session is replaced only once decryption and validation succeed. Returns
+  /// null on success, else a generic error message. The caller owns/wipes
+  /// [keyBytes].
+  Future<String?> loadVaultFromFile(String path, Uint8List keyBytes) async {
+    if (!SetupCrypto.isValidKeyLen(keyBytes.length)) {
+      return 'That is not a valid provisional key.';
+    }
+    Uint8List bytes;
+    try {
+      bytes = await File(path).readAsBytes();
+    } catch (_) {
+      return 'Could not read that file.';
+    }
+    SetupVault vault;
+    try {
+      vault = await SetupCrypto.openVault(bytes, keyBytes);
+    } on FormatException catch (e) {
+      return e.message;
+    } catch (e) {
+      return 'Could not load (${e.runtimeType}).';
+    }
+    try {
+      if (vault.resume != null) {
+        restoreResumableVault(vault); // a halted setup — restore + offer Resume
+      } else {
+        restoreVault(vault);
+      }
+      return null;
+    } on FormatException catch (e) {
+      return e.message;
+    } finally {
+      vault.wipe();
+    }
   }
 
   /// True once every point stage (1..N) carries a selected point.
