@@ -2357,8 +2357,8 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   /// Open (load) a saved setup from the file path (O): scan the QR (Q) or type
-  /// the 32-hex key (Alt+Q focuses the field, Enter loads), Esc to cancel. The
-  /// key is never displayed.
+  /// the 32- or 64-hex key (Alt+Q focuses the field, Enter loads), Esc to
+  /// cancel. The key is never displayed.
   Future<void> _openSetup() async {
     final String path = _vaultPath.text.trim();
     if (path.isEmpty) {
@@ -2413,9 +2413,9 @@ class _SetupScreenState extends State<SetupScreen> {
                     Text(
                       canScan
                           ? 'Q — scan the QR with the camera.  Alt+Q — type the '
-                              '32-hex key instead.  Esc — cancel.'
-                          : 'Alt+Q — type the 32-hex key (live scanning needs a '
-                              'camera this platform does not expose).  '
+                              '32- or 64-hex key instead.  Esc — cancel.'
+                          : 'Alt+Q — type the 32- or 64-hex key (live scanning '
+                              'needs a camera this platform does not expose).  '
                               'Esc — cancel.',
                       style: const TextStyle(fontSize: 12),
                     ),
@@ -2430,7 +2430,7 @@ class _SetupScreenState extends State<SetupScreen> {
                       decoration: const InputDecoration(
                         isDense: true,
                         border: OutlineInputBorder(),
-                        labelText: 'Key — 32 hex digits',
+                        labelText: 'Key — 32 or 64 hex digits',
                         hintText: 'paste from your manager, then Enter',
                       ),
                     ),
