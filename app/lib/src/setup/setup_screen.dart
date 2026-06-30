@@ -751,6 +751,15 @@ class _SetupScreenState extends State<SetupScreen> {
       _truncate();
       return KeyEventResult.handled;
     }
+    // E — enumerate the canonical leaf areas under the current view and
+    // highlight each one's canonical island (flat white). Heavy one-shot
+    // (decode grid + per-leaf discovery); no-op while a derivation is busy.
+    if (event.logicalKey == LogicalKeyboardKey.keyE) {
+      if (!_busy) {
+        unawaited(_setup.enumerateCanonicalIslands(_viewport.viewport));
+      }
+      return KeyEventResult.handled;
+    }
     // C — focus the colour wheel (then ← → cycle hues).
     if (event.logicalKey == LogicalKeyboardKey.keyC) {
       _focusField(_hueFocus, 'colour wheel');
@@ -1272,6 +1281,7 @@ class _SetupScreenState extends State<SetupScreen> {
     'Enter  start (Generate / Encode / Begin recall) from a field',
     'K  copy the master secret ("the key")    H  halt derivation (keeps progress)',
     'X  exclude this stage & above (shorten the setup)',
+    'E  highlight canonical islands in view (white) · zoom in if too many',
     'Vault: F file path · W write/save · O open file · T blank templates',
     'In Write: Q QR · Alt+Q copy · press again to switch 128/256-bit · I scan QR to reuse key · Alt+I own key',
     'In Open: Q scan QR · Alt+Q type key (32 or 64 hex) · Esc cancel',
@@ -1805,6 +1815,15 @@ class _SetupScreenState extends State<SetupScreen> {
         Text(
           _setup.errorMessage!,
           style: const TextStyle(color: Colors.redAccent),
+        ),
+      ],
+      // Leaf-area / island enumeration feedback (the `E` action): "too many",
+      // "no islands", or nothing while islands are shown.
+      if (_setup.islandStatus != null) ...<Widget>[
+        const SizedBox(height: 12),
+        Text(
+          _setup.islandStatus!,
+          style: const TextStyle(color: Colors.white70),
         ),
       ],
     ];
