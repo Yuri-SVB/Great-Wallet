@@ -1446,6 +1446,9 @@ class SetupController extends ChangeNotifier {
     // The selected leaf's decoration (always framed), reusing this decode.
     _selDecoCache[k] = _selDecoForLeaf(result.leafRect, result.path, r.o, r.p, r.q);
     _refreshFocusDecos();
+    debugPrint('select: stage=$k marked; '
+        'selDeco=${_selDeco == null ? "NULL" : (_selDeco!.cells.pointsReIm.isEmpty ? "leaf-frame (no island cells)" : "island-frame (${_selDeco!.cells.pointsReIm.length ~/ 2} cells)")}; '
+        'displayStage=$_displayStageIndex');
 
     // Any later fractals were derived from this stage's previous point; they are
     // now invalid. Discard them so the chain stays consistent.
