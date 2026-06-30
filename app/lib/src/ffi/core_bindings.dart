@@ -71,6 +71,28 @@ class GreatWallCoreBindings {
         _lib.lookupFunction<_LeafAreasFreeC, _LeafAreasFreeDart>(
       'bs_leaf_areas_free',
     );
+    _canonicalIslandCompute =
+        _lib.lookupFunction<_CanonicalIslandComputeC, _CanonicalIslandComputeDart>(
+      'bs_canonical_island_compute',
+    );
+    _canonicalIslandFound =
+        _lib.lookupFunction<_CanonicalIslandFoundC, _CanonicalIslandFoundDart>(
+      'bs_canonical_island_found',
+    );
+    _canonicalIslandMeta =
+        _lib.lookupFunction<_CanonicalIslandMetaC, _CanonicalIslandMetaDart>(
+      'bs_canonical_island_meta',
+    );
+    _canonicalIslandNumPoints = _lib.lookupFunction<_CanonicalIslandNumPointsC,
+        _CanonicalIslandNumPointsDart>('bs_canonical_island_num_points');
+    _canonicalIslandPoints =
+        _lib.lookupFunction<_CanonicalIslandPointsC, _CanonicalIslandPointsDart>(
+      'bs_canonical_island_points',
+    );
+    _canonicalIslandFree =
+        _lib.lookupFunction<_CanonicalIslandFreeC, _CanonicalIslandFreeDart>(
+      'bs_canonical_island_free',
+    );
     _argon2Single =
         _lib.lookupFunction<_Argon2SingleC, _Argon2SingleDart>('bs_argon2_single');
     _argon2idMaster =
@@ -126,6 +148,12 @@ class GreatWallCoreBindings {
   late final _LeafAreasRectDart _leafAreasRect;
   late final _LeafAreasPathDart _leafAreasPath;
   late final _LeafAreasFreeDart _leafAreasFree;
+  late final _CanonicalIslandComputeDart _canonicalIslandCompute;
+  late final _CanonicalIslandFoundDart _canonicalIslandFound;
+  late final _CanonicalIslandMetaDart _canonicalIslandMeta;
+  late final _CanonicalIslandNumPointsDart _canonicalIslandNumPoints;
+  late final _CanonicalIslandPointsDart _canonicalIslandPoints;
+  late final _CanonicalIslandFreeDart _canonicalIslandFree;
   late final _Argon2SingleDart _argon2Single;
   late final _Argon2idMasterDart _argon2idMaster;
   late final _SaltPepperCanonicalizeDart _saltPepperCanonicalize;
@@ -484,6 +512,86 @@ class GreatWallCoreBindings {
     }
   }
 
+  /// Select a leaf area's canonical island (`bs_canonical_island_*`) and return
+  /// its shape: the flood points (raw I4F60, interleaved `[re, im]`) plus the
+  /// cell size `pixelDeltaRaw`, bbox, escape count and pixel count. [path] is
+  /// the leaf's bisection path; `(o, p, q)` must select the same fractal the
+  /// leaf was decoded on. [params] is a visualisation choice (resolution / flood
+  /// cap), independent of the encoder's. Returns null if no island is found.
+  CoreCanonicalIsland? canonicalIsland({
+    required FixedRect leafRect,
+    required CoreDiscoveryParams params,
+    required int o,
+    required int p,
+    required int q,
+    required String path,
+  }) {
+    final (Pointer<Uint8> ppPtr, int ppLen) = _allocAscii(path);
+    final Pointer<Uint32> outEscape = calloc<Uint32>();
+    final Pointer<Uint64> outPixelCount = calloc<Uint64>();
+    final Pointer<Int64> outPixelDelta = calloc<Int64>();
+    final Pointer<Int64> outBbox = calloc<Int64>(4);
+    try {
+      final Pointer<Void> handle = _canonicalIslandCompute(
+        leafRect.reMin,
+        leafRect.reMax,
+        leafRect.imMin,
+        leafRect.imMax,
+        params.maxIter,
+        params.targetGood,
+        params.maxFloodPoints,
+        params.minGridCells,
+        params.pMaxShift,
+        params.exclusionThresholdNum,
+        params.rngSeed,
+        o,
+        p,
+        q,
+        ppPtr,
+        ppLen,
+      );
+      if (handle == nullptr) {
+        throw StateError('bs_canonical_island_compute returned NULL handle');
+      }
+      try {
+        if (_canonicalIslandFound(handle) == 0) return null;
+        _canonicalIslandMeta(
+          handle, outEscape, outPixelCount, outPixelDelta, outBbox);
+        final int n = _canonicalIslandNumPoints(handle);
+        // 2 Fixed per point; guard the zero case so calloc gets a valid size.
+        final Pointer<Int64> outPts = calloc<Int64>(n == 0 ? 1 : n * 2);
+        try {
+          final int written = _canonicalIslandPoints(handle, outPts, n);
+          final List<int> pointsRaw =
+              List<int>.from(outPts.asTypedList(written * 2));
+          return CoreCanonicalIsland(
+            escapeCount: outEscape.value,
+            pixelCount: outPixelCount.value,
+            pixelDeltaRaw: outPixelDelta.value,
+            bbox: FixedRect(
+              reMin: outBbox[0],
+              reMax: outBbox[1],
+              imMin: outBbox[2],
+              imMax: outBbox[3],
+            ),
+            pointsRaw: pointsRaw,
+          );
+        } finally {
+          calloc.free(outPts);
+        }
+      } finally {
+        _canonicalIslandFree(handle);
+      }
+    } finally {
+      if (ppPtr != nullptr) calloc.free(ppPtr);
+      calloc
+        ..free(outEscape)
+        ..free(outPixelCount)
+        ..free(outPixelDelta)
+        ..free(outBbox);
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Argon2 (stage-1 bits -> 256-bit digest)
   // -------------------------------------------------------------------------
@@ -771,6 +879,28 @@ class CoreLeafAreasResult {
   final int maxLeaves;
 }
 
+/// A leaf area's canonical island from [GreatWallCoreBindings.canonicalIsland]:
+/// the island's flood points as interleaved raw I4F60 `[re, im]` cell centres,
+/// plus the cell size [pixelDeltaRaw] (raw Fixed), bbox, escape count and pixel
+/// count. The union of `pixelDeltaRaw`-sized cells at the points is its shape.
+class CoreCanonicalIsland {
+  const CoreCanonicalIsland({
+    required this.escapeCount,
+    required this.pixelCount,
+    required this.pixelDeltaRaw,
+    required this.bbox,
+    required this.pointsRaw,
+  });
+
+  final int escapeCount;
+  final int pixelCount;
+  final int pixelDeltaRaw;
+  final FixedRect bbox;
+
+  /// Interleaved `[re0, im0, re1, im1, ...]` cell centres as raw I4F60 `i64`.
+  final List<int> pointsRaw;
+}
+
 // ---------------------------------------------------------------------------
 // C ABI typedefs (native + Dart signatures)
 // ---------------------------------------------------------------------------
@@ -867,6 +997,36 @@ typedef _LeafAreasPathDart = int Function(
 
 typedef _LeafAreasFreeC = Void Function(Pointer<Void>);
 typedef _LeafAreasFreeDart = void Function(Pointer<Void>);
+
+typedef _CanonicalIslandComputeC = Pointer<Void> Function(
+  Int64, Int64, Int64, Int64,
+  Uint32, Uint32, Uint64, Uint64, Uint32, Uint32,
+  Uint64, Uint64, Uint64, Uint64,
+  Pointer<Uint8>, Uint32);
+typedef _CanonicalIslandComputeDart = Pointer<Void> Function(
+  int, int, int, int,
+  int, int, int, int, int, int,
+  int, int, int, int,
+  Pointer<Uint8>, int);
+
+typedef _CanonicalIslandFoundC = Int32 Function(Pointer<Void>);
+typedef _CanonicalIslandFoundDart = int Function(Pointer<Void>);
+
+typedef _CanonicalIslandMetaC = Void Function(
+  Pointer<Void>, Pointer<Uint32>, Pointer<Uint64>, Pointer<Int64>, Pointer<Int64>);
+typedef _CanonicalIslandMetaDart = void Function(
+  Pointer<Void>, Pointer<Uint32>, Pointer<Uint64>, Pointer<Int64>, Pointer<Int64>);
+
+typedef _CanonicalIslandNumPointsC = Uint32 Function(Pointer<Void>);
+typedef _CanonicalIslandNumPointsDart = int Function(Pointer<Void>);
+
+typedef _CanonicalIslandPointsC = Uint32 Function(
+  Pointer<Void>, Pointer<Int64>, Uint32);
+typedef _CanonicalIslandPointsDart = int Function(
+  Pointer<Void>, Pointer<Int64>, int);
+
+typedef _CanonicalIslandFreeC = Void Function(Pointer<Void>);
+typedef _CanonicalIslandFreeDart = void Function(Pointer<Void>);
 
 typedef _Argon2SingleC = Void Function(
   Pointer<Uint8>, Uint32, Uint8, Pointer<Uint8>);
