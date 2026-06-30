@@ -47,6 +47,30 @@ class GreatWallCoreBindings {
     );
     _decodeFull =
         _lib.lookupFunction<_DecodeFullC, _DecodeFullDart>('bs_decode_full');
+    _leafAreasCompute =
+        _lib.lookupFunction<_LeafAreasComputeC, _LeafAreasComputeDart>(
+      'bs_leaf_areas_compute',
+    );
+    _leafAreasStatus =
+        _lib.lookupFunction<_LeafAreasStatusC, _LeafAreasStatusDart>(
+      'bs_leaf_areas_status',
+    );
+    _leafAreasCount =
+        _lib.lookupFunction<_LeafAreasCountC, _LeafAreasCountDart>(
+      'bs_leaf_areas_count',
+    );
+    _leafAreasRect =
+        _lib.lookupFunction<_LeafAreasRectC, _LeafAreasRectDart>(
+      'bs_leaf_areas_rect',
+    );
+    _leafAreasPath =
+        _lib.lookupFunction<_LeafAreasPathC, _LeafAreasPathDart>(
+      'bs_leaf_areas_path',
+    );
+    _leafAreasFree =
+        _lib.lookupFunction<_LeafAreasFreeC, _LeafAreasFreeDart>(
+      'bs_leaf_areas_free',
+    );
     _argon2Single =
         _lib.lookupFunction<_Argon2SingleC, _Argon2SingleDart>('bs_argon2_single');
     _argon2idMaster =
@@ -96,6 +120,12 @@ class GreatWallCoreBindings {
   late final _EncodeResultFinalRectDart _encodeResultFinalRect;
   late final _EncodeResultFreeDart _encodeResultFree;
   late final _DecodeFullDart _decodeFull;
+  late final _LeafAreasComputeDart _leafAreasCompute;
+  late final _LeafAreasStatusDart _leafAreasStatus;
+  late final _LeafAreasCountDart _leafAreasCount;
+  late final _LeafAreasRectDart _leafAreasRect;
+  late final _LeafAreasPathDart _leafAreasPath;
+  late final _LeafAreasFreeDart _leafAreasFree;
   late final _Argon2SingleDart _argon2Single;
   late final _Argon2idMasterDart _argon2idMaster;
   late final _SaltPepperCanonicalizeDart _saltPepperCanonicalize;
@@ -353,6 +383,104 @@ class GreatWallCoreBindings {
         ..free(outValid)
         ..free(outPath)
         ..free(outPathLen);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Viewport leaf-area enumeration
+  // -------------------------------------------------------------------------
+
+  /// Enumerate the distinct canonical leaf areas present in a view
+  /// (`bs_leaf_areas_*`). The view is described as for [renderViewport]: pixel
+  /// `(col, row)` samples `(originRe + col*step, originIm + col*step)`; the scan
+  /// steps by [scanStep] pixels. `(o, p, q)` must select the same fractal the
+  /// points were encoded on (`(0,0,0)` for the canonical stage, the stage's
+  /// reservoirs otherwise) — leaf membership is meaningless on any other surface.
+  ///
+  /// Returns either the (capped) list of leaf areas — each a leaf rectangle in
+  /// raw I4F60 bounds plus its bisection path (canonical identity) — or a
+  /// "too many" result when more than [maxLeaves] distinct areas are present.
+  /// The opaque handle is queried and freed internally.
+  CoreLeafAreasResult enumerateLeafAreas({
+    required double originRe,
+    required double originIm,
+    required double step,
+    required int width,
+    required int height,
+    required int scanStep,
+    required int maxLeaves,
+    required FixedRect area,
+    required CoreDiscoveryParams params,
+    required int numBits,
+    required int o,
+    required int p,
+    required int q,
+    String pathPrefix = 'O',
+  }) {
+    final (Pointer<Uint8> ppPtr, int ppLen) = _allocAscii(pathPrefix);
+    // A leaf path is the prefix plus one direction letter per bisection level.
+    final int pathBufLen = pathPrefix.length + numBits + 2;
+    final Pointer<Int64> outRect = calloc<Int64>(4);
+    final Pointer<Uint8> outPath = calloc<Uint8>(pathBufLen);
+    try {
+      final Pointer<Void> handle = _leafAreasCompute(
+        originRe,
+        originIm,
+        step,
+        width,
+        height,
+        scanStep,
+        maxLeaves,
+        area.reMin,
+        area.reMax,
+        area.imMin,
+        area.imMax,
+        params.maxIter,
+        params.targetGood,
+        params.maxFloodPoints,
+        params.minGridCells,
+        params.pMaxShift,
+        params.exclusionThresholdNum,
+        params.rngSeed,
+        numBits,
+        o,
+        p,
+        q,
+        ppPtr,
+        ppLen,
+      );
+      if (handle == nullptr) {
+        throw StateError('bs_leaf_areas_compute returned NULL handle');
+      }
+      try {
+        // status: 0 = list available, 1 = too many (zoom in).
+        if (_leafAreasStatus(handle) == 1) {
+          return CoreLeafAreasResult.tooMany(maxLeaves);
+        }
+        final int count = _leafAreasCount(handle);
+        final List<CoreLeafArea> leaves = <CoreLeafArea>[];
+        for (int i = 0; i < count; i++) {
+          _leafAreasRect(handle, i, outRect);
+          final FixedRect rect = FixedRect(
+            reMin: outRect[0],
+            reMax: outRect[1],
+            imMin: outRect[2],
+            imMax: outRect[3],
+          );
+          final int len = _leafAreasPath(handle, i, outPath, pathBufLen);
+          final int take = len < pathBufLen ? len : pathBufLen - 1;
+          final String path = String.fromCharCodes(outPath.asTypedList(take));
+          leaves.add(CoreLeafArea(rect: rect, path: path));
+        }
+        return CoreLeafAreasResult.leaves(leaves);
+      } finally {
+        _leafAreasFree(handle);
+      }
+    } finally {
+      if (ppPtr != nullptr) calloc.free(ppPtr);
+      // The path bytes are directional bits; wipe them before freeing.
+      _zeroAndFree(outPath, pathBufLen);
+      calloc.free(outRect);
     }
   }
 
@@ -616,6 +744,33 @@ class CoreDecodeResult {
   final bool valid;
 }
 
+/// One leaf area from [GreatWallCoreBindings.enumerateLeafAreas]: the leaf
+/// rectangle in raw I4F60 bounds, plus its bisection [path] — the canonical
+/// identity, stable across frames and zoom levels.
+class CoreLeafArea {
+  const CoreLeafArea({required this.rect, required this.path});
+
+  final FixedRect rect;
+  final String path;
+}
+
+/// Result of [GreatWallCoreBindings.enumerateLeafAreas]: either the (capped)
+/// list of distinct leaf areas present, or [tooMany] meaning more than
+/// [maxLeaves] are present and the UX should prompt the user to zoom in.
+class CoreLeafAreasResult {
+  const CoreLeafAreasResult.leaves(this.leaves)
+      : tooMany = false,
+        maxLeaves = 0;
+
+  const CoreLeafAreasResult.tooMany(this.maxLeaves)
+      : leaves = const <CoreLeafArea>[],
+        tooMany = true;
+
+  final List<CoreLeafArea> leaves;
+  final bool tooMany;
+  final int maxLeaves;
+}
+
 // ---------------------------------------------------------------------------
 // C ABI typedefs (native + Dart signatures)
 // ---------------------------------------------------------------------------
@@ -682,6 +837,36 @@ typedef _DecodeFullDart = void Function(
   Pointer<Uint8>, int,
   Pointer<Uint8>, Pointer<Int64>, Pointer<Uint8>,
   Pointer<Uint8>, int, Pointer<Uint32>);
+
+typedef _LeafAreasComputeC = Pointer<Void> Function(
+  Double, Double, Double, Uint32, Uint32, Uint32, Uint32,
+  Int64, Int64, Int64, Int64,
+  Uint32, Uint32, Uint64, Uint64, Uint32, Uint32,
+  Uint64, Uint32, Uint64, Uint64, Uint64,
+  Pointer<Uint8>, Uint32);
+typedef _LeafAreasComputeDart = Pointer<Void> Function(
+  double, double, double, int, int, int, int,
+  int, int, int, int,
+  int, int, int, int, int, int,
+  int, int, int, int, int,
+  Pointer<Uint8>, int);
+
+typedef _LeafAreasStatusC = Int32 Function(Pointer<Void>);
+typedef _LeafAreasStatusDart = int Function(Pointer<Void>);
+
+typedef _LeafAreasCountC = Uint32 Function(Pointer<Void>);
+typedef _LeafAreasCountDart = int Function(Pointer<Void>);
+
+typedef _LeafAreasRectC = Void Function(Pointer<Void>, Uint32, Pointer<Int64>);
+typedef _LeafAreasRectDart = void Function(Pointer<Void>, int, Pointer<Int64>);
+
+typedef _LeafAreasPathC = Uint32 Function(
+  Pointer<Void>, Uint32, Pointer<Uint8>, Uint32);
+typedef _LeafAreasPathDart = int Function(
+  Pointer<Void>, int, Pointer<Uint8>, int);
+
+typedef _LeafAreasFreeC = Void Function(Pointer<Void>);
+typedef _LeafAreasFreeDart = void Function(Pointer<Void>);
 
 typedef _Argon2SingleC = Void Function(
   Pointer<Uint8>, Uint32, Uint8, Pointer<Uint8>);
