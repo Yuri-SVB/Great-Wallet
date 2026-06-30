@@ -42,6 +42,19 @@ enum SetupPhase {
   error,
 }
 
+/// Outcome of the `E` canonical-leaf-area enumeration (drives the screen's
+/// sound cue and status).
+enum LeafScanOutcome {
+  /// One or more canonical islands were highlighted.
+  shown,
+
+  /// Too many / too dense to enumerate here — the user should zoom in.
+  tooMany,
+
+  /// No leaf areas resolved in view (e.g. zoomed out / over a dead region).
+  empty,
+}
+
 /// Outcome of a select-mode click. Selecting a point only **marks** it on the
 /// displayed stage; deriving the next fractal is a separate step (selecting the
 /// next stage — see [deriveNextStage]).
@@ -564,7 +577,12 @@ class SetupController extends ChangeNotifier {
   /// discovery per leaf, all through blocking FFI on the UI isolate. It is a
   /// one-shot on key-press (not per frame); moving it off the UI isolate is a
   /// follow-up if the freeze on a busy view becomes noticeable.
-  Future<void> enumerateCanonicalIslands(FractalViewport viewport) async {
+  /// Number of canonical islands currently highlighted by the `E` enumeration.
+  int get islandCount => _islandHighlights.length;
+
+  Future<LeafScanOutcome> enumerateCanonicalIslands(
+      FractalViewport viewport) async {
+    debugPrint('E: enumerating canonical leaf areas in the current view…');
     final LeafAreasResult res = await _core.leafSource.leafAreas(
       LeafAreasRequest(
         viewport: viewport,
@@ -578,8 +596,9 @@ class SetupController extends ChangeNotifier {
       // Covers both "more than maxLeaves distinct areas" and the decode-budget
       // (zoom-out) guard — the action is the same.
       _islandStatus = 'Too many / too dense to enumerate here — zoom in.';
+      debugPrint('E: too many / too dense to enumerate here — zoom in.');
       notifyListeners();
-      return;
+      return LeafScanOutcome.tooMany;
     }
 
     // (o, p, q): the canonical stage decodes on (0,0,0), a chain stage on its
@@ -592,45 +611,24 @@ class SetupController extends ChangeNotifier {
     final int p = r?.p ?? 0;
     final int q = r?.q ?? 0;
 
-    // Visualisation discovery params: the engine's encode params with a larger
-    // flood cap so an island resolves into a shape rather than a speck.
-    final CoreDiscoveryParams base = _core.encodeParams;
-    final CoreDiscoveryParams vizParams = CoreDiscoveryParams(
-      maxIter: base.maxIter,
-      targetGood: base.targetGood,
-      maxFloodPoints: EncodingConstants.canonicalIslandMaxFloodPoints,
-      minGridCells: base.minGridCells,
-      pMaxShift: base.pMaxShift,
-      exclusionThresholdNum: base.exclusionThresholdNum,
-      rngSeed: base.rngSeed,
-    );
-
     final List<CanvasIsland> islands = <CanvasIsland>[];
     for (final LeafArea leaf in res.leaves) {
-      final CoreCanonicalIsland? island = _core.bindings.canonicalIsland(
-        leafRect:
-            FixedRect.fromDoubles(leaf.reMin, leaf.reMax, leaf.imMin, leaf.imMax),
-        params: vizParams,
-        o: o,
-        p: p,
-        q: q,
-        path: leaf.path,
+      final _IslandDeco? deco = _islandDecoForLeaf(
+        FixedRect.fromDoubles(leaf.reMin, leaf.reMax, leaf.imMin, leaf.imMax),
+        leaf.path,
+        o,
+        p,
+        q,
       );
-      if (island == null || island.pointsRaw.isEmpty) continue;
-      final List<double> pts =
-          List<double>.filled(island.pointsRaw.length, 0);
-      for (int i = 0; i < island.pointsRaw.length; i++) {
-        pts[i] = fixedToDouble(island.pointsRaw[i]);
-      }
-      islands.add(CanvasIsland(
-        cellSize: fixedToDouble(island.pixelDeltaRaw),
-        pointsReIm: pts,
-      ));
+      if (deco != null) islands.add(deco.cells);
     }
 
     _islandHighlights = islands;
     _islandStatus = islands.isEmpty ? 'No islands found in view.' : null;
+    debugPrint('E: ${res.leaves.length} leaf area(s) in view, '
+        '${islands.length} canonical island(s) highlighted.');
     notifyListeners();
+    return islands.isEmpty ? LeafScanOutcome.empty : LeafScanOutcome.shown;
   }
 
   /// Clear any canonical-island highlights and status (e.g. on stage change or

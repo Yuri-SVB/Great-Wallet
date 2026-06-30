@@ -753,10 +753,11 @@ class _SetupScreenState extends State<SetupScreen> {
     }
     // E — enumerate the canonical leaf areas under the current view and
     // highlight each one's canonical island (flat white). Heavy one-shot
-    // (decode grid + per-leaf discovery); no-op while a derivation is busy.
+    // (memoized decode grid + per-leaf discovery); no-op while a derivation is
+    // busy.
     if (event.logicalKey == LogicalKeyboardKey.keyE) {
       if (!_busy) {
-        unawaited(_setup.enumerateCanonicalIslands(_viewport.viewport));
+        unawaited(_enumerateIslands());
       }
       return KeyEventResult.handled;
     }
@@ -1132,6 +1133,26 @@ class _SetupScreenState extends State<SetupScreen> {
         ),
       ),
     );
+  }
+
+  /// Run the `E` canonical-leaf-area enumeration: a start cue, then a result
+  /// cue + toast/console log. See [SetupController.enumerateCanonicalIslands].
+  Future<void> _enumerateIslands() async {
+    _sounds.play(UiSound.focus);
+    final LeafScanOutcome r =
+        await _setup.enumerateCanonicalIslands(_viewport.viewport);
+    if (!mounted) return;
+    switch (r) {
+      case LeafScanOutcome.shown:
+        _sounds.play(UiSound.confirm);
+        _toast('Highlighted ${_setup.islandCount} canonical island(s).');
+      case LeafScanOutcome.tooMany:
+        _sounds.play(UiSound.warn);
+        _toast('Too many / too dense to enumerate here — zoom in.');
+      case LeafScanOutcome.empty:
+        _sounds.play(UiSound.denyMiss);
+        _toast('No canonical islands in view — zoom in.');
+    }
   }
 
   Future<void> _onCanvasSelect(FractalSelection sel) async {
