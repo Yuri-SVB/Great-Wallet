@@ -65,11 +65,11 @@ class EncodingConstants {
   /// hard cost cap.
   static const int leafEnumMaxAxisSamples = 64;
 
-  /// Hard cap on the number of (non-excluded) decodes per leaf-area scan — the
-  /// zoom-out guard. A decode is ~hundreds of ms (full discovery), so at
-  /// zoom-out, where almost nothing is excluded, an unbounded scan would hang;
-  /// hitting this budget aborts with a "zoom in" result. Tuned for a bounded
-  /// few-second worst case on the UI isolate (raise it once enumeration moves
-  /// off the UI isolate).
-  static const int leafEnumMaxDecodes = 24;
+  /// Backstop cap on island **discoveries** (bisection-tree node expansions)
+  /// per leaf-area scan — the zoom-out guard. The engine memoizes the area tree,
+  /// so points sharing a path prefix reuse the expensive upper-level
+  /// discoveries; in practice even a zoom-out scan now finishes in a fraction of
+  /// a second. This bound only catches a pathological view; it is generous so it
+  /// never falsely aborts a legitimate one. Hitting it yields a "zoom in" result.
+  static const int leafEnumMaxDecodes = 4000;
 }
