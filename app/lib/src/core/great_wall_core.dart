@@ -300,14 +300,17 @@ class GreatWallCore {
 
   /// Start a **cancellable** on-device Argon2 micro-benchmark at [profile] in a
   /// worker isolate (heavy, blocking), returning an [Argon2BenchJob] whose
-  /// `result` is the measured **seconds per pass** (one pass == one derivation
-  /// step). One untimed warm-up pass faults in the profile's memory; [passes]
-  /// timed passes are then averaged. `cancel()` kills the isolate and fails
-  /// `result` with [Argon2Cancelled]. `result` errors with [StateError] if the
-  /// profile can't be allocated (e.g. the 32/128 GiB tiers on a phone).
+  /// `result` is the **median** seconds per pass (one pass == one derivation
+  /// step) over [passes] timed passes. One untimed warm-up pass faults in the
+  /// profile's memory first. [onProgress] is called `(done, total)` after the
+  /// warm-up and after each timed pass (`total == 1 + passes`), for a
+  /// determinate progress bar. `cancel()` kills the isolate and fails `result`
+  /// with [Argon2Cancelled]; `result` errors with [StateError] if the profile
+  /// can't be allocated (e.g. the 32/128 GiB tiers on a phone).
   Future<Argon2BenchJob> startBenchArgon2({
     Argon2Profile profile = Argon2Profile.basic,
-    int passes = 2,
+    int passes = 3,
+    void Function(int done, int total)? onProgress,
   }) async {
     final ReceivePort port = ReceivePort();
     final Completer<double> completer = Completer<double>();
@@ -319,12 +322,18 @@ class GreatWallCore {
     );
     void cleanup() => port.close();
     port.listen((dynamic msg) {
-      if (msg is double) {
+      if (msg is (int, int)) {
+        // Progress tick — does not complete the job.
+        onProgress?.call(msg.$1, msg.$2);
+      } else if (msg is double) {
         if (!completer.isCompleted) completer.complete(msg);
-      } else if (!completer.isCompleted) {
-        completer.completeError(StateError('Argon2 calibration failed'));
+        cleanup();
+      } else {
+        if (!completer.isCompleted) {
+          completer.completeError(StateError('Argon2 calibration failed'));
+        }
+        cleanup();
       }
-      cleanup();
     });
     void cancel() {
       if (completer.isCompleted) return;
@@ -338,7 +347,7 @@ class GreatWallCore {
   /// Convenience wrapper: run a benchmark and await its result (not cancellable).
   Future<double> benchArgon2({
     Argon2Profile profile = Argon2Profile.basic,
-    int passes = 2,
+    int passes = 3,
   }) async {
     final Argon2BenchJob job =
         await startBenchArgon2(profile: profile, passes: passes);
@@ -346,21 +355,34 @@ class GreatWallCore {
   }
 }
 
-/// Worker-isolate entry: open the engine and time [passes] Argon2 passes at the
-/// given profile (after one untimed warm-up pass), returning seconds per pass.
+/// Worker-isolate entry: open the engine, run one untimed warm-up pass, then
+/// time [passes] passes at the given profile and return the **median** seconds
+/// per pass. Emits a `(done, total)` progress tick after the warm-up and after
+/// each timed pass (`total == 1 + passes`).
 void _argon2BenchIsolateEntry((SendPort, int, int) args) {
   final (SendPort send, int profileValue, int passes) = args;
   final Argon2Profile profile = Argon2Profile.values[profileValue];
   final GreatWallCoreBindings bindings = GreatWallCoreBindings.open();
   final Uint8List input = Uint8List(8);
+  final int total = 1 + passes;
   // Warm-up (fault in the profile's pages) — not timed.
   bindings.argon2Single(input, profile);
-  final Stopwatch sw = Stopwatch()..start();
+  send.send((1, total));
+  final List<double> times = <double>[];
   for (int i = 0; i < passes; i++) {
+    final Stopwatch sw = Stopwatch()..start();
     bindings.argon2Single(input, profile);
+    sw.stop();
+    times.add(sw.elapsedMicroseconds / 1e6);
+    send.send((2 + i, total));
   }
-  sw.stop();
-  send.send(sw.elapsedMicroseconds / 1e6 / passes);
+  // Median is robust to a stray scheduling/contention spike.
+  times.sort();
+  final int m = times.length;
+  final double median = m.isOdd
+      ? times[m ~/ 2]
+      : (times[m ~/ 2 - 1] + times[m ~/ 2]) / 2.0;
+  send.send(median);
 }
 
 /// Worker-isolate entry: open the engine, run the single Argon2id master pass

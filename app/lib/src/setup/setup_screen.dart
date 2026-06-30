@@ -4205,15 +4205,25 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
   late int _stages;
   int? _computedN;
 
+  // Advanced (sane defaults; "leave unchanged if unsure"):
+  // - conservative safety margin baked into N (typical user overshoots ~2×),
+  // - benchmark passes (median of these).
+  double _margin = 2.0;
+  int _passes = 3;
+
+  // Determinate progress over (1 warm-up + _passes) benchmark passes.
+  int _progressDone = 0;
+  int _progressTotal = 0;
+
   @override
   void initState() {
     super.initState();
     _stages = widget.initialStages.clamp(1, SetupController.maxPointStages);
   }
 
-  /// Recompute N from the single benchmark + the current target / scope / stages.
-  /// N is per stage; "all stages" splits the target across the stages so the
-  /// whole setup ≈ target.
+  /// Recompute N from the single benchmark + the current target / scope / stages
+  /// / margin. N is per stage; "all stages" splits the target across the stages
+  /// so the whole setup ≈ target. The safety margin lengthens N (err to caution).
   void _recompute() {
     final double? s = _secPerPass;
     final Duration? t = _target;
@@ -4224,17 +4234,30 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
     final double perStageSeconds = _scope == _CalibScope.allStages
         ? t.inSeconds / _stages
         : t.inSeconds.toDouble();
-    _computedN = (perStageSeconds / s).ceil().clamp(1, 1 << 30);
+    _computedN = (perStageSeconds * _margin / s).ceil().clamp(1, 1 << 30);
   }
 
   Future<void> _bench() async {
     setState(() {
       _benching = true;
       _benchError = null;
+      _progressDone = 0;
+      _progressTotal = 1 + _passes;
     });
     widget.sounds.play(UiSound.focus);
     try {
-      _benchJob = await widget.core.startBenchArgon2(profile: widget.profile);
+      _benchJob = await widget.core.startBenchArgon2(
+        profile: widget.profile,
+        passes: _passes,
+        onProgress: (int done, int total) {
+          if (mounted) {
+            setState(() {
+              _progressDone = done;
+              _progressTotal = total;
+            });
+          }
+        },
+      );
       final double s = await _benchJob!.result;
       if (!mounted) return;
       setState(() {
@@ -4306,6 +4329,16 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
     return '${(seconds / 86400).toStringAsFixed(1)} d';
   }
 
+  String _fmtMargin() => _margin == _margin.roundToDouble()
+      ? _margin.toStringAsFixed(0)
+      : _margin.toStringAsFixed(1);
+
+  /// Determinate-progress label: warm-up, then "Measuring k / passes…".
+  String _progressLabel() {
+    if (_progressDone <= 0) return 'Warming up…';
+    return 'Measuring ${_progressDone.clamp(1, _passes)} / $_passes…';
+  }
+
   @override
   Widget build(BuildContext context) {
     final ThemeData theme = Theme.of(context);
@@ -4355,8 +4388,7 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
                     const SizedBox(height: 6),
                     Row(
                       children: <Widget>[
-                        // Run ↔ Stop: a benchmark in progress is cancellable
-                        // (kills the worker isolate).
+                        // Run ↔ Stop: a benchmark in progress is cancellable.
                         OutlinedButton.icon(
                           onPressed: _benching ? _cancelBench : _bench,
                           icon: Icon(_benching ? Icons.stop : Icons.speed,
@@ -4366,18 +4398,10 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
                               : (s == null ? 'Run benchmark' : 'Re-run')),
                         ),
                         const SizedBox(width: 12),
-                        if (_benching) ...<Widget>[
-                          const SizedBox(
-                              width: 16,
-                              height: 16,
-                              child:
-                                  CircularProgressIndicator(strokeWidth: 2)),
-                          const SizedBox(width: 8),
-                        ],
                         Expanded(
                           child: Text(
                             _benching
-                                ? 'Benchmarking… (Stop to cancel)'
+                                ? _progressLabel()
                                 : (_benchError ??
                                     (s == null
                                         ? 'Profile: ${widget.profileLabel}'
@@ -4387,6 +4411,15 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
                         ),
                       ],
                     ),
+                    // Determinate progress: one notch per (warm-up + timed) pass.
+                    if (_benching) ...<Widget>[
+                      const SizedBox(height: 10),
+                      LinearProgressIndicator(
+                        value: _progressTotal > 0
+                            ? _progressDone / _progressTotal
+                            : null,
+                      ),
+                    ],
                     const SizedBox(height: 20),
 
                     // 2 — target time.
@@ -4458,11 +4491,85 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
                     ),
                     const SizedBox(height: 20),
 
+                    // Advanced — sane defaults; leave unchanged if unsure.
+                    ExpansionTile(
+                      tilePadding: EdgeInsets.zero,
+                      childrenPadding: const EdgeInsets.only(bottom: 8),
+                      title:
+                          Text('Advanced', style: theme.textTheme.labelLarge),
+                      children: <Widget>[
+                        Align(
+                          alignment: Alignment.centerLeft,
+                          child: Text(
+                            'If you don’t know what these mean, leave them '
+                            'unchanged.',
+                            style: theme.textTheme.bodySmall,
+                          ),
+                        ),
+                        const SizedBox(height: 10),
+                        Row(
+                          children: <Widget>[
+                            SizedBox(
+                                width: 120,
+                                child: Text('Safety margin',
+                                    style: theme.textTheme.bodyMedium)),
+                            Expanded(
+                              child: SegmentedButton<double>(
+                                showSelectedIcon: false,
+                                segments: const <ButtonSegment<double>>[
+                                  ButtonSegment<double>(
+                                      value: 1.0, label: Text('×1')),
+                                  ButtonSegment<double>(
+                                      value: 1.5, label: Text('×1.5')),
+                                  ButtonSegment<double>(
+                                      value: 2.0, label: Text('×2')),
+                                  ButtonSegment<double>(
+                                      value: 3.0, label: Text('×3')),
+                                ],
+                                selected: <double>{_margin},
+                                onSelectionChanged: (Set<double> sel) =>
+                                    setState(() {
+                                  _margin = sel.first;
+                                  widget.sounds.play(UiSound.tickSoft);
+                                  _recompute();
+                                }),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        Row(
+                          children: <Widget>[
+                            SizedBox(
+                                width: 120,
+                                child: Text('Benchmark passes',
+                                    style: theme.textTheme.bodyMedium)),
+                            IconButton(
+                              onPressed: (_benching || _passes <= 1)
+                                  ? null
+                                  : () => setState(() => _passes--),
+                              icon: const Icon(Icons.remove_circle_outline),
+                            ),
+                            Text('$_passes',
+                                style: theme.textTheme.titleMedium),
+                            IconButton(
+                              onPressed: (_benching || _passes >= 7)
+                                  ? null
+                                  : () => setState(() => _passes++),
+                              icon: const Icon(Icons.add_circle_outline),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 20),
+
                     // Result.
                     if (n != null && s != null)
                       Text(
                         'N = $n   ·   one stage ≈ ${_fmtDuration(n * s)}   ·   '
-                        'all $_stages ≈ ${_fmtDuration(n * s * _stages)}',
+                        'all $_stages ≈ ${_fmtDuration(n * s * _stages)}'
+                        '${_margin == 1.0 ? '' : '   (×${_fmtMargin()} safety)'}',
                         style: theme.textTheme.bodyMedium,
                       )
                     else
