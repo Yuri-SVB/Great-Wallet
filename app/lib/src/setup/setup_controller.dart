@@ -648,6 +648,8 @@ class SetupController extends ChangeNotifier {
 
   _IslandDeco? _selDeco;
   final Map<int, _IslandDeco?> _selDecoCache = <int, _IslandDeco?>{};
+  _IslandDeco? _genDeco;
+  final Map<int, _IslandDeco?> _genDecoCache = <int, _IslandDeco?>{};
 
   /// Discovery params for resolving a canonical island's *shape* — the engine's
   /// encode params with a larger flood cap so the island is a real shape, not a
@@ -705,6 +707,7 @@ class SetupController extends ChangeNotifier {
   /// Recompute the displayed stage's focus decorations (cached per stage).
   void _refreshFocusDecos() {
     _selDeco = _selectedDecoForDisplay();
+    _genDeco = _generatedDecoForDisplay();
   }
 
   _IslandDeco? _selectedDecoForDisplay() {
@@ -720,28 +723,40 @@ class SetupController extends ChangeNotifier {
     return deco;
   }
 
+  _IslandDeco? _generatedDecoForDisplay() {
+    final int k = _displayStageIndex;
+    final EncodedPoint? pt = (k >= 1 && k < _points.length) ? _points[k] : null;
+    if (pt == null) return null;
+    if (_genDecoCache.containsKey(k)) return _genDecoCache[k];
+    final StageReservoirs? r = (k < _reservoirs.length) ? _reservoirs[k] : null;
+    final _IslandDeco? deco =
+        (r == null) ? null : _islandDecoAt(pt.reRaw, pt.imRaw, r.o, r.p, r.q);
+    _genDecoCache[k] = deco;
+    return deco;
+  }
+
   CanvasOverlays overlaysForDisplayStage() {
     final EncodedPoint? pt = _displayStageIndex < _points.length
         ? _points[_displayStageIndex]
         : null;
+    // The generated point is marked by a fixed-size white cross placed on its
+    // canonical island (falling back to the leaf centre if the island couldn't
+    // be resolved), so the marker is always visible and the island grows into
+    // view around it on deep zoom.
+    final ({double re, double im})? crossAt = pt == null
+        ? null
+        : (_genDeco != null
+            ? (
+                re: (_genDeco!.reMin + _genDeco!.reMax) / 2.0,
+                im: (_genDeco!.imMin + _genDeco!.imMax) / 2.0,
+              )
+            : (re: fixedToDouble(pt.reRaw), im: fixedToDouble(pt.imRaw)));
     return CanvasOverlays(
-      points: <PointMarker>[
-        // Generated point: white dot at the leaf centre (replaced by a cross at
-        // its canonical island in a later change).
-        if (pt != null)
-          PointMarker(
-            re: fixedToDouble(pt.reRaw),
-            im: fixedToDouble(pt.imRaw),
-            colour: const Color(0xFFFFFFFF),
-            radiusPx: 6,
-          ),
-      ],
-      // No crosshairs: a centre cross adds nothing here and reads as a stray
-      // marker over the fractal.
       crosshairs: false,
-      // Enumerated (E) islands plus the selected leaf's canonical island.
+      // Enumerated (E) islands plus the generated and selected leaves' islands.
       islands: <CanvasIsland>[
         ..._islandHighlights,
+        if (_genDeco != null) _genDeco!.cells,
         if (_selDeco != null) _selDeco!.cells,
       ],
       // The selected leaf framed by a white rectangle.
@@ -753,6 +768,10 @@ class SetupController extends ChangeNotifier {
             imMin: _selDeco!.imMin,
             imMax: _selDeco!.imMax,
           ),
+      ],
+      // The generated point's cross.
+      crosses: <CrossMarker>[
+        if (crossAt != null) CrossMarker(re: crossAt.re, im: crossAt.im),
       ],
     );
   }
@@ -869,6 +888,8 @@ class SetupController extends ChangeNotifier {
     _profile = profile;
     try {
       _entropyBits = bits;
+      _selDecoCache.clear();
+      _genDecoCache.clear();
       _points = List<EncodedPoint?>.filled(pointStages + 1, null);
       _reservoirs = List<StageReservoirs?>.filled(pointStages + 1, null);
       _stageRecords = List<StageRecord?>.filled(pointStages + 1, null);
@@ -1004,6 +1025,7 @@ class SetupController extends ChangeNotifier {
     );
     _points[k] = pts.first;
     _leafRects[k] = pts.first.leafRect;
+    _genDecoCache.remove(k);
     // Record this stage's export contribution: its params and the centre of
     // the encoded point's leaf rectangle (DESIGN.md §"Master-Secret Export").
     final ({int re, int im}) leaf =
@@ -1258,6 +1280,8 @@ class SetupController extends ChangeNotifier {
     _stageCount = pointStages + 1; // Stage-0 text + one per point stage
     _chainText = _core.canonicalizeSaltPepper(text);
     _iterations = argon2Iterations;
+    _selDecoCache.clear();
+    _genDecoCache.clear();
     _points = List<EncodedPoint?>.filled(_stageCount, null);
     _reservoirs = List<StageReservoirs?>.filled(_stageCount, null);
     _stageRecords = List<StageRecord?>.filled(_stageCount, null);
@@ -1437,6 +1461,7 @@ class SetupController extends ChangeNotifier {
     // The encoded point now defines this stage; drop any recall-style selection.
     _selectedMarks[k] = null;
     _selDecoCache.remove(k);
+    _genDecoCache.remove(k);
     final List<int>? oldSel = _selectedChunks[k];
     if (oldSel != null) {
       Entropy.wipe(oldSel);
@@ -2049,6 +2074,8 @@ class SetupController extends ChangeNotifier {
       leafReRaw: leaf.re,
       leafImRaw: leaf.im,
     );
+    _genDecoCache.remove(k);
+    _refreshFocusDecos();
     Entropy.wipe(chunk);
     notifyListeners();
   }
@@ -2506,7 +2533,9 @@ class SetupController extends ChangeNotifier {
     _core.leafSource.reservoirs = null;
     _clearIslandHighlights();
     _selDecoCache.clear();
+    _genDecoCache.clear();
     _selDeco = null;
+    _genDeco = null;
     _clearRecall();
   }
 
