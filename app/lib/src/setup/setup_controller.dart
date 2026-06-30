@@ -575,7 +575,9 @@ class SetupController extends ChangeNotifier {
     );
     if (res.tooMany) {
       _islandHighlights = const <CanvasIsland>[];
-      _islandStatus = 'Too many leaf areas in view (> ${res.maxLeaves}) — zoom in.';
+      // Covers both "more than maxLeaves distinct areas" and the decode-budget
+      // (zoom-out) guard — the action is the same.
+      _islandStatus = 'Too many / too dense to enumerate here — zoom in.';
       notifyListeners();
       return;
     }

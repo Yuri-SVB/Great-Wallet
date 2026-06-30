@@ -437,6 +437,7 @@ class GreatWallCoreBindings {
     required int height,
     required int scanStep,
     required int maxLeaves,
+    required int maxDecodes,
     required FixedRect area,
     required CoreDiscoveryParams params,
     required int numBits,
@@ -459,6 +460,7 @@ class GreatWallCoreBindings {
         height,
         scanStep,
         maxLeaves,
+        maxDecodes,
         area.reMin,
         area.reMax,
         area.imMin,
@@ -481,8 +483,9 @@ class GreatWallCoreBindings {
         throw StateError('bs_leaf_areas_compute returned NULL handle');
       }
       try {
-        // status: 0 = list available, 1 = too many (zoom in).
-        if (_leafAreasStatus(handle) == 1) {
+        // status: 0 = list available; 1 = too many leaves; 2 = decode budget
+        // hit (zoom-out). Both non-zero outcomes mean "zoom in".
+        if (_leafAreasStatus(handle) != 0) {
           return CoreLeafAreasResult.tooMany(maxLeaves);
         }
         final int count = _leafAreasCount(handle);
@@ -969,13 +972,13 @@ typedef _DecodeFullDart = void Function(
   Pointer<Uint8>, int, Pointer<Uint32>);
 
 typedef _LeafAreasComputeC = Pointer<Void> Function(
-  Double, Double, Double, Uint32, Uint32, Uint32, Uint32,
+  Double, Double, Double, Uint32, Uint32, Uint32, Uint32, Uint32,
   Int64, Int64, Int64, Int64,
   Uint32, Uint32, Uint64, Uint64, Uint32, Uint32,
   Uint64, Uint32, Uint64, Uint64, Uint64,
   Pointer<Uint8>, Uint32);
 typedef _LeafAreasComputeDart = Pointer<Void> Function(
-  double, double, double, int, int, int, int,
+  double, double, double, int, int, int, int, int,
   int, int, int, int,
   int, int, int, int, int, int,
   int, int, int, int, int,

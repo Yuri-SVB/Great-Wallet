@@ -2,6 +2,7 @@ import 'package:great_wall_ux/great_wall_ux.dart';
 
 import '../ffi/core_bindings.dart';
 import '../ffi/fixed.dart';
+import 'encoding_constants.dart';
 import 'stage_params.dart';
 
 /// The integration seam: a great-wall-ux [LeafAreaSource] backed by the real
@@ -54,6 +55,15 @@ class CoreLeafAreaSource implements LeafAreaSource {
     final double originRe = vp.centreRe + (0.5 - w / 2.0) * u;
     final double originIm = vp.centreIm + (0.5 - h / 2.0) * u;
 
+    // Coarse-grid clamp: raise the scan step so neither axis exceeds the sample
+    // cap, regardless of canvas size (the grid is pixels / step). The decode
+    // budget is the hard cost cap; this just keeps the loop itself bounded.
+    final int maxAxis = w > h ? w : h;
+    final int axisCap = EncodingConstants.leafEnumMaxAxisSamples;
+    final int minScan = (maxAxis + axisCap - 1) ~/ axisCap; // ceil(maxAxis/cap)
+    final int scanStep =
+        request.scanStep > minScan ? request.scanStep : minScan;
+
     // Canonical stage decodes on generic(0,0,0); a chain stage on its
     // reservoirs — matching the encode-time surface (see CoreEscapeCountSource).
     final int o = request.stage == Stage.stage2 ? _requireReservoirs().o : 0;
@@ -66,8 +76,9 @@ class CoreLeafAreaSource implements LeafAreaSource {
       step: u,
       width: w,
       height: h,
-      scanStep: request.scanStep,
+      scanStep: scanStep,
       maxLeaves: request.maxLeaves,
+      maxDecodes: EncodingConstants.leafEnumMaxDecodes,
       area: _area,
       params: _params,
       numBits: request.numBits,

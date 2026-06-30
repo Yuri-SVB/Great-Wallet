@@ -58,4 +58,18 @@ class EncodingConstants {
   /// touches the encoded bits (only `o,p,q` and the leaf rect do) — so it lives
   /// app-side rather than in the engine's encode params.
   static const int canonicalIslandMaxFloodPoints = 50000;
+
+  /// Cap on leaf-area scan samples **per axis**, regardless of canvas size, so
+  /// the grid can't explode on a large window (the scan is `pixels / step`).
+  /// The source raises the step to honour this; the decode budget below is the
+  /// hard cost cap.
+  static const int leafEnumMaxAxisSamples = 64;
+
+  /// Hard cap on the number of (non-excluded) decodes per leaf-area scan — the
+  /// zoom-out guard. A decode is ~hundreds of ms (full discovery), so at
+  /// zoom-out, where almost nothing is excluded, an unbounded scan would hang;
+  /// hitting this budget aborts with a "zoom in" result. Tuned for a bounded
+  /// few-second worst case on the UI isolate (raise it once enumeration moves
+  /// off the UI isolate).
+  static const int leafEnumMaxDecodes = 24;
 }
