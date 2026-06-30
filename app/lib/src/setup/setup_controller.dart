@@ -42,6 +42,19 @@ enum SetupPhase {
   error,
 }
 
+/// Outcome of the `E` canonical-leaf-area enumeration (drives the screen's
+/// sound cue and status).
+enum LeafScanOutcome {
+  /// One or more canonical islands were highlighted.
+  shown,
+
+  /// Too many / too dense to enumerate here — the user should zoom in.
+  tooMany,
+
+  /// No leaf areas resolved in view (e.g. zoomed out / over a dead region).
+  empty,
+}
+
 /// Outcome of a select-mode click. Selecting a point only **marks** it on the
 /// displayed stage; deriving the next fractal is a separate step (selecting the
 /// next stage — see [deriveNextStage]).
@@ -547,31 +560,248 @@ class SetupController extends ChangeNotifier {
   /// The point markers to overlay for the currently displayed stage: the single
   /// location the user must learn to recognise (white), plus the point selected
   /// on this stage in select mode (green).
+  // -- Canonical-island highlights (the `E` action) -------------------------
+
+  List<CanvasIsland> _islandHighlights = const <CanvasIsland>[];
+  String? _islandStatus;
+
+  /// Transient status for the leaf-area / island enumeration ("too many leaf
+  /// areas", "no islands"), or null when islands are shown or nothing was run.
+  String? get islandStatus => _islandStatus;
+
+  /// Enumerate the canonical leaf areas under [viewport] and highlight each
+  /// one's canonical island (flat white). Aborts with a "zoom in" status when
+  /// there are too many leaf areas. Triggered by the Setup screen's `E` action.
+  ///
+  /// Heavy: the enumeration decodes a grid of sample points and runs a fresh
+  /// discovery per leaf, all through blocking FFI on the UI isolate. It is a
+  /// one-shot on key-press (not per frame); moving it off the UI isolate is a
+  /// follow-up if the freeze on a busy view becomes noticeable.
+  /// Number of canonical islands currently highlighted by the `E` enumeration.
+  int get islandCount => _islandHighlights.length;
+
+  Future<LeafScanOutcome> enumerateCanonicalIslands(
+      FractalViewport viewport) async {
+    debugPrint('E: enumerating canonical leaf areas in the current view…');
+    final LeafAreasResult res = await _core.leafSource.leafAreas(
+      LeafAreasRequest(
+        viewport: viewport,
+        stage: displayStage,
+        stageParameters: _displayParams,
+        numBits: EncodingConstants.bitsPerPoint,
+      ),
+    );
+    if (res.tooMany) {
+      _islandHighlights = const <CanvasIsland>[];
+      // Covers both "more than maxLeaves distinct areas" and the decode-budget
+      // (zoom-out) guard — the action is the same.
+      _islandStatus = 'Too many / too dense to enumerate here — zoom in.';
+      debugPrint('E: too many / too dense to enumerate here — zoom in.');
+      notifyListeners();
+      return LeafScanOutcome.tooMany;
+    }
+
+    // (o, p, q): the canonical stage decodes on (0,0,0), a chain stage on its
+    // reservoirs — the same surface the leaf was decoded on.
+    final StageReservoirs? r =
+        _displayStageIndex == 0 || _displayStageIndex >= _reservoirs.length
+            ? null
+            : _reservoirs[_displayStageIndex];
+    final int o = r?.o ?? 0;
+    final int p = r?.p ?? 0;
+    final int q = r?.q ?? 0;
+
+    final List<CanvasIsland> islands = <CanvasIsland>[];
+    for (final LeafArea leaf in res.leaves) {
+      final _IslandDeco? deco = _islandDecoForLeaf(
+        FixedRect.fromDoubles(leaf.reMin, leaf.reMax, leaf.imMin, leaf.imMax),
+        leaf.path,
+        o,
+        p,
+        q,
+      );
+      if (deco != null) islands.add(deco.cells);
+    }
+
+    _islandHighlights = islands;
+    _islandStatus = islands.isEmpty ? 'No islands found in view.' : null;
+    debugPrint('E: ${res.leaves.length} leaf area(s) in view, '
+        '${islands.length} canonical island(s) highlighted.');
+    notifyListeners();
+    return islands.isEmpty ? LeafScanOutcome.empty : LeafScanOutcome.shown;
+  }
+
+  /// Clear any canonical-island highlights and status (e.g. on stage change or
+  /// session teardown).
+  void _clearIslandHighlights() {
+    _islandHighlights = const <CanvasIsland>[];
+    _islandStatus = null;
+  }
+
+  // --- Selected-leaf decoration --------------------------------------------
+  //
+  // The displayed stage's selected leaf is shown as its canonical island (white
+  // cells) framed by a white rectangle. Computed when the selection is made
+  // (reusing that decode) and cached per stage; recomputed lazily on navigation.
+
+  _IslandDeco? _selDeco;
+  final Map<int, _IslandDeco?> _selDecoCache = <int, _IslandDeco?>{};
+  _IslandDeco? _genDeco;
+  final Map<int, _IslandDeco?> _genDecoCache = <int, _IslandDeco?>{};
+
+  /// Discovery params for resolving a canonical island's *shape* — the engine's
+  /// encode params with a larger flood cap so the island is a real shape, not a
+  /// speck. Pure visualisation; never affects encoded bits.
+  CoreDiscoveryParams get _islandVizParams {
+    final CoreDiscoveryParams b = _core.encodeParams;
+    return CoreDiscoveryParams(
+      maxIter: b.maxIter,
+      targetGood: b.targetGood,
+      maxFloodPoints: EncodingConstants.canonicalIslandMaxFloodPoints,
+      minGridCells: b.minGridCells,
+      pMaxShift: b.pMaxShift,
+      exclusionThresholdNum: b.exclusionThresholdNum,
+      rngSeed: b.rngSeed,
+    );
+  }
+
+  /// Build the canonical-island decoration for a known leaf (rect + path).
+  _IslandDeco? _islandDecoForLeaf(
+      FixedRect leafRect, String path, int o, int p, int q) {
+    final CoreCanonicalIsland? isl = _core.bindings.canonicalIsland(
+      leafRect: leafRect,
+      params: _islandVizParams,
+      o: o,
+      p: p,
+      q: q,
+      path: path,
+    );
+    if (isl == null || isl.pointsRaw.isEmpty) return null;
+    final List<double> pts = List<double>.filled(isl.pointsRaw.length, 0);
+    for (int i = 0; i < isl.pointsRaw.length; i++) {
+      pts[i] = fixedToDouble(isl.pointsRaw[i]);
+    }
+    return _IslandDeco(
+      cells: CanvasIsland(
+        cellSize: fixedToDouble(isl.pixelDeltaRaw),
+        pointsReIm: pts,
+      ),
+      reMin: fixedToDouble(isl.bbox.reMin),
+      reMax: fixedToDouble(isl.bbox.reMax),
+      imMin: fixedToDouble(isl.bbox.imMin),
+      imMax: fixedToDouble(isl.bbox.imMax),
+    );
+  }
+
+  /// The decoration for a focus leaf (the generated point or a selection) —
+  /// always framed. Frames the canonical island (with its cells) when it
+  /// resolves; otherwise frames the whole leaf rectangle (no cells), so the
+  /// focus point is never unmarked.
+  _IslandDeco _focusDecoForLeaf(FixedRect leafRect, String path, int o, int p, int q) {
+    final _IslandDeco? isl = _islandDecoForLeaf(leafRect, path, o, p, q);
+    if (isl != null) return isl;
+    return _IslandDeco(
+      cells: const CanvasIsland(cellSize: 0.0, pointsReIm: <double>[]),
+      reMin: fixedToDouble(leafRect.reMin),
+      reMax: fixedToDouble(leafRect.reMax),
+      imMin: fixedToDouble(leafRect.imMin),
+      imMax: fixedToDouble(leafRect.imMax),
+    );
+  }
+
+  /// Decode the leaf at (reRaw, imRaw) on stage k's fractal and build its
+  /// (always-framed) decoration, or null if the point doesn't decode.
+  _IslandDeco? _focusDecoAt(int reRaw, int imRaw, int o, int p, int q) {
+    final CoreDecodeResult d =
+        _core.decodePoint(reRaw: reRaw, imRaw: imRaw, o: o, p: p, q: q);
+    if (!d.valid) return null;
+    return _focusDecoForLeaf(d.leafRect, d.path, o, p, q);
+  }
+
+  /// Recompute the displayed stage's focus decorations (cached per stage).
+  void _refreshFocusDecos() {
+    _selDeco = _selectedDecoForDisplay();
+    _genDeco = _generatedDecoForDisplay();
+  }
+
+  _IslandDeco? _selectedDecoForDisplay() {
+    final int k = _displayStageIndex;
+    final ({double re, double im})? m = selectedMarkAt(k);
+    if (k < 1 || m == null) return null;
+    if (_selDecoCache.containsKey(k)) return _selDecoCache[k];
+    final StageReservoirs? r = (k < _reservoirs.length) ? _reservoirs[k] : null;
+    _IslandDeco? deco;
+    if (r != null) {
+      final CoreDecodeResult d = _core.decodePoint(
+        reRaw: fixedFromDouble(m.re),
+        imRaw: fixedFromDouble(m.im),
+        o: r.o,
+        p: r.p,
+        q: r.q,
+      );
+      deco = d.valid ? _focusDecoForLeaf(d.leafRect, d.path, r.o, r.p, r.q) : null;
+    }
+    _selDecoCache[k] = deco;
+    return deco;
+  }
+
+  _IslandDeco? _generatedDecoForDisplay() {
+    final int k = _displayStageIndex;
+    final EncodedPoint? pt = (k >= 1 && k < _points.length) ? _points[k] : null;
+    if (pt == null) return null;
+    if (_genDecoCache.containsKey(k)) return _genDecoCache[k];
+    final StageReservoirs? r = (k < _reservoirs.length) ? _reservoirs[k] : null;
+    final _IslandDeco? deco =
+        (r == null) ? null : _focusDecoAt(pt.reRaw, pt.imRaw, r.o, r.p, r.q);
+    _genDecoCache[k] = deco;
+    return deco;
+  }
+
   CanvasOverlays overlaysForDisplayStage() {
     final EncodedPoint? pt = _displayStageIndex < _points.length
         ? _points[_displayStageIndex]
         : null;
-    final ({double re, double im})? mark = selectedMarkAt(_displayStageIndex);
+    // The generated point is marked by a fixed-size white cross placed on its
+    // canonical island (falling back to the leaf centre if the island couldn't
+    // be resolved), so the marker is always visible and the island grows into
+    // view around it on deep zoom.
+    final ({double re, double im})? crossAt = pt == null
+        ? null
+        : (_genDeco != null
+            ? (
+                re: (_genDeco!.reMin + _genDeco!.reMax) / 2.0,
+                im: (_genDeco!.imMin + _genDeco!.imMax) / 2.0,
+              )
+            : (re: fixedToDouble(pt.reRaw), im: fixedToDouble(pt.imRaw)));
     return CanvasOverlays(
-      points: <PointMarker>[
-        if (pt != null)
-          PointMarker(
-            re: fixedToDouble(pt.reRaw),
-            im: fixedToDouble(pt.imRaw),
-            colour: const Color(0xFFFFFFFF),
-            radiusPx: 6,
+      crosshairs: false,
+      // Enumerated (E) islands plus the generated and selected leaves' islands.
+      islands: <CanvasIsland>[
+        ..._islandHighlights,
+        if (_genDeco != null) _genDeco!.cells,
+        if (_selDeco != null) _selDeco!.cells,
+      ],
+      // The generated and selected leaves each framed by a white rectangle.
+      frames: <SelectionFrame>[
+        if (_genDeco != null)
+          SelectionFrame(
+            reMin: _genDeco!.reMin,
+            reMax: _genDeco!.reMax,
+            imMin: _genDeco!.imMin,
+            imMax: _genDeco!.imMax,
           ),
-        if (mark != null)
-          PointMarker(
-            re: mark.re,
-            im: mark.im,
-            colour: const Color(0xFF00E676),
-            radiusPx: 7,
+        if (_selDeco != null)
+          SelectionFrame(
+            reMin: _selDeco!.reMin,
+            reMax: _selDeco!.reMax,
+            imMin: _selDeco!.imMin,
+            imMax: _selDeco!.imMax,
           ),
       ],
-      // No crosshairs: a centre cross adds nothing here and reads as a stray
-      // marker over the fractal.
-      crosshairs: false,
+      // The generated point's cross.
+      crosses: <CrossMarker>[
+        if (crossAt != null) CrossMarker(re: crossAt.re, im: crossAt.im),
+      ],
     );
   }
 
@@ -687,6 +917,8 @@ class SetupController extends ChangeNotifier {
     _profile = profile;
     try {
       _entropyBits = bits;
+      _selDecoCache.clear();
+      _genDecoCache.clear();
       _points = List<EncodedPoint?>.filled(pointStages + 1, null);
       _reservoirs = List<StageReservoirs?>.filled(pointStages + 1, null);
       _stageRecords = List<StageRecord?>.filled(pointStages + 1, null);
@@ -822,6 +1054,7 @@ class SetupController extends ChangeNotifier {
     );
     _points[k] = pts.first;
     _leafRects[k] = pts.first.leafRect;
+    _genDecoCache.remove(k);
     // Record this stage's export contribution: its params and the centre of
     // the encoded point's leaf rectangle (DESIGN.md §"Master-Secret Export").
     final ({int re, int im}) leaf =
@@ -834,6 +1067,9 @@ class SetupController extends ChangeNotifier {
       leafImRaw: leaf.im,
     );
     Entropy.wipe(chunk);
+    // Refresh the displayed stage's cross/island now that its point exists, so
+    // the marker appears immediately (not only after the next navigation).
+    _refreshFocusDecos();
     notifyListeners();
     return true;
   }
@@ -1076,6 +1312,8 @@ class SetupController extends ChangeNotifier {
     _stageCount = pointStages + 1; // Stage-0 text + one per point stage
     _chainText = _core.canonicalizeSaltPepper(text);
     _iterations = argon2Iterations;
+    _selDecoCache.clear();
+    _genDecoCache.clear();
     _points = List<EncodedPoint?>.filled(_stageCount, null);
     _reservoirs = List<StageReservoirs?>.filled(_stageCount, null);
     _stageRecords = List<StageRecord?>.filled(_stageCount, null);
@@ -1213,6 +1451,13 @@ class SetupController extends ChangeNotifier {
       leafImRaw: leaf.im,
     );
 
+    // The selected leaf's decoration (always framed), reusing this decode.
+    _selDecoCache[k] = _focusDecoForLeaf(result.leafRect, result.path, r.o, r.p, r.q);
+    _refreshFocusDecos();
+    debugPrint('select: stage=$k marked; '
+        'selDeco=${_selDeco == null ? "NULL" : (_selDeco!.cells.pointsReIm.isEmpty ? "leaf-frame (no island cells)" : "island-frame (${_selDeco!.cells.pointsReIm.length ~/ 2} cells)")}; '
+        'displayStage=$_displayStageIndex');
+
     // Any later fractals were derived from this stage's previous point; they are
     // now invalid. Discard them so the chain stays consistent.
     if (discardsDownstream) _discardAfter(k);
@@ -1250,6 +1495,8 @@ class SetupController extends ChangeNotifier {
     );
     // The encoded point now defines this stage; drop any recall-style selection.
     _selectedMarks[k] = null;
+    _selDecoCache.remove(k);
+    _genDecoCache.remove(k);
     final List<int>? oldSel = _selectedChunks[k];
     if (oldSel != null) {
       Entropy.wipe(oldSel);
@@ -1862,6 +2109,8 @@ class SetupController extends ChangeNotifier {
       leafReRaw: leaf.re,
       leafImRaw: leaf.im,
     );
+    _genDecoCache.remove(k);
+    _refreshFocusDecos();
     Entropy.wipe(chunk);
     notifyListeners();
   }
@@ -2182,12 +2431,15 @@ class SetupController extends ChangeNotifier {
   void _applyReservoirs(int index, StageReservoirs? res) {
     _displayStageIndex = index;
     _core.source.reservoirs = res;
+    _core.leafSource.reservoirs = res;
+    _clearIslandHighlights();
     if (res == null) {
       _displayParams = null;
     } else {
       final ({double o, double p, double q}) key = res.displayKey;
       _displayParams = StageParameters(o: key.o, p: key.p, q: key.q);
     }
+    _refreshFocusDecos();
   }
 
   /// Clear the displayed stage's selected point (mark, chunk and export record).
@@ -2199,6 +2451,8 @@ class SetupController extends ChangeNotifier {
     if (old != null) Entropy.wipe(old);
     _selectedChunks[k] = null;
     _stageRecords[k] = null;
+    _selDecoCache.remove(k);
+    _refreshFocusDecos();
     notifyListeners();
   }
 
@@ -2253,12 +2507,15 @@ class SetupController extends ChangeNotifier {
     final StageReservoirs? res =
         index == 0 || index >= _reservoirs.length ? null : _reservoirs[index];
     _core.source.reservoirs = res;
+    _core.leafSource.reservoirs = res;
+    _clearIslandHighlights();
     if (res == null) {
       _displayParams = null;
     } else {
       final ({double o, double p, double q}) key = res.displayKey;
       _displayParams = StageParameters(o: key.o, p: key.p, q: key.q);
     }
+    _refreshFocusDecos();
   }
 
   /// Finish Setup and wipe all session secrets. Call when leaving the flow
@@ -2307,6 +2564,13 @@ class SetupController extends ChangeNotifier {
     _generationError = null;
     _core.source.reservoirs?.clear();
     _core.source.reservoirs = null;
+    // leafSource holds the same reservoirs reference (cleared above); drop it.
+    _core.leafSource.reservoirs = null;
+    _clearIslandHighlights();
+    _selDecoCache.clear();
+    _genDecoCache.clear();
+    _selDeco = null;
+    _genDeco = null;
     _clearRecall();
   }
 
@@ -2352,4 +2616,23 @@ class _ExpandPlan {
   final _ExpandMode mode;
   final int target;
   final int firstNew;
+}
+
+/// A computed canonical-island decoration for the displayed stage: the island's
+/// flat-white [cells] plus its bounding box (fractal coordinates) for framing
+/// (the selected leaf) or centring a cross (the generated point).
+class _IslandDeco {
+  _IslandDeco({
+    required this.cells,
+    required this.reMin,
+    required this.reMax,
+    required this.imMin,
+    required this.imMax,
+  });
+
+  final CanvasIsland cells;
+  final double reMin;
+  final double reMax;
+  final double imMin;
+  final double imMax;
 }

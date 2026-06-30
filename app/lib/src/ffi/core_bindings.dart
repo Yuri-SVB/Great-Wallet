@@ -47,6 +47,52 @@ class GreatWallCoreBindings {
     );
     _decodeFull =
         _lib.lookupFunction<_DecodeFullC, _DecodeFullDart>('bs_decode_full');
+    _leafAreasCompute =
+        _lib.lookupFunction<_LeafAreasComputeC, _LeafAreasComputeDart>(
+      'bs_leaf_areas_compute',
+    );
+    _leafAreasStatus =
+        _lib.lookupFunction<_LeafAreasStatusC, _LeafAreasStatusDart>(
+      'bs_leaf_areas_status',
+    );
+    _leafAreasCount =
+        _lib.lookupFunction<_LeafAreasCountC, _LeafAreasCountDart>(
+      'bs_leaf_areas_count',
+    );
+    _leafAreasRect =
+        _lib.lookupFunction<_LeafAreasRectC, _LeafAreasRectDart>(
+      'bs_leaf_areas_rect',
+    );
+    _leafAreasPath =
+        _lib.lookupFunction<_LeafAreasPathC, _LeafAreasPathDart>(
+      'bs_leaf_areas_path',
+    );
+    _leafAreasFree =
+        _lib.lookupFunction<_LeafAreasFreeC, _LeafAreasFreeDart>(
+      'bs_leaf_areas_free',
+    );
+    _canonicalIslandCompute =
+        _lib.lookupFunction<_CanonicalIslandComputeC, _CanonicalIslandComputeDart>(
+      'bs_canonical_island_compute',
+    );
+    _canonicalIslandFound =
+        _lib.lookupFunction<_CanonicalIslandFoundC, _CanonicalIslandFoundDart>(
+      'bs_canonical_island_found',
+    );
+    _canonicalIslandMeta =
+        _lib.lookupFunction<_CanonicalIslandMetaC, _CanonicalIslandMetaDart>(
+      'bs_canonical_island_meta',
+    );
+    _canonicalIslandNumPoints = _lib.lookupFunction<_CanonicalIslandNumPointsC,
+        _CanonicalIslandNumPointsDart>('bs_canonical_island_num_points');
+    _canonicalIslandPoints =
+        _lib.lookupFunction<_CanonicalIslandPointsC, _CanonicalIslandPointsDart>(
+      'bs_canonical_island_points',
+    );
+    _canonicalIslandFree =
+        _lib.lookupFunction<_CanonicalIslandFreeC, _CanonicalIslandFreeDart>(
+      'bs_canonical_island_free',
+    );
     _argon2Single =
         _lib.lookupFunction<_Argon2SingleC, _Argon2SingleDart>('bs_argon2_single');
     _argon2idMaster =
@@ -96,6 +142,18 @@ class GreatWallCoreBindings {
   late final _EncodeResultFinalRectDart _encodeResultFinalRect;
   late final _EncodeResultFreeDart _encodeResultFree;
   late final _DecodeFullDart _decodeFull;
+  late final _LeafAreasComputeDart _leafAreasCompute;
+  late final _LeafAreasStatusDart _leafAreasStatus;
+  late final _LeafAreasCountDart _leafAreasCount;
+  late final _LeafAreasRectDart _leafAreasRect;
+  late final _LeafAreasPathDart _leafAreasPath;
+  late final _LeafAreasFreeDart _leafAreasFree;
+  late final _CanonicalIslandComputeDart _canonicalIslandCompute;
+  late final _CanonicalIslandFoundDart _canonicalIslandFound;
+  late final _CanonicalIslandMetaDart _canonicalIslandMeta;
+  late final _CanonicalIslandNumPointsDart _canonicalIslandNumPoints;
+  late final _CanonicalIslandPointsDart _canonicalIslandPoints;
+  late final _CanonicalIslandFreeDart _canonicalIslandFree;
   late final _Argon2SingleDart _argon2Single;
   late final _Argon2idMasterDart _argon2idMaster;
   late final _SaltPepperCanonicalizeDart _saltPepperCanonicalize;
@@ -340,10 +398,16 @@ class GreatWallCoreBindings {
         imMin: outRect[2],
         imMax: outRect[3],
       );
+      // The bisection path — the leaf's canonical identity, needed to resolve
+      // its canonical island. (Coercion-relevant, like the bits: never logged.)
+      final int plen = outPathLen.value;
+      final int take = plen < pathBufLen ? plen : pathBufLen - 1;
+      final String path = String.fromCharCodes(outPath.asTypedList(take));
       return CoreDecodeResult(
         bits: bits,
         leafRect: rect,
         valid: outValid.value != 0,
+        path: path,
       );
     } finally {
       _zeroAndFree(outBits, numBits);
@@ -353,6 +417,187 @@ class GreatWallCoreBindings {
         ..free(outValid)
         ..free(outPath)
         ..free(outPathLen);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Viewport leaf-area enumeration
+  // -------------------------------------------------------------------------
+
+  /// Enumerate the distinct canonical leaf areas present in a view
+  /// (`bs_leaf_areas_*`). The view is described as for [renderViewport]: pixel
+  /// `(col, row)` samples `(originRe + col*step, originIm + col*step)`; the scan
+  /// steps by [scanStep] pixels. `(o, p, q)` must select the same fractal the
+  /// points were encoded on (`(0,0,0)` for the canonical stage, the stage's
+  /// reservoirs otherwise) — leaf membership is meaningless on any other surface.
+  ///
+  /// Returns either the (capped) list of leaf areas — each a leaf rectangle in
+  /// raw I4F60 bounds plus its bisection path (canonical identity) — or a
+  /// "too many" result when more than [maxLeaves] distinct areas are present.
+  /// The opaque handle is queried and freed internally.
+  CoreLeafAreasResult enumerateLeafAreas({
+    required double originRe,
+    required double originIm,
+    required double step,
+    required int width,
+    required int height,
+    required int scanStep,
+    required int maxLeaves,
+    required int maxDecodes,
+    required FixedRect area,
+    required CoreDiscoveryParams params,
+    required int numBits,
+    required int o,
+    required int p,
+    required int q,
+    String pathPrefix = 'O',
+  }) {
+    final (Pointer<Uint8> ppPtr, int ppLen) = _allocAscii(pathPrefix);
+    // A leaf path is the prefix plus one direction letter per bisection level.
+    final int pathBufLen = pathPrefix.length + numBits + 2;
+    final Pointer<Int64> outRect = calloc<Int64>(4);
+    final Pointer<Uint8> outPath = calloc<Uint8>(pathBufLen);
+    try {
+      final Pointer<Void> handle = _leafAreasCompute(
+        originRe,
+        originIm,
+        step,
+        width,
+        height,
+        scanStep,
+        maxLeaves,
+        maxDecodes,
+        area.reMin,
+        area.reMax,
+        area.imMin,
+        area.imMax,
+        params.maxIter,
+        params.targetGood,
+        params.maxFloodPoints,
+        params.minGridCells,
+        params.pMaxShift,
+        params.exclusionThresholdNum,
+        params.rngSeed,
+        numBits,
+        o,
+        p,
+        q,
+        ppPtr,
+        ppLen,
+      );
+      if (handle == nullptr) {
+        throw StateError('bs_leaf_areas_compute returned NULL handle');
+      }
+      try {
+        // status: 0 = list available; 1 = too many leaves; 2 = decode budget
+        // hit (zoom-out). Both non-zero outcomes mean "zoom in".
+        if (_leafAreasStatus(handle) != 0) {
+          return CoreLeafAreasResult.tooMany(maxLeaves);
+        }
+        final int count = _leafAreasCount(handle);
+        final List<CoreLeafArea> leaves = <CoreLeafArea>[];
+        for (int i = 0; i < count; i++) {
+          _leafAreasRect(handle, i, outRect);
+          final FixedRect rect = FixedRect(
+            reMin: outRect[0],
+            reMax: outRect[1],
+            imMin: outRect[2],
+            imMax: outRect[3],
+          );
+          final int len = _leafAreasPath(handle, i, outPath, pathBufLen);
+          final int take = len < pathBufLen ? len : pathBufLen - 1;
+          final String path = String.fromCharCodes(outPath.asTypedList(take));
+          leaves.add(CoreLeafArea(rect: rect, path: path));
+        }
+        return CoreLeafAreasResult.leaves(leaves);
+      } finally {
+        _leafAreasFree(handle);
+      }
+    } finally {
+      if (ppPtr != nullptr) calloc.free(ppPtr);
+      // The path bytes are directional bits; wipe them before freeing.
+      _zeroAndFree(outPath, pathBufLen);
+      calloc.free(outRect);
+    }
+  }
+
+  /// Select a leaf area's canonical island (`bs_canonical_island_*`) and return
+  /// its shape: the flood points (raw I4F60, interleaved `[re, im]`) plus the
+  /// cell size `pixelDeltaRaw`, bbox, escape count and pixel count. [path] is
+  /// the leaf's bisection path; `(o, p, q)` must select the same fractal the
+  /// leaf was decoded on. [params] is a visualisation choice (resolution / flood
+  /// cap), independent of the encoder's. Returns null if no island is found.
+  CoreCanonicalIsland? canonicalIsland({
+    required FixedRect leafRect,
+    required CoreDiscoveryParams params,
+    required int o,
+    required int p,
+    required int q,
+    required String path,
+  }) {
+    final (Pointer<Uint8> ppPtr, int ppLen) = _allocAscii(path);
+    final Pointer<Uint32> outEscape = calloc<Uint32>();
+    final Pointer<Uint64> outPixelCount = calloc<Uint64>();
+    final Pointer<Int64> outPixelDelta = calloc<Int64>();
+    final Pointer<Int64> outBbox = calloc<Int64>(4);
+    try {
+      final Pointer<Void> handle = _canonicalIslandCompute(
+        leafRect.reMin,
+        leafRect.reMax,
+        leafRect.imMin,
+        leafRect.imMax,
+        params.maxIter,
+        params.targetGood,
+        params.maxFloodPoints,
+        params.minGridCells,
+        params.pMaxShift,
+        params.exclusionThresholdNum,
+        params.rngSeed,
+        o,
+        p,
+        q,
+        ppPtr,
+        ppLen,
+      );
+      if (handle == nullptr) {
+        throw StateError('bs_canonical_island_compute returned NULL handle');
+      }
+      try {
+        if (_canonicalIslandFound(handle) == 0) return null;
+        _canonicalIslandMeta(
+          handle, outEscape, outPixelCount, outPixelDelta, outBbox);
+        final int n = _canonicalIslandNumPoints(handle);
+        // 2 Fixed per point; guard the zero case so calloc gets a valid size.
+        final Pointer<Int64> outPts = calloc<Int64>(n == 0 ? 1 : n * 2);
+        try {
+          final int written = _canonicalIslandPoints(handle, outPts, n);
+          final List<int> pointsRaw =
+              List<int>.from(outPts.asTypedList(written * 2));
+          return CoreCanonicalIsland(
+            escapeCount: outEscape.value,
+            pixelCount: outPixelCount.value,
+            pixelDeltaRaw: outPixelDelta.value,
+            bbox: FixedRect(
+              reMin: outBbox[0],
+              reMax: outBbox[1],
+              imMin: outBbox[2],
+              imMax: outBbox[3],
+            ),
+            pointsRaw: pointsRaw,
+          );
+        } finally {
+          calloc.free(outPts);
+        }
+      } finally {
+        _canonicalIslandFree(handle);
+      }
+    } finally {
+      if (ppPtr != nullptr) calloc.free(ppPtr);
+      calloc
+        ..free(outEscape)
+        ..free(outPixelCount)
+        ..free(outPixelDelta)
+        ..free(outBbox);
     }
   }
 
@@ -609,11 +854,65 @@ class CoreDecodeResult {
     required this.bits,
     required this.leafRect,
     required this.valid,
+    required this.path,
   });
 
   final List<int> bits;
   final FixedRect leafRect;
   final bool valid;
+
+  /// The bisection path — the leaf area's canonical identity, used to resolve
+  /// its canonical island. Empty when not requested. Never logged.
+  final String path;
+}
+
+/// One leaf area from [GreatWallCoreBindings.enumerateLeafAreas]: the leaf
+/// rectangle in raw I4F60 bounds, plus its bisection [path] — the canonical
+/// identity, stable across frames and zoom levels.
+class CoreLeafArea {
+  const CoreLeafArea({required this.rect, required this.path});
+
+  final FixedRect rect;
+  final String path;
+}
+
+/// Result of [GreatWallCoreBindings.enumerateLeafAreas]: either the (capped)
+/// list of distinct leaf areas present, or [tooMany] meaning more than
+/// [maxLeaves] are present and the UX should prompt the user to zoom in.
+class CoreLeafAreasResult {
+  const CoreLeafAreasResult.leaves(this.leaves)
+      : tooMany = false,
+        maxLeaves = 0;
+
+  const CoreLeafAreasResult.tooMany(this.maxLeaves)
+      : leaves = const <CoreLeafArea>[],
+        tooMany = true;
+
+  final List<CoreLeafArea> leaves;
+  final bool tooMany;
+  final int maxLeaves;
+}
+
+/// A leaf area's canonical island from [GreatWallCoreBindings.canonicalIsland]:
+/// the island's flood points as interleaved raw I4F60 `[re, im]` cell centres,
+/// plus the cell size [pixelDeltaRaw] (raw Fixed), bbox, escape count and pixel
+/// count. The union of `pixelDeltaRaw`-sized cells at the points is its shape.
+class CoreCanonicalIsland {
+  const CoreCanonicalIsland({
+    required this.escapeCount,
+    required this.pixelCount,
+    required this.pixelDeltaRaw,
+    required this.bbox,
+    required this.pointsRaw,
+  });
+
+  final int escapeCount;
+  final int pixelCount;
+  final int pixelDeltaRaw;
+  final FixedRect bbox;
+
+  /// Interleaved `[re0, im0, re1, im1, ...]` cell centres as raw I4F60 `i64`.
+  final List<int> pointsRaw;
 }
 
 // ---------------------------------------------------------------------------
@@ -682,6 +981,66 @@ typedef _DecodeFullDart = void Function(
   Pointer<Uint8>, int,
   Pointer<Uint8>, Pointer<Int64>, Pointer<Uint8>,
   Pointer<Uint8>, int, Pointer<Uint32>);
+
+typedef _LeafAreasComputeC = Pointer<Void> Function(
+  Double, Double, Double, Uint32, Uint32, Uint32, Uint32, Uint32,
+  Int64, Int64, Int64, Int64,
+  Uint32, Uint32, Uint64, Uint64, Uint32, Uint32,
+  Uint64, Uint32, Uint64, Uint64, Uint64,
+  Pointer<Uint8>, Uint32);
+typedef _LeafAreasComputeDart = Pointer<Void> Function(
+  double, double, double, int, int, int, int, int,
+  int, int, int, int,
+  int, int, int, int, int, int,
+  int, int, int, int, int,
+  Pointer<Uint8>, int);
+
+typedef _LeafAreasStatusC = Int32 Function(Pointer<Void>);
+typedef _LeafAreasStatusDart = int Function(Pointer<Void>);
+
+typedef _LeafAreasCountC = Uint32 Function(Pointer<Void>);
+typedef _LeafAreasCountDart = int Function(Pointer<Void>);
+
+typedef _LeafAreasRectC = Void Function(Pointer<Void>, Uint32, Pointer<Int64>);
+typedef _LeafAreasRectDart = void Function(Pointer<Void>, int, Pointer<Int64>);
+
+typedef _LeafAreasPathC = Uint32 Function(
+  Pointer<Void>, Uint32, Pointer<Uint8>, Uint32);
+typedef _LeafAreasPathDart = int Function(
+  Pointer<Void>, int, Pointer<Uint8>, int);
+
+typedef _LeafAreasFreeC = Void Function(Pointer<Void>);
+typedef _LeafAreasFreeDart = void Function(Pointer<Void>);
+
+typedef _CanonicalIslandComputeC = Pointer<Void> Function(
+  Int64, Int64, Int64, Int64,
+  Uint32, Uint32, Uint64, Uint64, Uint32, Uint32,
+  Uint64, Uint64, Uint64, Uint64,
+  Pointer<Uint8>, Uint32);
+typedef _CanonicalIslandComputeDart = Pointer<Void> Function(
+  int, int, int, int,
+  int, int, int, int, int, int,
+  int, int, int, int,
+  Pointer<Uint8>, int);
+
+typedef _CanonicalIslandFoundC = Int32 Function(Pointer<Void>);
+typedef _CanonicalIslandFoundDart = int Function(Pointer<Void>);
+
+typedef _CanonicalIslandMetaC = Void Function(
+  Pointer<Void>, Pointer<Uint32>, Pointer<Uint64>, Pointer<Int64>, Pointer<Int64>);
+typedef _CanonicalIslandMetaDart = void Function(
+  Pointer<Void>, Pointer<Uint32>, Pointer<Uint64>, Pointer<Int64>, Pointer<Int64>);
+
+typedef _CanonicalIslandNumPointsC = Uint32 Function(Pointer<Void>);
+typedef _CanonicalIslandNumPointsDart = int Function(Pointer<Void>);
+
+typedef _CanonicalIslandPointsC = Uint32 Function(
+  Pointer<Void>, Pointer<Int64>, Uint32);
+typedef _CanonicalIslandPointsDart = int Function(
+  Pointer<Void>, Pointer<Int64>, int);
+
+typedef _CanonicalIslandFreeC = Void Function(Pointer<Void>);
+typedef _CanonicalIslandFreeDart = void Function(Pointer<Void>);
 
 typedef _Argon2SingleC = Void Function(
   Pointer<Uint8>, Uint32, Uint8, Pointer<Uint8>);

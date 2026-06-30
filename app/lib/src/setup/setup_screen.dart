@@ -751,6 +751,16 @@ class _SetupScreenState extends State<SetupScreen> {
       _truncate();
       return KeyEventResult.handled;
     }
+    // E — enumerate the canonical leaf areas under the current view and
+    // highlight each one's canonical island (flat white). Heavy one-shot
+    // (memoized decode grid + per-leaf discovery); no-op while a derivation is
+    // busy.
+    if (event.logicalKey == LogicalKeyboardKey.keyE) {
+      if (!_busy) {
+        unawaited(_enumerateIslands());
+      }
+      return KeyEventResult.handled;
+    }
     // C — focus the colour wheel (then ← → cycle hues).
     if (event.logicalKey == LogicalKeyboardKey.keyC) {
       _focusField(_hueFocus, 'colour wheel');
@@ -1125,6 +1135,26 @@ class _SetupScreenState extends State<SetupScreen> {
     );
   }
 
+  /// Run the `E` canonical-leaf-area enumeration: a start cue, then a result
+  /// cue + toast/console log. See [SetupController.enumerateCanonicalIslands].
+  Future<void> _enumerateIslands() async {
+    _sounds.play(UiSound.focus);
+    final LeafScanOutcome r =
+        await _setup.enumerateCanonicalIslands(_viewport.viewport);
+    if (!mounted) return;
+    switch (r) {
+      case LeafScanOutcome.shown:
+        _sounds.play(UiSound.confirm);
+        _toast('Highlighted ${_setup.islandCount} canonical island(s).');
+      case LeafScanOutcome.tooMany:
+        _sounds.play(UiSound.warn);
+        _toast('Too many / too dense to enumerate here — zoom in.');
+      case LeafScanOutcome.empty:
+        _sounds.play(UiSound.denyMiss);
+        _toast('No canonical islands in view — zoom in.');
+    }
+  }
+
   Future<void> _onCanvasSelect(FractalSelection sel) async {
     // Editing the displayed stage's point (the R edit): the click sets the new
     // point and the tail (if any) was already confirmed when arming the mode.
@@ -1272,6 +1302,7 @@ class _SetupScreenState extends State<SetupScreen> {
     'Enter  start (Generate / Encode / Begin recall) from a field',
     'K  copy the master secret ("the key")    H  halt derivation (keeps progress)',
     'X  exclude this stage & above (shorten the setup)',
+    'E  highlight canonical islands in view (white) · zoom in if too many',
     'Vault: F file path · W write/save · O open file · T blank templates',
     'In Write: Q QR · Alt+Q copy · press again to switch 128/256-bit · I scan QR to reuse key · Alt+I own key',
     'In Open: Q scan QR · Alt+Q type key (32 or 64 hex) · Esc cancel',
@@ -1805,6 +1836,15 @@ class _SetupScreenState extends State<SetupScreen> {
         Text(
           _setup.errorMessage!,
           style: const TextStyle(color: Colors.redAccent),
+        ),
+      ],
+      // Leaf-area / island enumeration feedback (the `E` action): "too many",
+      // "no islands", or nothing while islands are shown.
+      if (_setup.islandStatus != null) ...<Widget>[
+        const SizedBox(height: 12),
+        Text(
+          _setup.islandStatus!,
+          style: const TextStyle(color: Colors.white70),
         ),
       ],
     ];
@@ -2357,8 +2397,8 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   /// Open (load) a saved setup from the file path (O): scan the QR (Q) or type
-  /// the 32-hex key (Alt+Q focuses the field, Enter loads), Esc to cancel. The
-  /// key is never displayed.
+  /// the 32- or 64-hex key (Alt+Q focuses the field, Enter loads), Esc to
+  /// cancel. The key is never displayed.
   Future<void> _openSetup() async {
     final String path = _vaultPath.text.trim();
     if (path.isEmpty) {
@@ -2413,9 +2453,9 @@ class _SetupScreenState extends State<SetupScreen> {
                     Text(
                       canScan
                           ? 'Q — scan the QR with the camera.  Alt+Q — type the '
-                              '32-hex key instead.  Esc — cancel.'
-                          : 'Alt+Q — type the 32-hex key (live scanning needs a '
-                              'camera this platform does not expose).  '
+                              '32- or 64-hex key instead.  Esc — cancel.'
+                          : 'Alt+Q — type the 32- or 64-hex key (live scanning '
+                              'needs a camera this platform does not expose).  '
                               'Esc — cancel.',
                       style: const TextStyle(fontSize: 12),
                     ),
@@ -2430,7 +2470,7 @@ class _SetupScreenState extends State<SetupScreen> {
                       decoration: const InputDecoration(
                         isDense: true,
                         border: OutlineInputBorder(),
-                        labelText: 'Key — 32 hex digits',
+                        labelText: 'Key — 32 or 64 hex digits',
                         hintText: 'paste from your manager, then Enter',
                       ),
                     ),
