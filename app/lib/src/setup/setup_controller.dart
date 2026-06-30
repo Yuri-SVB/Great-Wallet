@@ -547,6 +547,97 @@ class SetupController extends ChangeNotifier {
   /// The point markers to overlay for the currently displayed stage: the single
   /// location the user must learn to recognise (white), plus the point selected
   /// on this stage in select mode (green).
+  // -- Canonical-island highlights (the `E` action) -------------------------
+
+  List<CanvasIsland> _islandHighlights = const <CanvasIsland>[];
+  String? _islandStatus;
+
+  /// Transient status for the leaf-area / island enumeration ("too many leaf
+  /// areas", "no islands"), or null when islands are shown or nothing was run.
+  String? get islandStatus => _islandStatus;
+
+  /// Enumerate the canonical leaf areas under [viewport] and highlight each
+  /// one's canonical island (flat white). Aborts with a "zoom in" status when
+  /// there are too many leaf areas. Triggered by the Setup screen's `E` action.
+  ///
+  /// Heavy: the enumeration decodes a grid of sample points and runs a fresh
+  /// discovery per leaf, all through blocking FFI on the UI isolate. It is a
+  /// one-shot on key-press (not per frame); moving it off the UI isolate is a
+  /// follow-up if the freeze on a busy view becomes noticeable.
+  Future<void> enumerateCanonicalIslands(FractalViewport viewport) async {
+    final LeafAreasResult res = await _core.leafSource.leafAreas(
+      LeafAreasRequest(
+        viewport: viewport,
+        stage: displayStage,
+        stageParameters: _displayParams,
+        numBits: EncodingConstants.bitsPerPoint,
+      ),
+    );
+    if (res.tooMany) {
+      _islandHighlights = const <CanvasIsland>[];
+      _islandStatus = 'Too many leaf areas in view (> ${res.maxLeaves}) — zoom in.';
+      notifyListeners();
+      return;
+    }
+
+    // (o, p, q): the canonical stage decodes on (0,0,0), a chain stage on its
+    // reservoirs — the same surface the leaf was decoded on.
+    final StageReservoirs? r =
+        _displayStageIndex == 0 || _displayStageIndex >= _reservoirs.length
+            ? null
+            : _reservoirs[_displayStageIndex];
+    final int o = r?.o ?? 0;
+    final int p = r?.p ?? 0;
+    final int q = r?.q ?? 0;
+
+    // Visualisation discovery params: the engine's encode params with a larger
+    // flood cap so an island resolves into a shape rather than a speck.
+    final CoreDiscoveryParams base = _core.encodeParams;
+    final CoreDiscoveryParams vizParams = CoreDiscoveryParams(
+      maxIter: base.maxIter,
+      targetGood: base.targetGood,
+      maxFloodPoints: EncodingConstants.canonicalIslandMaxFloodPoints,
+      minGridCells: base.minGridCells,
+      pMaxShift: base.pMaxShift,
+      exclusionThresholdNum: base.exclusionThresholdNum,
+      rngSeed: base.rngSeed,
+    );
+
+    final List<CanvasIsland> islands = <CanvasIsland>[];
+    for (final LeafArea leaf in res.leaves) {
+      final CoreCanonicalIsland? island = _core.bindings.canonicalIsland(
+        leafRect:
+            FixedRect.fromDoubles(leaf.reMin, leaf.reMax, leaf.imMin, leaf.imMax),
+        params: vizParams,
+        o: o,
+        p: p,
+        q: q,
+        path: leaf.path,
+      );
+      if (island == null || island.pointsRaw.isEmpty) continue;
+      final List<double> pts =
+          List<double>.filled(island.pointsRaw.length, 0);
+      for (int i = 0; i < island.pointsRaw.length; i++) {
+        pts[i] = fixedToDouble(island.pointsRaw[i]);
+      }
+      islands.add(CanvasIsland(
+        cellSize: fixedToDouble(island.pixelDeltaRaw),
+        pointsReIm: pts,
+      ));
+    }
+
+    _islandHighlights = islands;
+    _islandStatus = islands.isEmpty ? 'No islands found in view.' : null;
+    notifyListeners();
+  }
+
+  /// Clear any canonical-island highlights and status (e.g. on stage change or
+  /// session teardown).
+  void _clearIslandHighlights() {
+    _islandHighlights = const <CanvasIsland>[];
+    _islandStatus = null;
+  }
+
   CanvasOverlays overlaysForDisplayStage() {
     final EncodedPoint? pt = _displayStageIndex < _points.length
         ? _points[_displayStageIndex]
@@ -572,6 +663,7 @@ class SetupController extends ChangeNotifier {
       // No crosshairs: a centre cross adds nothing here and reads as a stray
       // marker over the fractal.
       crosshairs: false,
+      islands: _islandHighlights,
     );
   }
 
@@ -2183,6 +2275,7 @@ class SetupController extends ChangeNotifier {
     _displayStageIndex = index;
     _core.source.reservoirs = res;
     _core.leafSource.reservoirs = res;
+    _clearIslandHighlights();
     if (res == null) {
       _displayParams = null;
     } else {
@@ -2255,6 +2348,7 @@ class SetupController extends ChangeNotifier {
         index == 0 || index >= _reservoirs.length ? null : _reservoirs[index];
     _core.source.reservoirs = res;
     _core.leafSource.reservoirs = res;
+    _clearIslandHighlights();
     if (res == null) {
       _displayParams = null;
     } else {
@@ -2311,6 +2405,7 @@ class SetupController extends ChangeNotifier {
     _core.source.reservoirs = null;
     // leafSource holds the same reservoirs reference (cleared above); drop it.
     _core.leafSource.reservoirs = null;
+    _clearIslandHighlights();
     _clearRecall();
   }
 

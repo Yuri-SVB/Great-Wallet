@@ -50,4 +50,12 @@ class EncodingConstants {
   /// count in `1..SetupController.maxPointStages` (every value is a valid setup),
   /// rather than a fixed mini/default/large preset.
   static int nStagesFor(int entropyBits) => entropyBits ~/ bitsPerPoint;
+
+  /// Flood-fill cap for resolving a leaf's **canonical island shape** (the `E`
+  /// highlight). The engine's encode flood cap is deliberately tiny, so a leaf's
+  /// largest island reads as a few-pixel speck; this larger cap lets the island
+  /// resolve into a real shape. It is a pure visualisation knob — it never
+  /// touches the encoded bits (only `o,p,q` and the leaf rect do) — so it lives
+  /// app-side rather than in the engine's encode params.
+  static const int canonicalIslandMaxFloodPoints = 50000;
 }
