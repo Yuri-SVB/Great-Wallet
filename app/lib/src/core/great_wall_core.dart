@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import '../ffi/core_bindings.dart';
 import '../ffi/library_loader.dart';
 import 'core_escape_count_source.dart';
+import 'core_leaf_area_source.dart';
 import 'encoding_constants.dart';
 import 'stage_params.dart';
 
@@ -39,6 +40,11 @@ class GreatWallCore {
 
   /// The production [EscapeCountSource] handed to great-wall-ux's FractalCanvas.
   final CoreEscapeCountSource source;
+
+  /// The production [LeafAreaSource] — enumerates the canonical leaf areas in a
+  /// view. Its `reservoirs` are kept in sync with [source] by the orchestrator
+  /// so both decode/render on the same fractal as the displayed stage.
+  late final CoreLeafAreaSource leafSource = CoreLeafAreaSource(bindings);
 
   /// Canonical encode/decode parameters, fetched once from the engine — the
   /// single source of truth for the values that determine encode output. The
