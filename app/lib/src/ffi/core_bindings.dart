@@ -398,10 +398,16 @@ class GreatWallCoreBindings {
         imMin: outRect[2],
         imMax: outRect[3],
       );
+      // The bisection path — the leaf's canonical identity, needed to resolve
+      // its canonical island. (Coercion-relevant, like the bits: never logged.)
+      final int plen = outPathLen.value;
+      final int take = plen < pathBufLen ? plen : pathBufLen - 1;
+      final String path = String.fromCharCodes(outPath.asTypedList(take));
       return CoreDecodeResult(
         bits: bits,
         leafRect: rect,
         valid: outValid.value != 0,
+        path: path,
       );
     } finally {
       _zeroAndFree(outBits, numBits);
@@ -848,11 +854,16 @@ class CoreDecodeResult {
     required this.bits,
     required this.leafRect,
     required this.valid,
+    required this.path,
   });
 
   final List<int> bits;
   final FixedRect leafRect;
   final bool valid;
+
+  /// The bisection path — the leaf area's canonical identity, used to resolve
+  /// its canonical island. Empty when not requested. Never logged.
+  final String path;
 }
 
 /// One leaf area from [GreatWallCoreBindings.enumerateLeafAreas]: the leaf
