@@ -1936,6 +1936,7 @@ class _SetupScreenState extends State<SetupScreen> {
         sounds: _sounds,
         profile: _profile,
         profileLabel: _profileLabels[profileIdx],
+        initialStages: _pointStages,
       ),
     );
     if (!mounted || n == null) return;
@@ -4160,13 +4161,18 @@ const List<({String label, Duration target})> _kCalibTargets =
   (label: '~1 day', target: Duration(days: 1)),
   (label: '~1 week', target: Duration(days: 7)),
 ];
+/// Whether a calibration target time means one **inter-stage** derivation or
+/// the **whole setup** (all stages). All-stages divides the target by the stage
+/// count to get the per-stage time the iteration count N must hit.
+enum _CalibScope { perStage, allStages }
 
 /// The spacious Argon2 calibration dialog (opened by Alt+D / the panel button).
 ///
-/// Benchmarks Argon2 on this device at [profile], solves the iteration count N
-/// for a chosen target wall-clock, and returns N via [Navigator.pop] on Apply.
-/// Exit is Esc (or Cancel/✕) **with confirmation** — a benchmark result is
-/// discarded unless Applied. "Time is a perishable label on a durable
+/// Flow: benchmark this device **once** at [profile] (seconds per derivation
+/// step), then pick a target time, a scope (one stage vs all stages) and the
+/// stage count; N recomputes arithmetically from the single benchmark — no
+/// re-benchmark when those change. Apply returns N via [Navigator.pop]. Exit is
+/// Esc / Cancel / ✕ with confirmation. "Time is a perishable label on a durable
 /// parameter": N is exact and reproducible; only the absolute delay drifts.
 class _CalibrationDialog extends StatefulWidget {
   const _CalibrationDialog({
@@ -4174,21 +4180,80 @@ class _CalibrationDialog extends StatefulWidget {
     required this.sounds,
     required this.profile,
     required this.profileLabel,
+    required this.initialStages,
   });
 
   final GreatWallCore core;
   final SoundBoard sounds;
   final Argon2Profile profile;
   final String profileLabel;
+  final int initialStages;
 
   @override
   State<_CalibrationDialog> createState() => _CalibrationDialogState();
 }
 
 class _CalibrationDialogState extends State<_CalibrationDialog> {
-  bool _calibrating = false;
-  String? _result;
+  bool _benching = false;
+  String? _benchError;
+  // Single on-device measurement; target/scope/stages all derive N from this.
+  double? _secPerPass;
+
+  Duration? _target;
+  _CalibScope _scope = _CalibScope.perStage;
+  late int _stages;
   int? _computedN;
+
+  @override
+  void initState() {
+    super.initState();
+    _stages = widget.initialStages.clamp(1, SetupController.maxPointStages);
+  }
+
+  /// Recompute N from the single benchmark + the current target / scope / stages.
+  /// N is per stage; "all stages" splits the target across the stages so the
+  /// whole setup ≈ target.
+  void _recompute() {
+    final double? s = _secPerPass;
+    final Duration? t = _target;
+    if (s == null || t == null) {
+      _computedN = null;
+      return;
+    }
+    final double perStageSeconds = _scope == _CalibScope.allStages
+        ? t.inSeconds / _stages
+        : t.inSeconds.toDouble();
+    _computedN = (perStageSeconds / s).ceil().clamp(1, 1 << 30);
+  }
+
+  Future<void> _bench() async {
+    setState(() {
+      _benching = true;
+      _benchError = null;
+    });
+    widget.sounds.play(UiSound.focus);
+    try {
+      final double s = await widget.core.benchArgon2(profile: widget.profile);
+      if (!mounted) return;
+      setState(() {
+        _secPerPass = s;
+        _recompute();
+      });
+      widget.sounds.play(UiSound.confirm);
+      debugPrint('calibrate: profile=${widget.profile} secPerStep=$s');
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _secPerPass = null;
+        _computedN = null;
+        _benchError = 'Benchmark failed (${e.runtimeType}) — the chosen memory '
+            'profile may not fit on this device.';
+      });
+      widget.sounds.play(UiSound.warn);
+    } finally {
+      if (mounted) setState(() => _benching = false);
+    }
+  }
 
   Future<bool> _confirmClose() async {
     final bool? ok = await showDialog<bool>(
@@ -4211,45 +4276,23 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
   }
 
   Future<void> _attemptClose() async {
-    if (_calibrating) return; // never bail mid-benchmark
+    if (_benching) return; // never bail mid-benchmark
     if (await _confirmClose() && mounted) Navigator.of(context).pop();
   }
 
-  Future<void> _runCalibration(Duration target, String label) async {
-    setState(() {
-      _calibrating = true;
-      _result = null;
-      _computedN = null;
-    });
-    widget.sounds.play(UiSound.focus);
-    try {
-      final double secPerPass =
-          await widget.core.benchArgon2(profile: widget.profile);
-      if (!mounted) return;
-      final int n = (target.inSeconds / secPerPass).ceil().clamp(1, 1 << 30);
-      setState(() {
-        _computedN = n;
-        _result =
-            '≈ ${secPerPass.toStringAsFixed(secPerPass < 10 ? 2 : 1)} s/step  '
-            '→  N = $n      (target $label · ${widget.profileLabel})';
-      });
-      widget.sounds.play(UiSound.confirm);
-      debugPrint('calibrate: profile=${widget.profile} secPerStep=$secPerPass '
-          'N=$n target=${target.inSeconds}s');
-    } catch (e) {
-      if (!mounted) return;
-      setState(() => _result =
-          'Calibration failed (${e.runtimeType}) — the chosen memory profile '
-          'may not fit on this device.');
-      widget.sounds.play(UiSound.warn);
-    } finally {
-      if (mounted) setState(() => _calibrating = false);
-    }
+  String _fmtDuration(double seconds) {
+    if (seconds < 90) return '${seconds.toStringAsFixed(0)} s';
+    if (seconds < 5400) return '${(seconds / 60).toStringAsFixed(1)} min';
+    if (seconds < 172800) return '${(seconds / 3600).toStringAsFixed(1)} h';
+    return '${(seconds / 86400).toStringAsFixed(1)} d';
   }
 
   @override
   Widget build(BuildContext context) {
     final ThemeData theme = Theme.of(context);
+    final double? s = _secPerPass;
+    final int? n = _computedN;
+
     // Override the dialog route's default Escape→pop so Esc asks first.
     return Actions(
       actions: <Type, Action<Intent>>{
@@ -4265,80 +4308,164 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
         child: Dialog(
           child: ConstrainedBox(
             constraints: const BoxConstraints(maxWidth: 560),
-            child: Padding(
-              padding: const EdgeInsets.all(24),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: <Widget>[
-                  Row(
-                    children: <Widget>[
-                      Expanded(
-                        child: Text('Calibrate Argon2 derivation time',
-                            style: theme.textTheme.titleLarge),
-                      ),
-                      IconButton(
-                        tooltip: 'Close (Esc)',
-                        onPressed: _calibrating ? null : _attemptClose,
-                        icon: const Icon(Icons.close),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 8),
-                  Text('Memory profile: ${widget.profileLabel}',
-                      style: theme.textTheme.bodyMedium),
-                  Text('Set the memory profile in the panel before calibrating.',
-                      style: theme.textTheme.bodySmall),
-                  const SizedBox(height: 20),
-                  Text('Target derivation time', style: theme.textTheme.labelLarge),
-                  const SizedBox(height: 8),
-                  Wrap(
-                    spacing: 10,
-                    runSpacing: 8,
-                    children: <Widget>[
-                      for (final ({String label, Duration target}) t
-                          in _kCalibTargets)
-                        OutlinedButton(
-                          onPressed: _calibrating
-                              ? null
-                              : () => _runCalibration(t.target, t.label),
-                          child: Text(t.label),
-                        ),
-                    ],
-                  ),
-                  const SizedBox(height: 20),
-                  if (_calibrating)
+            child: SingleChildScrollView(
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
                     Row(
-                      children: const <Widget>[
-                        SizedBox(
-                            width: 16,
-                            height: 16,
-                            child: CircularProgressIndicator(strokeWidth: 2)),
-                        SizedBox(width: 10),
+                      children: <Widget>[
                         Expanded(
-                            child: Text('Benchmarking Argon2 on this device…')),
+                          child: Text('Calibrate Argon2 derivation time',
+                              style: theme.textTheme.titleLarge),
+                        ),
+                        IconButton(
+                          tooltip: 'Close (Esc)',
+                          onPressed: _benching ? null : _attemptClose,
+                          icon: const Icon(Icons.close),
+                        ),
                       ],
-                    )
-                  else if (_result != null)
-                    Text(_result!, style: theme.textTheme.bodyMedium),
-                  const SizedBox(height: 24),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.end,
-                    children: <Widget>[
-                      TextButton(
-                        onPressed: _calibrating ? null : _attemptClose,
-                        child: const Text('Cancel'),
+                    ),
+                    const SizedBox(height: 12),
+
+                    // 1 — benchmark this device (once).
+                    Text('1 · Benchmark this device',
+                        style: theme.textTheme.labelLarge),
+                    const SizedBox(height: 6),
+                    Row(
+                      children: <Widget>[
+                        OutlinedButton.icon(
+                          onPressed: _benching ? null : _bench,
+                          icon: _benching
+                              ? const SizedBox(
+                                  width: 16,
+                                  height: 16,
+                                  child:
+                                      CircularProgressIndicator(strokeWidth: 2))
+                              : const Icon(Icons.speed, size: 18),
+                          label: Text(_benching
+                              ? 'Benchmarking…'
+                              : (s == null ? 'Run benchmark' : 'Re-run')),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Text(
+                            _benchError ??
+                                (s == null
+                                    ? 'Profile: ${widget.profileLabel}'
+                                    : '≈ ${s.toStringAsFixed(s < 10 ? 2 : 1)} s/step  ·  ${widget.profileLabel}'),
+                            style: theme.textTheme.bodySmall,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 20),
+
+                    // 2 — target time.
+                    Text('2 · Target time', style: theme.textTheme.labelLarge),
+                    const SizedBox(height: 6),
+                    Wrap(
+                      spacing: 10,
+                      runSpacing: 8,
+                      children: <Widget>[
+                        for (final ({String label, Duration target}) t
+                            in _kCalibTargets)
+                          ChoiceChip(
+                            label: Text(t.label),
+                            selected: _target == t.target,
+                            onSelected: (_) => setState(() {
+                              _target = t.target;
+                              widget.sounds.play(UiSound.tickSoft);
+                              _recompute();
+                            }),
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 20),
+
+                    // 3 — scope + stage count (disambiguates per-stage vs total).
+                    Text('3 · Target applies to',
+                        style: theme.textTheme.labelLarge),
+                    const SizedBox(height: 6),
+                    SegmentedButton<_CalibScope>(
+                      segments: const <ButtonSegment<_CalibScope>>[
+                        ButtonSegment<_CalibScope>(
+                            value: _CalibScope.perStage,
+                            label: Text('One stage')),
+                        ButtonSegment<_CalibScope>(
+                            value: _CalibScope.allStages,
+                            label: Text('All stages')),
+                      ],
+                      selected: <_CalibScope>{_scope},
+                      onSelectionChanged: (Set<_CalibScope> sel) => setState(() {
+                        _scope = sel.first;
+                        widget.sounds.play(UiSound.tickSoft);
+                        _recompute();
+                      }),
+                    ),
+                    const SizedBox(height: 10),
+                    Row(
+                      children: <Widget>[
+                        Text('Stages: ', style: theme.textTheme.bodyMedium),
+                        IconButton(
+                          onPressed: _stages > 1
+                              ? () => setState(() {
+                                    _stages--;
+                                    _recompute();
+                                  })
+                              : null,
+                          icon: const Icon(Icons.remove_circle_outline),
+                        ),
+                        Text('$_stages', style: theme.textTheme.titleMedium),
+                        IconButton(
+                          onPressed: _stages < SetupController.maxPointStages
+                              ? () => setState(() {
+                                    _stages++;
+                                    _recompute();
+                                  })
+                              : null,
+                          icon: const Icon(Icons.add_circle_outline),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 20),
+
+                    // Result.
+                    if (n != null && s != null)
+                      Text(
+                        'N = $n   ·   one stage ≈ ${_fmtDuration(n * s)}   ·   '
+                        'all $_stages ≈ ${_fmtDuration(n * s * _stages)}',
+                        style: theme.textTheme.bodyMedium,
+                      )
+                    else
+                      Text(
+                        s == null
+                            ? 'Run the benchmark, then pick a target.'
+                            : 'Pick a target time.',
+                        style: theme.textTheme.bodySmall,
                       ),
-                      const SizedBox(width: 8),
-                      FilledButton(
-                        onPressed: (_calibrating || _computedN == null)
-                            ? null
-                            : () => Navigator.of(context).pop(_computedN),
-                        child: const Text('Apply'),
-                      ),
-                    ],
-                  ),
-                ],
+                    const SizedBox(height: 24),
+
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.end,
+                      children: <Widget>[
+                        TextButton(
+                          onPressed: _benching ? null : _attemptClose,
+                          child: const Text('Cancel'),
+                        ),
+                        const SizedBox(width: 8),
+                        FilledButton(
+                          onPressed: (n == null)
+                              ? null
+                              : () => Navigator.of(context).pop(n),
+                          child: const Text('Apply N'),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
               ),
             ),
           ),
