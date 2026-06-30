@@ -298,35 +298,51 @@ class GreatWallCore {
     return completer.future;
   }
 
-  /// Micro-benchmark one Argon2 pass at [profile] on this device, in a worker
-  /// isolate (heavy, blocking), returning the measured **seconds per pass** (one
-  /// pass == one derivation step / GUI iteration). Setup calibration divides the
-  /// user's chosen target wall-clock by this to solve for the iteration count N.
-  ///
-  /// One untimed warm-up pass faults in the profile's memory first; [passes]
-  /// timed passes are then averaged. Throws if the profile can't be allocated on
-  /// this device (e.g. the 32/128 GiB tiers on a phone).
-  Future<double> benchArgon2({
+  /// Start a **cancellable** on-device Argon2 micro-benchmark at [profile] in a
+  /// worker isolate (heavy, blocking), returning an [Argon2BenchJob] whose
+  /// `result` is the measured **seconds per pass** (one pass == one derivation
+  /// step). One untimed warm-up pass faults in the profile's memory; [passes]
+  /// timed passes are then averaged. `cancel()` kills the isolate and fails
+  /// `result` with [Argon2Cancelled]. `result` errors with [StateError] if the
+  /// profile can't be allocated (e.g. the 32/128 GiB tiers on a phone).
+  Future<Argon2BenchJob> startBenchArgon2({
     Argon2Profile profile = Argon2Profile.basic,
     int passes = 2,
   }) async {
     final ReceivePort port = ReceivePort();
     final Completer<double> completer = Completer<double>();
-    await Isolate.spawn<(SendPort, int, int)>(
+    final Isolate isolate = await Isolate.spawn<(SendPort, int, int)>(
       _argon2BenchIsolateEntry,
       (port.sendPort, profile.value, passes < 1 ? 1 : passes),
       onError: port.sendPort,
       errorsAreFatal: true,
     );
+    void cleanup() => port.close();
     port.listen((dynamic msg) {
       if (msg is double) {
         if (!completer.isCompleted) completer.complete(msg);
       } else if (!completer.isCompleted) {
         completer.completeError(StateError('Argon2 calibration failed'));
       }
-      port.close();
+      cleanup();
     });
-    return completer.future;
+    void cancel() {
+      if (completer.isCompleted) return;
+      isolate.kill(priority: Isolate.immediate);
+      cleanup();
+      completer.completeError(const Argon2Cancelled());
+    }
+    return Argon2BenchJob(completer.future, cancel);
+  }
+
+  /// Convenience wrapper: run a benchmark and await its result (not cancellable).
+  Future<double> benchArgon2({
+    Argon2Profile profile = Argon2Profile.basic,
+    int passes = 2,
+  }) async {
+    final Argon2BenchJob job =
+        await startBenchArgon2(profile: profile, passes: passes);
+    return job.result;
   }
 }
 
@@ -396,6 +412,18 @@ class Argon2Job {
   Argon2Job(this.result, this._cancel);
 
   final Future<StageReservoirs> result;
+  final void Function() _cancel;
+
+  void cancel() => _cancel();
+}
+
+/// A running calibration benchmark: its [result] (seconds per pass) and a
+/// [cancel] that kills the worker isolate and fails [result] with
+/// [Argon2Cancelled].
+class Argon2BenchJob {
+  Argon2BenchJob(this.result, this._cancel);
+
+  final Future<double> result;
   final void Function() _cancel;
 
   void cancel() => _cancel();

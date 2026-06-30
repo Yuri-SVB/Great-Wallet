@@ -4198,6 +4198,7 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
   String? _benchError;
   // Single on-device measurement; target/scope/stages all derive N from this.
   double? _secPerPass;
+  Argon2BenchJob? _benchJob; // live benchmark, so it can be cancelled
 
   Duration? _target;
   _CalibScope _scope = _CalibScope.perStage;
@@ -4233,7 +4234,8 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
     });
     widget.sounds.play(UiSound.focus);
     try {
-      final double s = await widget.core.benchArgon2(profile: widget.profile);
+      _benchJob = await widget.core.startBenchArgon2(profile: widget.profile);
+      final double s = await _benchJob!.result;
       if (!mounted) return;
       setState(() {
         _secPerPass = s;
@@ -4241,6 +4243,14 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
       });
       widget.sounds.play(UiSound.confirm);
       debugPrint('calibrate: profile=${widget.profile} secPerStep=$s');
+    } on Argon2Cancelled {
+      if (!mounted) return;
+      setState(() {
+        _secPerPass = null;
+        _computedN = null;
+        _benchError = 'Benchmark cancelled.';
+      });
+      widget.sounds.play(UiSound.undo);
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -4251,9 +4261,13 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
       });
       widget.sounds.play(UiSound.warn);
     } finally {
+      _benchJob = null;
       if (mounted) setState(() => _benching = false);
     }
   }
+
+  /// Stop an in-progress benchmark (kills the worker isolate).
+  void _cancelBench() => _benchJob?.cancel();
 
   Future<bool> _confirmClose() async {
     final bool? ok = await showDialog<bool>(
@@ -4275,8 +4289,13 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
     return ok ?? false;
   }
 
+  /// Esc / Cancel / ✕: while a benchmark runs this stops it (stay in the
+  /// dialog); otherwise it closes the dialog after confirming.
   Future<void> _attemptClose() async {
-    if (_benching) return; // never bail mid-benchmark
+    if (_benching) {
+      _cancelBench();
+      return;
+    }
     if (await _confirmClose() && mounted) Navigator.of(context).pop();
   }
 
@@ -4322,8 +4341,8 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
                               style: theme.textTheme.titleLarge),
                         ),
                         IconButton(
-                          tooltip: 'Close (Esc)',
-                          onPressed: _benching ? null : _attemptClose,
+                          tooltip: _benching ? 'Stop (Esc)' : 'Close (Esc)',
+                          onPressed: _attemptClose,
                           icon: const Icon(Icons.close),
                         ),
                       ],
@@ -4336,26 +4355,33 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
                     const SizedBox(height: 6),
                     Row(
                       children: <Widget>[
+                        // Run ↔ Stop: a benchmark in progress is cancellable
+                        // (kills the worker isolate).
                         OutlinedButton.icon(
-                          onPressed: _benching ? null : _bench,
-                          icon: _benching
-                              ? const SizedBox(
-                                  width: 16,
-                                  height: 16,
-                                  child:
-                                      CircularProgressIndicator(strokeWidth: 2))
-                              : const Icon(Icons.speed, size: 18),
+                          onPressed: _benching ? _cancelBench : _bench,
+                          icon: Icon(_benching ? Icons.stop : Icons.speed,
+                              size: 18),
                           label: Text(_benching
-                              ? 'Benchmarking…'
+                              ? 'Stop'
                               : (s == null ? 'Run benchmark' : 'Re-run')),
                         ),
                         const SizedBox(width: 12),
+                        if (_benching) ...<Widget>[
+                          const SizedBox(
+                              width: 16,
+                              height: 16,
+                              child:
+                                  CircularProgressIndicator(strokeWidth: 2)),
+                          const SizedBox(width: 8),
+                        ],
                         Expanded(
                           child: Text(
-                            _benchError ??
-                                (s == null
-                                    ? 'Profile: ${widget.profileLabel}'
-                                    : '≈ ${s.toStringAsFixed(s < 10 ? 2 : 1)} s/step  ·  ${widget.profileLabel}'),
+                            _benching
+                                ? 'Benchmarking… (Stop to cancel)'
+                                : (_benchError ??
+                                    (s == null
+                                        ? 'Profile: ${widget.profileLabel}'
+                                        : '≈ ${s.toStringAsFixed(s < 10 ? 2 : 1)} s/step  ·  ${widget.profileLabel}')),
                             style: theme.textTheme.bodySmall,
                           ),
                         ),
@@ -4452,12 +4478,12 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
                       mainAxisAlignment: MainAxisAlignment.end,
                       children: <Widget>[
                         TextButton(
-                          onPressed: _benching ? null : _attemptClose,
-                          child: const Text('Cancel'),
+                          onPressed: _attemptClose,
+                          child: Text(_benching ? 'Stop' : 'Cancel'),
                         ),
                         const SizedBox(width: 8),
                         FilledButton(
-                          onPressed: (n == null)
+                          onPressed: (_benching || n == null)
                               ? null
                               : () => Navigator.of(context).pop(n),
                           child: const Text('Apply N'),
