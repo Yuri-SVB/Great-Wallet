@@ -297,6 +297,54 @@ class GreatWallCore {
     });
     return completer.future;
   }
+
+  /// Micro-benchmark one Argon2 pass at [profile] on this device, in a worker
+  /// isolate (heavy, blocking), returning the measured **seconds per pass** (one
+  /// pass == one derivation step / GUI iteration). Setup calibration divides the
+  /// user's chosen target wall-clock by this to solve for the iteration count N.
+  ///
+  /// One untimed warm-up pass faults in the profile's memory first; [passes]
+  /// timed passes are then averaged. Throws if the profile can't be allocated on
+  /// this device (e.g. the 32/128 GiB tiers on a phone).
+  Future<double> benchArgon2({
+    Argon2Profile profile = Argon2Profile.basic,
+    int passes = 2,
+  }) async {
+    final ReceivePort port = ReceivePort();
+    final Completer<double> completer = Completer<double>();
+    await Isolate.spawn<(SendPort, int, int)>(
+      _argon2BenchIsolateEntry,
+      (port.sendPort, profile.value, passes < 1 ? 1 : passes),
+      onError: port.sendPort,
+      errorsAreFatal: true,
+    );
+    port.listen((dynamic msg) {
+      if (msg is double) {
+        if (!completer.isCompleted) completer.complete(msg);
+      } else if (!completer.isCompleted) {
+        completer.completeError(StateError('Argon2 calibration failed'));
+      }
+      port.close();
+    });
+    return completer.future;
+  }
+}
+
+/// Worker-isolate entry: open the engine and time [passes] Argon2 passes at the
+/// given profile (after one untimed warm-up pass), returning seconds per pass.
+void _argon2BenchIsolateEntry((SendPort, int, int) args) {
+  final (SendPort send, int profileValue, int passes) = args;
+  final Argon2Profile profile = Argon2Profile.values[profileValue];
+  final GreatWallCoreBindings bindings = GreatWallCoreBindings.open();
+  final Uint8List input = Uint8List(8);
+  // Warm-up (fault in the profile's pages) — not timed.
+  bindings.argon2Single(input, profile);
+  final Stopwatch sw = Stopwatch()..start();
+  for (int i = 0; i < passes; i++) {
+    bindings.argon2Single(input, profile);
+  }
+  sw.stop();
+  send.send(sw.elapsedMicroseconds / 1e6 / passes);
 }
 
 /// Worker-isolate entry: open the engine, run the single Argon2id master pass

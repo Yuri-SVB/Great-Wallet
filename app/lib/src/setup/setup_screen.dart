@@ -149,6 +149,12 @@ class _SetupScreenState extends State<SetupScreen> {
     return n != null && n >= 0;
   }
 
+  /// On-device Argon2 calibration state: while a micro-benchmark runs, and the
+  /// last result line ("≈ X s/step → N = Y"). The calibrator fills
+  /// [_iterationsField]; the raw field stays editable as the advanced override.
+  bool _calibrating = false;
+  String? _calibResult;
+
   /// Number of fractal **point stages** for a fresh/recall setup, chosen on a
   /// discrete slider with nine positions, 0..[SetupController.maxPointStages].
   /// 0 is a Stage-0-text-only setup (no fractal points); each higher position
@@ -1810,6 +1816,8 @@ class _SetupScreenState extends State<SetupScreen> {
       const SizedBox(height: 16),
       _argon2ProfileSlider(),
       const SizedBox(height: 16),
+      _calibrationInput(),
+      const SizedBox(height: 16),
       ..._iterationsInput(),
       const SizedBox(height: 16),
       if (_source == _SourceMode.recall)
@@ -1911,6 +1919,103 @@ class _SetupScreenState extends State<SetupScreen> {
   /// time a given N takes drifts with hardware; N itself is exact and
   /// reproducible — see docs §"time is a perishable label on a durable
   /// parameter".)
+  /// Setup-calibration targets: a human duration label paired with the
+  /// wall-clock the derivation should take (grounded in THREAT_MODEL.md —
+  /// hours defeat robbery/flash-kidnap, ~a week defeats the flashiest wrench
+  /// attacks). "Time is a perishable label on a durable parameter": these set N,
+  /// which is exact and reproducible; only the absolute delay drifts with
+  /// hardware.
+  static const List<({String label, Duration target})> _calibTargets =
+      <({String label, Duration target})>[
+    (label: '~1 hour', target: Duration(hours: 1)),
+    (label: '~6 hours', target: Duration(hours: 6)),
+    (label: '~1 day', target: Duration(days: 1)),
+    (label: '~1 week', target: Duration(days: 7)),
+  ];
+
+  /// Pick a target time → micro-benchmark Argon2 on this device at the chosen
+  /// memory profile → fill the derivation-steps field with the N that hits it.
+  Widget _calibrationInput() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Text('Calibrate steps to a target time (this device)',
+            style: Theme.of(context).textTheme.labelMedium),
+        const SizedBox(height: 6),
+        Wrap(
+          spacing: 8,
+          runSpacing: 4,
+          children: <Widget>[
+            for (final ({String label, Duration target}) t in _calibTargets)
+              OutlinedButton(
+                onPressed: (_busy || _calibrating)
+                    ? null
+                    : () => _calibrate(t.target, t.label),
+                child: Text(t.label),
+              ),
+          ],
+        ),
+        if (_calibrating)
+          const Padding(
+            padding: EdgeInsets.only(top: 8),
+            child: Row(
+              children: <Widget>[
+                SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: CircularProgressIndicator(strokeWidth: 2)),
+                SizedBox(width: 8),
+                Expanded(child: Text('Benchmarking Argon2 on this device…')),
+              ],
+            ),
+          ),
+        if (_calibResult != null && !_calibrating)
+          Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: Text(_calibResult!,
+                style: Theme.of(context).textTheme.bodySmall),
+          ),
+      ],
+    );
+  }
+
+  /// Benchmark one Argon2 pass at the current profile, solve N for [target], and
+  /// write it into the steps field. Heavy and off the UI isolate; pick the
+  /// memory profile first (calibrating a profile the device can't allocate
+  /// fails cleanly).
+  Future<void> _calibrate(Duration target, String label) async {
+    setState(() {
+      _calibrating = true;
+      _calibResult = null;
+    });
+    _sounds.play(UiSound.focus);
+    try {
+      final double secPerPass = await widget.core.benchArgon2(profile: _profile);
+      if (!mounted) return;
+      final int n = (target.inSeconds / secPerPass).ceil().clamp(1, 1 << 30);
+      final int profileIdx =
+          _profiles.indexOf(_profile).clamp(0, _profiles.length - 1);
+      setState(() {
+        _iterations = n;
+        _iterationsField.text = n.toString();
+        _calibResult =
+            '≈ ${secPerPass.toStringAsFixed(secPerPass < 10 ? 2 : 1)} s/step '
+            '→ N = $n   (target $label · ${_profileLabels[profileIdx]})';
+      });
+      _sounds.play(UiSound.confirm);
+      debugPrint('calibrate: profile=$_profile secPerStep=$secPerPass '
+          'N=$n target=${target.inSeconds}s');
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _calibResult =
+          'Calibration failed (${e.runtimeType}) — the chosen memory profile '
+          'may not fit on this device.');
+      _sounds.play(UiSound.warn);
+    } finally {
+      if (mounted) setState(() => _calibrating = false);
+    }
+  }
+
   List<Widget> _iterationsInput() {
     final String raw = _iterationsField.text.trim();
     final bool invalid = raw.isNotEmpty && !_iterationsValid;
@@ -1987,7 +2092,12 @@ class _SetupScreenState extends State<SetupScreen> {
                       final Argon2Profile next = _profiles[v.round()];
                       if (next == _profile) return;
                       _sounds.play(UiSound.tickSoft);
-                      setState(() => _profile = next);
+                      // A calibration result is for the old profile — drop it so
+                      // a stale "N for Basic" can't be read as "N for Advanced".
+                      setState(() {
+                        _profile = next;
+                        _calibResult = null;
+                      });
                     },
             ),
           ),
