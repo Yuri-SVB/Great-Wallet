@@ -1156,8 +1156,6 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   Future<void> _onCanvasSelect(FractalSelection sel) async {
-    debugPrint('onCanvasSelect: editPointMode=$_editPointMode '
-        'selectMode=$_selectMode (frame is only drawn via the select path)');
     // Editing the displayed stage's point (the R edit): the click sets the new
     // point and the tail (if any) was already confirmed when arming the mode.
     if (_editPointMode) {

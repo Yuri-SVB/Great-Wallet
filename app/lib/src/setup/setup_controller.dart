@@ -693,19 +693,11 @@ class SetupController extends ChangeNotifier {
     );
   }
 
-  /// Decode the leaf at (reRaw, imRaw) on stage k's fractal and build its island
-  /// decoration (used when navigating to a stage whose selection isn't cached).
-  _IslandDeco? _islandDecoAt(int reRaw, int imRaw, int o, int p, int q) {
-    final CoreDecodeResult d =
-        _core.decodePoint(reRaw: reRaw, imRaw: imRaw, o: o, p: p, q: q);
-    if (!d.valid) return null;
-    return _islandDecoForLeaf(d.leafRect, d.path, o, p, q);
-  }
-
-  /// The decoration for a *selected* leaf — always framed. Frames the canonical
-  /// island (with its cells) when it resolves; otherwise frames the whole leaf
-  /// rectangle (no cells), so a selection is never invisible.
-  _IslandDeco _selDecoForLeaf(FixedRect leafRect, String path, int o, int p, int q) {
+  /// The decoration for a focus leaf (the generated point or a selection) —
+  /// always framed. Frames the canonical island (with its cells) when it
+  /// resolves; otherwise frames the whole leaf rectangle (no cells), so the
+  /// focus point is never unmarked.
+  _IslandDeco _focusDecoForLeaf(FixedRect leafRect, String path, int o, int p, int q) {
     final _IslandDeco? isl = _islandDecoForLeaf(leafRect, path, o, p, q);
     if (isl != null) return isl;
     return _IslandDeco(
@@ -715,6 +707,15 @@ class SetupController extends ChangeNotifier {
       imMin: fixedToDouble(leafRect.imMin),
       imMax: fixedToDouble(leafRect.imMax),
     );
+  }
+
+  /// Decode the leaf at (reRaw, imRaw) on stage k's fractal and build its
+  /// (always-framed) decoration, or null if the point doesn't decode.
+  _IslandDeco? _focusDecoAt(int reRaw, int imRaw, int o, int p, int q) {
+    final CoreDecodeResult d =
+        _core.decodePoint(reRaw: reRaw, imRaw: imRaw, o: o, p: p, q: q);
+    if (!d.valid) return null;
+    return _focusDecoForLeaf(d.leafRect, d.path, o, p, q);
   }
 
   /// Recompute the displayed stage's focus decorations (cached per stage).
@@ -738,7 +739,7 @@ class SetupController extends ChangeNotifier {
         p: r.p,
         q: r.q,
       );
-      deco = d.valid ? _selDecoForLeaf(d.leafRect, d.path, r.o, r.p, r.q) : null;
+      deco = d.valid ? _focusDecoForLeaf(d.leafRect, d.path, r.o, r.p, r.q) : null;
     }
     _selDecoCache[k] = deco;
     return deco;
@@ -751,7 +752,7 @@ class SetupController extends ChangeNotifier {
     if (_genDecoCache.containsKey(k)) return _genDecoCache[k];
     final StageReservoirs? r = (k < _reservoirs.length) ? _reservoirs[k] : null;
     final _IslandDeco? deco =
-        (r == null) ? null : _islandDecoAt(pt.reRaw, pt.imRaw, r.o, r.p, r.q);
+        (r == null) ? null : _focusDecoAt(pt.reRaw, pt.imRaw, r.o, r.p, r.q);
     _genDecoCache[k] = deco;
     return deco;
   }
@@ -780,8 +781,15 @@ class SetupController extends ChangeNotifier {
         if (_genDeco != null) _genDeco!.cells,
         if (_selDeco != null) _selDeco!.cells,
       ],
-      // The selected leaf framed by a white rectangle.
+      // The generated and selected leaves each framed by a white rectangle.
       frames: <SelectionFrame>[
+        if (_genDeco != null)
+          SelectionFrame(
+            reMin: _genDeco!.reMin,
+            reMax: _genDeco!.reMax,
+            imMin: _genDeco!.imMin,
+            imMax: _genDeco!.imMax,
+          ),
         if (_selDeco != null)
           SelectionFrame(
             reMin: _selDeco!.reMin,
@@ -1444,7 +1452,7 @@ class SetupController extends ChangeNotifier {
     );
 
     // The selected leaf's decoration (always framed), reusing this decode.
-    _selDecoCache[k] = _selDecoForLeaf(result.leafRect, result.path, r.o, r.p, r.q);
+    _selDecoCache[k] = _focusDecoForLeaf(result.leafRect, result.path, r.o, r.p, r.q);
     _refreshFocusDecos();
     debugPrint('select: stage=$k marked; '
         'selDeco=${_selDeco == null ? "NULL" : (_selDeco!.cells.pointsReIm.isEmpty ? "leaf-frame (no island cells)" : "island-frame (${_selDeco!.cells.pointsReIm.length ~/ 2} cells)")}; '
