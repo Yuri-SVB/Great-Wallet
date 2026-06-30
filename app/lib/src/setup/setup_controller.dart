@@ -1036,6 +1036,9 @@ class SetupController extends ChangeNotifier {
       leafImRaw: leaf.im,
     );
     Entropy.wipe(chunk);
+    // Refresh the displayed stage's cross/island now that its point exists, so
+    // the marker appears immediately (not only after the next navigation).
+    _refreshFocusDecos();
     notifyListeners();
     return true;
   }
