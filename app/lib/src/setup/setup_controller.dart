@@ -2182,6 +2182,7 @@ class SetupController extends ChangeNotifier {
   void _applyReservoirs(int index, StageReservoirs? res) {
     _displayStageIndex = index;
     _core.source.reservoirs = res;
+    _core.leafSource.reservoirs = res;
     if (res == null) {
       _displayParams = null;
     } else {
@@ -2253,6 +2254,7 @@ class SetupController extends ChangeNotifier {
     final StageReservoirs? res =
         index == 0 || index >= _reservoirs.length ? null : _reservoirs[index];
     _core.source.reservoirs = res;
+    _core.leafSource.reservoirs = res;
     if (res == null) {
       _displayParams = null;
     } else {
@@ -2307,6 +2309,8 @@ class SetupController extends ChangeNotifier {
     _generationError = null;
     _core.source.reservoirs?.clear();
     _core.source.reservoirs = null;
+    // leafSource holds the same reservoirs reference (cleared above); drop it.
+    _core.leafSource.reservoirs = null;
     _clearRecall();
   }
 
