@@ -4211,9 +4211,12 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
   double _margin = 2.0;
   int _passes = 3;
 
-  // Determinate progress over (1 warm-up + _passes) benchmark passes.
+  // Determinate progress over (1 warm-up + _passes) benchmark passes, with a
+  // wall-clock ETA projected from the passes completed so far.
   int _progressDone = 0;
   int _progressTotal = 0;
+  final Stopwatch _benchClock = Stopwatch();
+  double? _etaSeconds;
 
   @override
   void initState() {
@@ -4238,11 +4241,15 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
   }
 
   Future<void> _bench() async {
+    _benchClock
+      ..reset()
+      ..start();
     setState(() {
       _benching = true;
       _benchError = null;
       _progressDone = 0;
       _progressTotal = 1 + _passes;
+      _etaSeconds = null;
     });
     widget.sounds.play(UiSound.focus);
     try {
@@ -4250,12 +4257,15 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
         profile: widget.profile,
         passes: _passes,
         onProgress: (int done, int total) {
-          if (mounted) {
-            setState(() {
-              _progressDone = done;
-              _progressTotal = total;
-            });
-          }
+          if (!mounted) return;
+          // Project remaining time from the passes done so far (the warm-up is
+          // included, so the ETA is mildly conservative — fine).
+          final double elapsed = _benchClock.elapsedMicroseconds / 1e6;
+          setState(() {
+            _progressDone = done;
+            _progressTotal = total;
+            _etaSeconds = done > 0 ? (total - done) * (elapsed / done) : null;
+          });
         },
       );
       final double s = await _benchJob!.result;
@@ -4284,6 +4294,7 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
       });
       widget.sounds.play(UiSound.warn);
     } finally {
+      _benchClock.stop();
       _benchJob = null;
       if (mounted) setState(() => _benching = false);
     }
@@ -4333,10 +4344,14 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
       ? _margin.toStringAsFixed(0)
       : _margin.toStringAsFixed(1);
 
-  /// Determinate-progress label: warm-up, then "Measuring k / passes…".
+  /// Determinate-progress label: warm-up, then "Measuring k / passes…", with a
+  /// projected "~X left" ETA once the first pass has completed.
   String _progressLabel() {
-    if (_progressDone <= 0) return 'Warming up…';
-    return 'Measuring ${_progressDone.clamp(1, _passes)} / $_passes…';
+    final String eta = _etaSeconds != null
+        ? '   ·   ~${_fmtDuration(_etaSeconds!)} left'
+        : '';
+    if (_progressDone <= 0) return 'Warming up…$eta';
+    return 'Measuring ${_progressDone.clamp(1, _passes)} / $_passes…$eta';
   }
 
   @override
