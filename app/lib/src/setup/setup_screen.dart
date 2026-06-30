@@ -149,12 +149,6 @@ class _SetupScreenState extends State<SetupScreen> {
     return n != null && n >= 0;
   }
 
-  /// On-device Argon2 calibration state: while a micro-benchmark runs, and the
-  /// last result line ("≈ X s/step → N = Y"). The calibrator fills
-  /// [_iterationsField]; the raw field stays editable as the advanced override.
-  bool _calibrating = false;
-  String? _calibResult;
-
   /// Number of fractal **point stages** for a fresh/recall setup, chosen on a
   /// discrete slider with nine positions, 0..[SetupController.maxPointStages].
   /// 0 is a Stage-0-text-only setup (no fractal points); each higher position
@@ -725,6 +719,12 @@ class _SetupScreenState extends State<SetupScreen> {
       // visibility counterpart of V's volume control).
       if (event.logicalKey == LogicalKeyboardKey.keyV) {
         _toggleSensitiveVisibility();
+        return KeyEventResult.handled;
+      }
+      // Alt+D — open the spacious Argon2 calibration dialog (vs plain D, which
+      // focuses the raw derivation-steps field).
+      if (event.logicalKey == LogicalKeyboardKey.keyD) {
+        _openCalibrationDialog();
         return KeyEventResult.handled;
       }
     }
@@ -1305,6 +1305,7 @@ class _SetupScreenState extends State<SetupScreen> {
     'I import = BIP39 words · Alt+I import = hex (config & point edit alike)',
     'Click/press a ghost slot past the last stage to grow the setup (N/I/R)',
     'S salt / export salt · P profile · D derivation steps · C colour',
+    'Alt+D  calibrate derivation time (dialog: target time → steps N)',
     'Enter  start (Generate / Encode / Begin recall) from a field',
     'K  copy the master secret ("the key")    H  halt derivation (keeps progress)',
     'X  exclude this stage & above (shorten the setup)',
@@ -1816,7 +1817,7 @@ class _SetupScreenState extends State<SetupScreen> {
       const SizedBox(height: 16),
       _argon2ProfileSlider(),
       const SizedBox(height: 16),
-      _calibrationInput(),
+      _calibrateButton(),
       const SizedBox(height: 16),
       ..._iterationsInput(),
       const SizedBox(height: 16),
@@ -1919,101 +1920,42 @@ class _SetupScreenState extends State<SetupScreen> {
   /// time a given N takes drifts with hardware; N itself is exact and
   /// reproducible — see docs §"time is a perishable label on a durable
   /// parameter".)
-  /// Setup-calibration targets: a human duration label paired with the
-  /// wall-clock the derivation should take (grounded in THREAT_MODEL.md —
-  /// hours defeat robbery/flash-kidnap, ~a week defeats the flashiest wrench
-  /// attacks). "Time is a perishable label on a durable parameter": these set N,
-  /// which is exact and reproducible; only the absolute delay drifts with
-  /// hardware.
-  static const List<({String label, Duration target})> _calibTargets =
-      <({String label, Duration target})>[
-    (label: '~1 hour', target: Duration(hours: 1)),
-    (label: '~6 hours', target: Duration(hours: 6)),
-    (label: '~1 day', target: Duration(days: 1)),
-    (label: '~1 week', target: Duration(days: 7)),
-  ];
-
-  /// Pick a target time → micro-benchmark Argon2 on this device at the chosen
-  /// memory profile → fill the derivation-steps field with the N that hits it.
-  Widget _calibrationInput() {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: <Widget>[
-        Text('Calibrate steps to a target time (this device)',
-            style: Theme.of(context).textTheme.labelMedium),
-        const SizedBox(height: 6),
-        Wrap(
-          spacing: 8,
-          runSpacing: 4,
-          children: <Widget>[
-            for (final ({String label, Duration target}) t in _calibTargets)
-              OutlinedButton(
-                onPressed: (_busy || _calibrating)
-                    ? null
-                    : () => _calibrate(t.target, t.label),
-                child: Text(t.label),
-              ),
-          ],
-        ),
-        if (_calibrating)
-          const Padding(
-            padding: EdgeInsets.only(top: 8),
-            child: Row(
-              children: <Widget>[
-                SizedBox(
-                    width: 14,
-                    height: 14,
-                    child: CircularProgressIndicator(strokeWidth: 2)),
-                SizedBox(width: 8),
-                Expanded(child: Text('Benchmarking Argon2 on this device…')),
-              ],
-            ),
-          ),
-        if (_calibResult != null && !_calibrating)
-          Padding(
-            padding: const EdgeInsets.only(top: 6),
-            child: Text(_calibResult!,
-                style: Theme.of(context).textTheme.bodySmall),
-          ),
-      ],
+  /// Open the spacious Argon2 calibration dialog (Alt+D). It benchmarks on this
+  /// device, solves the iteration count N for a chosen target time, and — on
+  /// Apply — returns N, which we write into the derivation-steps field. Exit is
+  /// Esc + confirm (handled inside the dialog).
+  Future<void> _openCalibrationDialog() async {
+    if (_busy || _hasSession) return;
+    final int profileIdx =
+        _profiles.indexOf(_profile).clamp(0, _profiles.length - 1);
+    final int? n = await showDialog<int>(
+      context: context,
+      barrierDismissible: false,
+      builder: (BuildContext _) => _CalibrationDialog(
+        core: widget.core,
+        sounds: _sounds,
+        profile: _profile,
+        profileLabel: _profileLabels[profileIdx],
+      ),
     );
+    if (!mounted || n == null) return;
+    setState(() {
+      _iterations = n;
+      _iterationsField.text = n.toString();
+    });
+    _sounds.play(UiSound.confirm);
   }
 
-  /// Benchmark one Argon2 pass at the current profile, solve N for [target], and
-  /// write it into the steps field. Heavy and off the UI isolate; pick the
-  /// memory profile first (calibrating a profile the device can't allocate
-  /// fails cleanly).
-  Future<void> _calibrate(Duration target, String label) async {
-    setState(() {
-      _calibrating = true;
-      _calibResult = null;
-    });
-    _sounds.play(UiSound.focus);
-    try {
-      final double secPerPass = await widget.core.benchArgon2(profile: _profile);
-      if (!mounted) return;
-      final int n = (target.inSeconds / secPerPass).ceil().clamp(1, 1 << 30);
-      final int profileIdx =
-          _profiles.indexOf(_profile).clamp(0, _profiles.length - 1);
-      setState(() {
-        _iterations = n;
-        _iterationsField.text = n.toString();
-        _calibResult =
-            '≈ ${secPerPass.toStringAsFixed(secPerPass < 10 ? 2 : 1)} s/step '
-            '→ N = $n   (target $label · ${_profileLabels[profileIdx]})';
-      });
-      _sounds.play(UiSound.confirm);
-      debugPrint('calibrate: profile=$_profile secPerStep=$secPerPass '
-          'N=$n target=${target.inSeconds}s');
-    } catch (e) {
-      if (!mounted) return;
-      setState(() => _calibResult =
-          'Calibration failed (${e.runtimeType}) — the chosen memory profile '
-          'may not fit on this device.');
-      _sounds.play(UiSound.warn);
-    } finally {
-      if (mounted) setState(() => _calibrating = false);
-    }
+  /// Panel affordance that opens the calibration dialog (same as Alt+D).
+  Widget _calibrateButton() {
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: OutlinedButton.icon(
+        onPressed: (_busy || _hasSession) ? null : _openCalibrationDialog,
+        icon: const Icon(Icons.timer_outlined, size: 18),
+        label: const Text('Calibrate derivation time…  (Alt+D)'),
+      ),
+    );
   }
 
   List<Widget> _iterationsInput() {
@@ -2092,12 +2034,7 @@ class _SetupScreenState extends State<SetupScreen> {
                       final Argon2Profile next = _profiles[v.round()];
                       if (next == _profile) return;
                       _sounds.play(UiSound.tickSoft);
-                      // A calibration result is for the old profile — drop it so
-                      // a stale "N for Basic" can't be read as "N for Advanced".
-                      setState(() {
-                        _profile = next;
-                        _calibResult = null;
-                      });
+                      setState(() => _profile = next);
                     },
             ),
           ),
@@ -4212,3 +4149,201 @@ class _QrPainter extends CustomPainter {
 /// skeleton (only the key-independent cells, over a highlighted module grid,
 /// printed for hand-colouring).
 enum _QrView { scan, blank }
+
+/// Calibration target presets: a human duration label paired with the
+/// wall-clock the derivation should take. Grounded in THREAT_MODEL.md — hours
+/// defeat robbery / flash-kidnap, ~a week defeats the flashiest wrench attacks.
+const List<({String label, Duration target})> _kCalibTargets =
+    <({String label, Duration target})>[
+  (label: '~1 hour', target: Duration(hours: 1)),
+  (label: '~6 hours', target: Duration(hours: 6)),
+  (label: '~1 day', target: Duration(days: 1)),
+  (label: '~1 week', target: Duration(days: 7)),
+];
+
+/// The spacious Argon2 calibration dialog (opened by Alt+D / the panel button).
+///
+/// Benchmarks Argon2 on this device at [profile], solves the iteration count N
+/// for a chosen target wall-clock, and returns N via [Navigator.pop] on Apply.
+/// Exit is Esc (or Cancel/✕) **with confirmation** — a benchmark result is
+/// discarded unless Applied. "Time is a perishable label on a durable
+/// parameter": N is exact and reproducible; only the absolute delay drifts.
+class _CalibrationDialog extends StatefulWidget {
+  const _CalibrationDialog({
+    required this.core,
+    required this.sounds,
+    required this.profile,
+    required this.profileLabel,
+  });
+
+  final GreatWallCore core;
+  final SoundBoard sounds;
+  final Argon2Profile profile;
+  final String profileLabel;
+
+  @override
+  State<_CalibrationDialog> createState() => _CalibrationDialogState();
+}
+
+class _CalibrationDialogState extends State<_CalibrationDialog> {
+  bool _calibrating = false;
+  String? _result;
+  int? _computedN;
+
+  Future<bool> _confirmClose() async {
+    final bool? ok = await showDialog<bool>(
+      context: context,
+      builder: (BuildContext ctx) => AlertDialog(
+        title: const Text('Close calibration?'),
+        content: const Text(
+            'The benchmark result is discarded unless you Apply it first.'),
+        actions: <Widget>[
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Close')),
+        ],
+      ),
+    );
+    return ok ?? false;
+  }
+
+  Future<void> _attemptClose() async {
+    if (_calibrating) return; // never bail mid-benchmark
+    if (await _confirmClose() && mounted) Navigator.of(context).pop();
+  }
+
+  Future<void> _runCalibration(Duration target, String label) async {
+    setState(() {
+      _calibrating = true;
+      _result = null;
+      _computedN = null;
+    });
+    widget.sounds.play(UiSound.focus);
+    try {
+      final double secPerPass =
+          await widget.core.benchArgon2(profile: widget.profile);
+      if (!mounted) return;
+      final int n = (target.inSeconds / secPerPass).ceil().clamp(1, 1 << 30);
+      setState(() {
+        _computedN = n;
+        _result =
+            '≈ ${secPerPass.toStringAsFixed(secPerPass < 10 ? 2 : 1)} s/step  '
+            '→  N = $n      (target $label · ${widget.profileLabel})';
+      });
+      widget.sounds.play(UiSound.confirm);
+      debugPrint('calibrate: profile=${widget.profile} secPerStep=$secPerPass '
+          'N=$n target=${target.inSeconds}s');
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _result =
+          'Calibration failed (${e.runtimeType}) — the chosen memory profile '
+          'may not fit on this device.');
+      widget.sounds.play(UiSound.warn);
+    } finally {
+      if (mounted) setState(() => _calibrating = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final ThemeData theme = Theme.of(context);
+    // Override the dialog route's default Escape→pop so Esc asks first.
+    return Actions(
+      actions: <Type, Action<Intent>>{
+        DismissIntent: CallbackAction<DismissIntent>(
+          onInvoke: (Intent _) {
+            _attemptClose();
+            return null;
+          },
+        ),
+      },
+      child: Focus(
+        autofocus: true,
+        child: Dialog(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 560),
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: <Widget>[
+                  Row(
+                    children: <Widget>[
+                      Expanded(
+                        child: Text('Calibrate Argon2 derivation time',
+                            style: theme.textTheme.titleLarge),
+                      ),
+                      IconButton(
+                        tooltip: 'Close (Esc)',
+                        onPressed: _calibrating ? null : _attemptClose,
+                        icon: const Icon(Icons.close),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  Text('Memory profile: ${widget.profileLabel}',
+                      style: theme.textTheme.bodyMedium),
+                  Text('Set the memory profile in the panel before calibrating.',
+                      style: theme.textTheme.bodySmall),
+                  const SizedBox(height: 20),
+                  Text('Target derivation time', style: theme.textTheme.labelLarge),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 10,
+                    runSpacing: 8,
+                    children: <Widget>[
+                      for (final ({String label, Duration target}) t
+                          in _kCalibTargets)
+                        OutlinedButton(
+                          onPressed: _calibrating
+                              ? null
+                              : () => _runCalibration(t.target, t.label),
+                          child: Text(t.label),
+                        ),
+                    ],
+                  ),
+                  const SizedBox(height: 20),
+                  if (_calibrating)
+                    Row(
+                      children: const <Widget>[
+                        SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(strokeWidth: 2)),
+                        SizedBox(width: 10),
+                        Expanded(
+                            child: Text('Benchmarking Argon2 on this device…')),
+                      ],
+                    )
+                  else if (_result != null)
+                    Text(_result!, style: theme.textTheme.bodyMedium),
+                  const SizedBox(height: 24),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.end,
+                    children: <Widget>[
+                      TextButton(
+                        onPressed: _calibrating ? null : _attemptClose,
+                        child: const Text('Cancel'),
+                      ),
+                      const SizedBox(width: 8),
+                      FilledButton(
+                        onPressed: (_calibrating || _computedN == null)
+                            ? null
+                            : () => Navigator.of(context).pop(_computedN),
+                        child: const Text('Apply'),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
