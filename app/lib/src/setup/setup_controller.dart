@@ -702,6 +702,21 @@ class SetupController extends ChangeNotifier {
     return _islandDecoForLeaf(d.leafRect, d.path, o, p, q);
   }
 
+  /// The decoration for a *selected* leaf — always framed. Frames the canonical
+  /// island (with its cells) when it resolves; otherwise frames the whole leaf
+  /// rectangle (no cells), so a selection is never invisible.
+  _IslandDeco _selDecoForLeaf(FixedRect leafRect, String path, int o, int p, int q) {
+    final _IslandDeco? isl = _islandDecoForLeaf(leafRect, path, o, p, q);
+    if (isl != null) return isl;
+    return _IslandDeco(
+      cells: const CanvasIsland(cellSize: 0.0, pointsReIm: <double>[]),
+      reMin: fixedToDouble(leafRect.reMin),
+      reMax: fixedToDouble(leafRect.reMax),
+      imMin: fixedToDouble(leafRect.imMin),
+      imMax: fixedToDouble(leafRect.imMax),
+    );
+  }
+
   /// Recompute the displayed stage's focus decorations (cached per stage).
   void _refreshFocusDecos() {
     _selDeco = _selectedDecoForDisplay();
@@ -714,9 +729,17 @@ class SetupController extends ChangeNotifier {
     if (k < 1 || m == null) return null;
     if (_selDecoCache.containsKey(k)) return _selDecoCache[k];
     final StageReservoirs? r = (k < _reservoirs.length) ? _reservoirs[k] : null;
-    final _IslandDeco? deco = (r == null)
-        ? null
-        : _islandDecoAt(fixedFromDouble(m.re), fixedFromDouble(m.im), r.o, r.p, r.q);
+    _IslandDeco? deco;
+    if (r != null) {
+      final CoreDecodeResult d = _core.decodePoint(
+        reRaw: fixedFromDouble(m.re),
+        imRaw: fixedFromDouble(m.im),
+        o: r.o,
+        p: r.p,
+        q: r.q,
+      );
+      deco = d.valid ? _selDecoForLeaf(d.leafRect, d.path, r.o, r.p, r.q) : null;
+    }
     _selDecoCache[k] = deco;
     return deco;
   }
@@ -1420,8 +1443,8 @@ class SetupController extends ChangeNotifier {
       leafImRaw: leaf.im,
     );
 
-    // The selected leaf's canonical island, reusing this decode (no re-decode).
-    _selDecoCache[k] = _islandDecoForLeaf(result.leafRect, result.path, r.o, r.p, r.q);
+    // The selected leaf's decoration (always framed), reusing this decode.
+    _selDecoCache[k] = _selDecoForLeaf(result.leafRect, result.path, r.o, r.p, r.q);
     _refreshFocusDecos();
 
     // Any later fractals were derived from this stage's previous point; they are
