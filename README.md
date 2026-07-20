@@ -1,5 +1,12 @@
 # Great Wallet
 
+> ⚠️ **PROOF OF CONCEPT — NOT SAFE FOR USE.** The current Great Wall
+> implementation is a **substandard proof of concept**: it does not yet match the
+> finalized protocol specification and has not undergone independent security
+> review. **Do not use it to protect real Bitcoin, funds, or any secret of
+> value.** This notice will be removed once the implementation is brought up to
+> the specified protocol.
+
 **Remember your Bitcoin — carry nothing.**
 
 Great Wallet is a self-custody Bitcoin wallet whose seed lives only in
@@ -120,9 +127,10 @@ active development and not yet public.
 
 ## Learn more
 
-- **[ARCHITECTURE.md](./ARCHITECTURE.md)** — repository structure,
-  cryptographic design, security model, and the inheritance protocol.
-  Written for collaborators and auditors.
+- **[ARCHITECTURE.md](great-wall-docs/great-wallet/ARCHITECTURE.md)** — repository
+  structure, cryptographic design, security model, and the inheritance protocol.
+  Written for collaborators and auditors. (Lives in the `great-wall-docs`
+  submodule — see *Documentation and Dependencies* above.)
 
 ---
 
@@ -141,7 +149,7 @@ which remain public:
 
 We thank everyone who contributed to those earlier iterations; the
 current design carries their work forward. See
-[ARCHITECTURE.md](./ARCHITECTURE.md#predecessor-repositories) for the
+[ARCHITECTURE.md](great-wall-docs/great-wallet/ARCHITECTURE.md#predecessor-repositories) for the
 detailed mapping from predecessor repositories to the current
 ecosystem.
 
