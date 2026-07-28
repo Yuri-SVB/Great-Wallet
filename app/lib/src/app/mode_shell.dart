@@ -2,16 +2,23 @@ import 'package:flutter/material.dart';
 
 import '../core/great_wall_core.dart';
 import '../setup/setup_screen.dart';
+import 'orbit_harness_screen.dart';
 
 /// The four great-wallet modes (ARCHITECTURE.md §"7. great-wallet"). Only
 /// **Setup** is implemented in this integration pass; Train / Accelerate /
 /// Inherit depend on libraries (celestial-peace-nf-core, jade-clock,
 /// phoenix-scroll) that are still in development.
+///
+/// [orbit] is an additive **developer** destination for test-running the 0.4.0
+/// orbit protocol end-to-end ([OrbitHarnessScreen]); it is independent of the
+/// production Setup flow and is expected to fold into Setup once the multi-board
+/// placement UX lands.
 enum WalletMode {
   setup('Setup', Icons.auto_awesome_mosaic),
   train('Train', Icons.school),
   accelerate('Accelerate', Icons.bolt),
-  inherit('Inherit', Icons.account_tree);
+  inherit('Inherit', Icons.account_tree),
+  orbit('Orbit (dev)', Icons.blur_circular);
 
   const WalletMode(this.label, this.icon);
   final String label;
@@ -61,6 +68,8 @@ class _ModeShellState extends State<ModeShell> {
     switch (_mode) {
       case WalletMode.setup:
         return SetupScreen(core: widget.core);
+      case WalletMode.orbit:
+        return OrbitHarnessScreen(core: widget.core);
       case WalletMode.train:
       case WalletMode.accelerate:
       case WalletMode.inherit:
