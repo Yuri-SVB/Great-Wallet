@@ -21,10 +21,12 @@ class NamtsoHarvester {
   static bool get isSupported =>
       Platform.isLinux || Platform.isMacOS || Platform.isWindows;
 
-  /// Default cap on how long a harvest may run before it is killed — the
-  /// timechain fetch is bounded, so a longer wait means an unreachable/slow
-  /// network, not progress.
-  static const Duration defaultTimeout = Duration(seconds: 45);
+  /// Backstop cap on how long a harvest may run before the app kills it. The
+  /// namtso CLI now self-bounds every phase (connect / read timeouts + a DNS
+  /// bound) and batches its fetches, so it fails fast on a dead network on its
+  /// own; this is only a last-resort guard for a genuinely stuck process, kept
+  /// generous so it never clips a legitimately-progressing harvest.
+  static const Duration defaultTimeout = Duration(seconds: 90);
 
   /// Start a **cancellable, timeout-bounded** harvest and return a
   /// [HarvestSession]. This is the safe entry point for UI: the process is
