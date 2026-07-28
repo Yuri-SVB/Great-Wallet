@@ -121,9 +121,10 @@ class NamtsoHarvester {
       }
       if (code != 0) {
         if (!completer.isCompleted) {
+          final String reason = _extractError(err);
           completer.completeError(NamtsoError(
               'namtso harvest failed (exit $code)'
-              '${err.isEmpty ? '' : ':\n$err'}'));
+              '${reason.isEmpty ? '' : ': $reason'}'));
         }
         return;
       }
@@ -194,6 +195,24 @@ class NamtsoHarvester {
 
   static bool _looksLikeSigmaHex(String s) =>
       s.length >= 2 && s.length.isEven && RegExp(r'^[0-9a-f]+$').hasMatch(s);
+
+  /// namtso prints failures as a JSON object on stderr
+  /// (`{"error":CODE,"message":...,"reason":...}`). Pull out the human reason;
+  /// fall back to the raw text if it isn't the expected JSON.
+  static String _extractError(String stderr) {
+    final String t = stderr.trim();
+    if (t.isEmpty) return '';
+    try {
+      final Object? j = jsonDecode(t);
+      if (j is Map) {
+        final Object? r = j['reason'] ?? j['message'] ?? j['error'];
+        if (r != null && r.toString().trim().isNotEmpty) return r.toString();
+      }
+    } catch (_) {
+      // not JSON — fall through to the raw text
+    }
+    return t;
+  }
 
   static String _ellipsis(String s) =>
       s.length <= 24 ? s : '${s.substring(0, 24)}…';

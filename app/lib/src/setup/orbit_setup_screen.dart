@@ -53,6 +53,7 @@ class _OrbitSetupScreenState extends State<OrbitSetupScreen> {
   final BrightnessController _brightness = BrightnessController();
   final SoundBoard _sounds = SoundBoard();
   final TextEditingController _sigmaCtrl = TextEditingController();
+  final TextEditingController _explorerCtrl = TextEditingController();
 
   int _level = 2;
   bool _cheapAdvance = false;
@@ -100,6 +101,7 @@ class _OrbitSetupScreenState extends State<OrbitSetupScreen> {
     _brightness.dispose();
     _sounds.dispose();
     _sigmaCtrl.dispose();
+    _explorerCtrl.dispose();
     super.dispose();
   }
 
@@ -182,7 +184,8 @@ class _OrbitSetupScreenState extends State<OrbitSetupScreen> {
       _harvestNote = null;
       _configError = null;
     });
-    final HarvestSession session = const NamtsoHarvester().start(date: picked);
+    final HarvestSession session = const NamtsoHarvester()
+        .start(date: picked, explorer: _explorerCtrl.text.trim());
     _harvestSession = session;
     try {
       final String sigma = await session.result;
@@ -378,6 +381,18 @@ class _OrbitSetupScreenState extends State<OrbitSetupScreen> {
               '(needs the built namtso CLI and network). Or paste/randomize σ '
               'above.',
               style: theme.textTheme.bodySmall,
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _explorerCtrl,
+              enabled: !_harvesting,
+              style: theme.textTheme.bodySmall,
+              decoration: const InputDecoration(
+                border: OutlineInputBorder(),
+                isDense: true,
+                labelText: 'Esplora URLs (advanced, optional)',
+                hintText: 'https://esplora.example/api, …  — blank = defaults',
+              ),
             ),
           ],
           const SizedBox(height: 16),
