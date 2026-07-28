@@ -7,6 +7,7 @@ import 'package:great_wall_ux/great_wall_ux.dart';
 
 import '../core/encoding_constants.dart';
 import '../core/great_wall_core.dart';
+import '../core/namtso_harvester.dart';
 import '../core/orbit_protocol.dart';
 import '../core/stage_params.dart';
 import 'orbit_setup_controller.dart';
@@ -57,6 +58,19 @@ class _OrbitSetupScreenState extends State<OrbitSetupScreen> {
   bool _cheapAdvance = false;
   String? _configError;
 
+  // σ harvest (Namtso) state.
+  bool _harvesting = false;
+  String? _harvestNote;
+  DateTime? _harvestedDate;
+
+  // Board navigation: deep render raises the escape-count cap so leaves buried
+  // in high-iteration voids become visible to tap (mirrors the legacy Alt+L).
+  bool _deepRender = false;
+
+  int get _renderMaxIter => _deepRender
+      ? widget.core.encodeParams.maxIter
+      : EncodingConstants.renderMaxIterFast;
+
   // Track the board being shown so the viewport recenters on each new fractal.
   (int, int)? _shownBoard;
 
@@ -96,6 +110,8 @@ class _OrbitSetupScreenState extends State<OrbitSetupScreen> {
         _applyBoardReservoirs();
         _viewport.viewport = _initialViewport;
         _brightness.reset();
+        // A new fractal renders fast by default; deep render is re-armed per board.
+        _deepRender = false;
       }
     } else {
       _shownBoard = null;
@@ -136,6 +152,58 @@ class _OrbitSetupScreenState extends State<OrbitSetupScreen> {
       ..setAll(o.length + shBytes.length, tag);
     return Uint8List.fromList(crypto.sha256.convert(m).bytes);
   }
+
+  void _recenter() {
+    _viewport.viewport = _initialViewport;
+    _brightness.reset();
+    setState(() {});
+  }
+
+  void _toggleDeepRender() => setState(() => _deepRender = !_deepRender);
+
+  /// Pick a date and harvest σ from the Namtso CLI (desktop). Fills the σ field
+  /// on success; on failure keeps manual entry available and shows why.
+  Future<void> _harvestFromDate() async {
+    final DateTime now = DateTime.now();
+    final DateTime today = DateTime(now.year, now.month, now.day);
+    final DateTime? picked = await showDatePicker(
+      context: context,
+      initialDate: _harvestedDate ?? today,
+      firstDate: DateTime(2009, 1, 3), // Bitcoin genesis
+      lastDate: today,
+      helpText: 'Harvest σ from the timechain at a date',
+    );
+    if (picked == null) return;
+    setState(() {
+      _harvesting = true;
+      _harvestNote = null;
+      _configError = null;
+    });
+    try {
+      final String sigma = await const NamtsoHarvester().harvest(date: picked);
+      if (!mounted) return;
+      setState(() {
+        _sigmaCtrl.text = sigma;
+        _harvestedDate = picked;
+        _harvestNote = 'σ harvested for ${_isoDate(picked)} '
+            '(${sigma.length ~/ 2} bytes).';
+      });
+    } on NamtsoUnavailable catch (e) {
+      if (mounted) {
+        setState(() => _configError = 'Namtso unavailable: ${e.message}\n'
+            'Build it with app/native/build_namtso.sh, or enter σ manually.');
+      }
+    } on NamtsoError catch (e) {
+      if (mounted) setState(() => _configError = e.message);
+    } finally {
+      if (mounted) setState(() => _harvesting = false);
+    }
+  }
+
+  static String _isoDate(DateTime d) =>
+      '${d.year.toString().padLeft(4, '0')}-'
+      '${d.month.toString().padLeft(2, '0')}-'
+      '${d.day.toString().padLeft(2, '0')}';
 
   void _begin() {
     final Uint8List? sigma = _parseHex(_sigmaCtrl.text.trim());
@@ -265,6 +333,35 @@ class _OrbitSetupScreenState extends State<OrbitSetupScreen> {
               ),
             ),
           ),
+          if (NamtsoHarvester.isSupported) ...<Widget>[
+            const SizedBox(height: 8),
+            Row(
+              children: <Widget>[
+                OutlinedButton.icon(
+                  onPressed: _harvesting ? null : _harvestFromDate,
+                  icon: const Icon(Icons.calendar_month),
+                  label: const Text('Harvest from date (Namtso)'),
+                ),
+                const SizedBox(width: 12),
+                if (_harvesting)
+                  const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2)),
+                if (_harvestNote != null && !_harvesting)
+                  Expanded(
+                    child: Text(_harvestNote!,
+                        style: theme.textTheme.bodySmall),
+                  ),
+              ],
+            ),
+            Text(
+              'Derives σ from Bitcoin block headers at the chosen date '
+              '(needs the built namtso CLI and network). Or paste/randomize σ '
+              'above.',
+              style: theme.textTheme.bodySmall,
+            ),
+          ],
           const SizedBox(height: 16),
           SwitchListTile(
             contentPadding: EdgeInsets.zero,
@@ -316,13 +413,28 @@ class _OrbitSetupScreenState extends State<OrbitSetupScreen> {
                       style: theme.textTheme.titleMedium,
                     ),
                     Text(
-                      'Tap the fractal to place this board’s point, or '
-                      'Generate a random one.',
+                      'Drag to pan, scroll to zoom; tap a leaf to place this '
+                      'board’s point — or Generate a random one.',
                       style: theme.textTheme.bodySmall,
                     ),
                   ],
                 ),
               ),
+              IconButton(
+                tooltip: 'Recenter',
+                onPressed: _recenter,
+                icon: const Icon(Icons.center_focus_strong),
+              ),
+              IconButton(
+                tooltip: 'Deep render — reveal leaves in escape-count voids '
+                    '(slower)',
+                onPressed: _toggleDeepRender,
+                icon: Icon(
+                  _deepRender ? Icons.visibility : Icons.visibility_outlined,
+                  color: _deepRender ? theme.colorScheme.primary : null,
+                ),
+              ),
+              const SizedBox(width: 8),
               OutlinedButton.icon(
                 onPressed: _generate,
                 icon: const Icon(Icons.shuffle),
@@ -347,7 +459,7 @@ class _OrbitSetupScreenState extends State<OrbitSetupScreen> {
                   sounds: _sounds,
                   stage: Stage.stage2,
                   stageParameters: bp,
-                  maxIterations: EncodingConstants.renderMaxIterFast,
+                  maxIterations: _renderMaxIter,
                   overlays: CanvasOverlays(
                     crosshairs: false,
                     islands: const <CanvasIsland>[],
