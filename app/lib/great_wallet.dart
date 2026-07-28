@@ -14,6 +14,8 @@ export 'src/core/stage_params.dart';
 export 'src/ffi/core_bindings.dart' show Argon2Profile, FixedRect, CoreDiscoveryParams, CoreDecodeResult;
 export 'src/ffi/fixed.dart';
 export 'src/ffi/library_loader.dart' show CoreLibraryLoader, CoreLibraryNotFound;
+export 'src/setup/orbit_review.dart';
+export 'src/setup/orbit_score_store.dart';
 export 'src/setup/orbit_setup_controller.dart';
 export 'src/setup/orbit_setup_screen.dart';
 export 'src/setup/setup_controller.dart';
