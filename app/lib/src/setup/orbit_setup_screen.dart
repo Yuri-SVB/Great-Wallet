@@ -62,6 +62,7 @@ class _OrbitSetupScreenState extends State<OrbitSetupScreen> {
   bool _harvesting = false;
   String? _harvestNote;
   DateTime? _harvestedDate;
+  HarvestSession? _harvestSession;
 
   // Board navigation: deep render raises the escape-count cap so leaves buried
   // in high-iteration voids become visible to tap (mirrors the legacy Alt+L).
@@ -87,6 +88,8 @@ class _OrbitSetupScreenState extends State<OrbitSetupScreen> {
 
   @override
   void dispose() {
+    // Kill any in-flight Namtso process so it can't outlive the screen.
+    _harvestSession?.cancel();
     // Release the shared render source so a mid-placement exit leaves no stale
     // orbit fractal for the legacy Setup mode (which sets its own reservoirs).
     widget.core.source.reservoirs = null;
@@ -179,8 +182,10 @@ class _OrbitSetupScreenState extends State<OrbitSetupScreen> {
       _harvestNote = null;
       _configError = null;
     });
+    final HarvestSession session = const NamtsoHarvester().start(date: picked);
+    _harvestSession = session;
     try {
-      final String sigma = await const NamtsoHarvester().harvest(date: picked);
+      final String sigma = await session.result;
       if (!mounted) return;
       setState(() {
         _sigmaCtrl.text = sigma;
@@ -188,6 +193,8 @@ class _OrbitSetupScreenState extends State<OrbitSetupScreen> {
         _harvestNote = 'σ harvested for ${_isoDate(picked)} '
             '(${sigma.length ~/ 2} bytes).';
       });
+    } on NamtsoCancelled {
+      if (mounted) setState(() => _harvestNote = 'Harvest cancelled.');
     } on NamtsoUnavailable catch (e) {
       if (mounted) {
         setState(() => _configError = 'Namtso unavailable: ${e.message}\n'
@@ -196,9 +203,12 @@ class _OrbitSetupScreenState extends State<OrbitSetupScreen> {
     } on NamtsoError catch (e) {
       if (mounted) setState(() => _configError = e.message);
     } finally {
+      _harvestSession = null;
       if (mounted) setState(() => _harvesting = false);
     }
   }
+
+  void _cancelHarvest() => _harvestSession?.cancel();
 
   static String _isoDate(DateTime d) =>
       '${d.year.toString().padLeft(4, '0')}-'
@@ -343,11 +353,19 @@ class _OrbitSetupScreenState extends State<OrbitSetupScreen> {
                   label: const Text('Harvest from date (Namtso)'),
                 ),
                 const SizedBox(width: 12),
-                if (_harvesting)
+                if (_harvesting) ...<Widget>[
                   const SizedBox(
                       width: 16,
                       height: 16,
                       child: CircularProgressIndicator(strokeWidth: 2)),
+                  const SizedBox(width: 12),
+                  Text('Fetching headers…', style: theme.textTheme.bodySmall),
+                  const SizedBox(width: 12),
+                  TextButton(
+                    onPressed: _cancelHarvest,
+                    child: const Text('Cancel'),
+                  ),
+                ],
                 if (_harvestNote != null && !_harvesting)
                   Expanded(
                     child: Text(_harvestNote!,

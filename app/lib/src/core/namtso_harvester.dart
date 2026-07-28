@@ -1,3 +1,5 @@
+import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 /// Harvests the orbit salt σ from the **Namtso** CLI (the flat submodule
@@ -19,60 +21,147 @@ class NamtsoHarvester {
   static bool get isSupported =>
       Platform.isLinux || Platform.isMacOS || Platform.isWindows;
 
-  /// Harvest σ for [date] and return it as a lowercase hex string (256 hex
-  /// chars = 128 bytes). [network] and [window] map to the CLI flags; [explorer]
-  /// is the comma-separated explorer list (empty string ⇒ Namtso's default
-  /// public explorers). Runs Namtso's network path — it can take a few seconds
-  /// and needs connectivity.
+  /// Default cap on how long a harvest may run before it is killed — the
+  /// timechain fetch is bounded, so a longer wait means an unreachable/slow
+  /// network, not progress.
+  static const Duration defaultTimeout = Duration(seconds: 45);
+
+  /// Start a **cancellable, timeout-bounded** harvest and return a
+  /// [HarvestSession]. This is the safe entry point for UI: the process is
+  /// spawned via `Process.start` (never blocking the UI isolate), killed on
+  /// [HarvestSession.cancel] or after [timeout], so the app can never hang on a
+  /// slow or unreachable network.
   ///
-  /// Throws [NamtsoUnavailable] if the binary can't be found, or [NamtsoError]
-  /// with the CLI's stderr on a non-zero exit / unparseable output.
+  /// [session.result] completes with the σ hex (lowercase, 256 chars), or errors
+  /// with [NamtsoUnavailable] (binary missing / this platform), [NamtsoCancelled]
+  /// (user cancel), or [NamtsoError] (timeout, non-zero exit, unparseable out).
+  HarvestSession start({
+    required DateTime date,
+    String network = 'mainnet',
+    int window = 32,
+    String explorer = '',
+    Duration timeout = defaultTimeout,
+  }) {
+    final Completer<String> completer = Completer<String>();
+    Process? proc;
+    bool cancelled = false;
+
+    void cancel() {
+      cancelled = true;
+      proc?.kill(ProcessSignal.sigkill);
+      if (!completer.isCompleted) {
+        completer.completeError(const NamtsoCancelled());
+      }
+    }
+
+    Future<void> run() async {
+      if (!isSupported) {
+        completer.completeError(const NamtsoUnavailable(
+            'Namtso harvest needs a desktop build (Process support). '
+            'Enter σ manually on this platform.'));
+        return;
+      }
+      final String bin = _locateBinary();
+      final List<String> args = <String>[
+        'harvest',
+        '--date',
+        _isoDate(date),
+        '--network',
+        network,
+        '--window',
+        '$window',
+        '--explorer',
+        explorer,
+      ];
+      try {
+        proc = await Process.start(bin, args);
+      } on ProcessException catch (e) {
+        if (!completer.isCompleted) {
+          completer.completeError(
+              NamtsoUnavailable('could not run namtso ($bin): ${e.message}'));
+        }
+        return;
+      }
+      if (cancelled) {
+        proc?.kill(ProcessSignal.sigkill);
+        return;
+      }
+      // Drain both pipes so the child can't block on a full stdout buffer.
+      final Future<String> outF =
+          proc!.stdout.transform(utf8.decoder).join();
+      final Future<String> errF =
+          proc!.stderr.transform(utf8.decoder).join();
+
+      bool timedOut = false;
+      final int code;
+      try {
+        code = await proc!.exitCode.timeout(timeout, onTimeout: () {
+          timedOut = true;
+          proc?.kill(ProcessSignal.sigkill);
+          return -1;
+        });
+      } catch (e) {
+        if (!completer.isCompleted) {
+          completer.completeError(NamtsoError('namtso failed to run: $e'));
+        }
+        return;
+      }
+      final String out = await outF;
+      final String err = (await errF).trim();
+
+      if (cancelled) return; // cancel() already errored the completer
+      if (timedOut) {
+        if (!completer.isCompleted) {
+          completer.completeError(NamtsoError(
+              'namtso harvest timed out after ${timeout.inSeconds}s '
+              '(network unreachable?). Try a --headers/--node source, or '
+              'enter σ manually.'));
+        }
+        return;
+      }
+      if (code != 0) {
+        if (!completer.isCompleted) {
+          completer.completeError(NamtsoError(
+              'namtso harvest failed (exit $code)'
+              '${err.isEmpty ? '' : ':\n$err'}'));
+        }
+        return;
+      }
+      final String first = out
+          .split('\n')
+          .firstWhere((String l) => l.trim().isNotEmpty, orElse: () => '');
+      final String sigma = first.trim().toLowerCase();
+      if (!_looksLikeSigmaHex(sigma)) {
+        if (!completer.isCompleted) {
+          completer.completeError(NamtsoError('namtso output did not start '
+              'with a σ hex line (got "${_ellipsis(first)}").'));
+        }
+        return;
+      }
+      if (!completer.isCompleted) completer.complete(sigma);
+    }
+
+    // Fire-and-forget: run() drives the process; failures land on the future.
+    unawaited(run());
+    return HarvestSession(completer.future, cancel);
+  }
+
+  /// Convenience: await a one-shot harvest (used by tests / non-UI callers).
+  /// Prefer [start] in the UI so the run can be cancelled.
   Future<String> harvest({
     required DateTime date,
     String network = 'mainnet',
     int window = 32,
     String explorer = '',
-  }) async {
-    if (!isSupported) {
-      throw const NamtsoUnavailable(
-        'Namtso harvest needs a desktop build (Process support). '
-        'Enter σ manually on this platform.',
-      );
-    }
-    final String bin = _locateBinary();
-    final List<String> args = <String>[
-      'harvest',
-      '--date',
-      _isoDate(date),
-      '--network',
-      network,
-      '--window',
-      '$window',
-      '--explorer',
-      explorer,
-    ];
-    final ProcessResult res;
-    try {
-      res = await Process.run(bin, args);
-    } on ProcessException catch (e) {
-      throw NamtsoUnavailable('could not run namtso ($bin): ${e.message}');
-    }
-    if (res.exitCode != 0) {
-      final String err = (res.stderr as String).trim();
-      throw NamtsoError('namtso harvest failed (exit ${res.exitCode})'
-          '${err.isEmpty ? '' : ':\n$err'}');
-    }
-    // The σ hex is the first stdout line; the receipt JSON follows.
-    final String out = (res.stdout as String).trim();
-    final String first =
-        out.split('\n').firstWhere((String l) => l.trim().isNotEmpty,
-            orElse: () => '');
-    final String sigma = first.trim().toLowerCase();
-    if (!_looksLikeSigmaHex(sigma)) {
-      throw NamtsoError(
-          'namtso output did not start with a σ hex line (got "${_ellipsis(first)}").');
-    }
-    return sigma;
+    Duration timeout = defaultTimeout,
+  }) {
+    return start(
+      date: date,
+      network: network,
+      window: window,
+      explorer: explorer,
+      timeout: timeout,
+    ).result;
   }
 
   /// Probe order for the `namtso` binary: an explicit env override, the flat
@@ -108,6 +197,24 @@ class NamtsoHarvester {
 
   static String _ellipsis(String s) =>
       s.length <= 24 ? s : '${s.substring(0, 24)}…';
+}
+
+/// A running, cancellable harvest. [result] completes with the σ hex or errors;
+/// [cancel] kills the process and fails [result] with [NamtsoCancelled].
+class HarvestSession {
+  HarvestSession(this.result, this._cancel);
+
+  final Future<String> result;
+  final void Function() _cancel;
+
+  void cancel() => _cancel();
+}
+
+/// The user cancelled the harvest.
+class NamtsoCancelled implements Exception {
+  const NamtsoCancelled();
+  @override
+  String toString() => 'NamtsoCancelled';
 }
 
 /// The Namtso binary could not be located or executed (build it with
