@@ -8,6 +8,7 @@ import 'package:great_wall_ux/great_wall_ux.dart';
 import '../core/encoding_constants.dart';
 import '../core/great_wall_core.dart';
 import '../core/orbit_protocol.dart';
+import '../core/stage_params.dart';
 import 'orbit_setup_controller.dart';
 
 /// The **orbit (0.4.0) Setup flow** — the coercion-resistant setup that places
@@ -59,6 +60,11 @@ class _OrbitSetupScreenState extends State<OrbitSetupScreen> {
   // Track the board being shown so the viewport recenters on each new fractal.
   (int, int)? _shownBoard;
 
+  /// The current board's display-proxy params (doubles) for the canvas. The
+  /// authoritative u64 reservoirs ride [GreatWallCore.source]`.reservoirs`
+  /// instead (see [_applyBoardReservoirs]); this only drives repaints.
+  StageParameters? _boardParams;
+
   @override
   void initState() {
     super.initState();
@@ -67,6 +73,10 @@ class _OrbitSetupScreenState extends State<OrbitSetupScreen> {
 
   @override
   void dispose() {
+    // Release the shared render source so a mid-placement exit leaves no stale
+    // orbit fractal for the legacy Setup mode (which sets its own reservoirs).
+    widget.core.source.reservoirs = null;
+    widget.core.leafSource.reservoirs = null;
     _setup.removeListener(_onChange);
     _setup.dispose();
     _viewport.dispose();
@@ -83,13 +93,39 @@ class _OrbitSetupScreenState extends State<OrbitSetupScreen> {
       final (int, int) key = (_setup.stageIndex, _setup.boardIndex);
       if (_shownBoard != key) {
         _shownBoard = key;
+        _applyBoardReservoirs();
         _viewport.viewport = _initialViewport;
         _brightness.reset();
       }
     } else {
       _shownBoard = null;
+      // Leaving placement: drop the render reservoirs so no stale fractal shows.
+      widget.core.source.reservoirs = null;
+      widget.core.leafSource.reservoirs = null;
+      _boardParams = null;
     }
     if (mounted) setState(() {});
+  }
+
+  /// Point the render source at the current board's **authoritative** u64
+  /// reservoirs and build the display-proxy [StageParameters] (doubles) the
+  /// canvas uses only to trigger repaints — mirroring setup_controller's
+  /// `_applyReservoirs`. The u64s never ride `StageParameters` (which is
+  /// `double`-typed); the engine reads them from the source (stage_params.dart).
+  void _applyBoardReservoirs() {
+    final ({int o, int p, int q})? prm = _setup.currentBoardParams;
+    if (prm == null) {
+      widget.core.source.reservoirs = null;
+      widget.core.leafSource.reservoirs = null;
+      _boardParams = null;
+      return;
+    }
+    final StageReservoirs res =
+        StageReservoirs(o: prm.o, p: prm.p, q: prm.q);
+    widget.core.source.reservoirs = res;
+    widget.core.leafSource.reservoirs = res;
+    final ({double o, double p, double q}) key = res.displayKey;
+    _boardParams = StageParameters(o: key.o, p: key.p, q: key.q);
   }
 
   Future<Uint8List> _cheapAdvanceFn(Uint8List o, Uint8List shBytes) async {
@@ -261,7 +297,7 @@ class _OrbitSetupScreenState extends State<OrbitSetupScreen> {
 
   Widget _boardView(BuildContext context) {
     final ThemeData theme = Theme.of(context);
-    final ({int o, int p, int q})? prm = _setup.currentBoardParams;
+    final StageParameters? bp = _boardParams;
     final bool deep = _setup.stageIndex > 0;
     return Column(
       children: <Widget>[
@@ -301,7 +337,7 @@ class _OrbitSetupScreenState extends State<OrbitSetupScreen> {
             child: _substandardBanner(theme),
           ),
         Expanded(
-          child: prm == null
+          child: bp == null
               ? const Center(child: CircularProgressIndicator())
               : FractalCanvas(
                   source: widget.core.source,
@@ -310,8 +346,7 @@ class _OrbitSetupScreenState extends State<OrbitSetupScreen> {
                   brightness: _brightness,
                   sounds: _sounds,
                   stage: Stage.stage2,
-                  stageParameters:
-                      StageParameters(o: prm.o, p: prm.p, q: prm.q),
+                  stageParameters: bp,
                   maxIterations: EncodingConstants.renderMaxIterFast,
                   overlays: CanvasOverlays(
                     crosshairs: false,
@@ -320,7 +355,9 @@ class _OrbitSetupScreenState extends State<OrbitSetupScreen> {
                     crosses: const <CrossMarker>[],
                   ),
                   semanticLabel: 'Orbit fractal board',
-                  onSelect: _onSelect,
+                  onSelect: (FractalSelection sel) {
+                    _onSelect(sel);
+                  },
                 ),
         ),
       ],
