@@ -12,6 +12,7 @@ import 'package:great_wall_ux/great_wall_ux.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:qr/qr.dart' as qr;
 
+import '../core/bip39.dart';
 import '../core/encoding_constants.dart';
 import '../core/entropy.dart';
 import '../core/great_wall_core.dart';
@@ -290,6 +291,11 @@ class _SetupScreenState extends State<SetupScreen> {
   final List<({int reRaw, int imRaw})?> _stage0Points =
       List<({int reRaw, int imRaw})?>.filled(_maxSlot + 1, null);
   final List<bool> _stage0Derived = List<bool>.filled(_maxSlot + 1, false);
+
+  /// The stage-0 slot whose point is being imported inline, or null. Reuses the
+  /// legacy point-import editor ([_importEditorBody] / [_pointImport]) — one
+  /// import surface, mutually exclusive with the chain import.
+  int? _boardImportSlot;
 
   /// True at a stage-0 fractal slot (`#j≥1`) — the orbit-board context.
   bool get _isBoardSlot => _activeStage == 0 && _slotIndex >= 1;
@@ -588,6 +594,10 @@ class _SetupScreenState extends State<SetupScreen> {
     // Esc also cancels an armed manual point edit and any open expansion picker
     // or import editor.
     if (_editPointMode) setState(() => _editPointMode = false);
+    if (_boardImportSlot != null) {
+      _pointImport.clear();
+      setState(() => _boardImportSlot = null);
+    }
     if (_expandTarget != null) setState(() => _expandTarget = null);
     if (_expandImportTarget != null) {
       _pointImport.clear();
@@ -724,11 +734,13 @@ class _SetupScreenState extends State<SetupScreen> {
       return;
     }
     if (i == _slotIndex) return;
+    if (_boardImportSlot != null) _pointImport.clear();
     _sounds.play(UiSound.navStage);
     setState(() {
       _slotIndex = i;
-      // Any manual point-placement armed for the previous slot no longer applies.
+      // Any point entry armed for the previous slot no longer applies.
       _editPointMode = false;
+      _boardImportSlot = null;
     });
   }
 
@@ -1112,6 +1124,8 @@ class _SetupScreenState extends State<SetupScreen> {
       if (event.logicalKey == LogicalKeyboardKey.keyI) {
         if (_expandTarget != null) {
           _expandImport(hex: true);
+        } else if (_placeableBoardSlot) {
+          _beginBoardImport(_slotIndex, hex: true);
         } else if (_setup.canEditCurrentPoint) {
           _changePointImport(hex: true);
         } else {
@@ -1203,6 +1217,8 @@ class _SetupScreenState extends State<SetupScreen> {
     if (event.logicalKey == LogicalKeyboardKey.keyI) {
       if (_expandTarget != null) {
         _expandImport(hex: false);
+      } else if (_placeableBoardSlot) {
+        _beginBoardImport(_slotIndex, hex: false);
       } else if (_setup.canEditCurrentPoint) {
         _changePointImport(hex: false);
       } else {
@@ -1588,6 +1604,70 @@ class _SetupScreenState extends State<SetupScreen> {
     _sounds.play(UiSound.selectPoint);
   }
 
+  /// Open the shared inline import editor for slot [slot]'s point — the board
+  /// peer of [_changePointImport] (`I` / `Alt+I`), reusing [_importEditorBody].
+  void _beginBoardImport(int slot, {required bool hex}) {
+    _pointImport.clear();
+    setState(() {
+      _pointImportFmt = hex ? _ImportFormat.hex : _ImportFormat.words;
+      _boardImportSlot = slot;
+    });
+    _pointImportFocus.requestFocus();
+  }
+
+  /// Apply the inline import to the pending board slot: 8 hex or 3 words → 32
+  /// bits, encoded to a board point.
+  void _applyBoardImport() {
+    final int slot = _boardImportSlot!;
+    final ({int o, int p, int q})? prm = _boardPrm(slot);
+    if (prm == null) {
+      _sounds.play(UiSound.denyBlocked);
+      _toast('Set σ in slot 0 first.');
+      return;
+    }
+    List<int> bits;
+    try {
+      bits = _pointImportFmt == _ImportFormat.hex
+          ? Entropy.hexToBits(_pointImport.text.trim().toUpperCase())
+          : Bip39.mnemonicToEntropyBits(_pointImport.text.trim());
+    } on FormatException catch (e) {
+      _sounds.play(UiSound.denyInput);
+      _toast(e.message);
+      return;
+    }
+    if (bits.length != EncodingConstants.bitsPerPoint) {
+      Entropy.wipe(bits);
+      _sounds.play(UiSound.denyInput);
+      _toast('A board point is 32 bits — 8 hex digits or 3 words.');
+      return;
+    }
+    final EncodedPoint pt = widget.core
+        .encodeStage(List<int>.of(bits), o: prm.o, p: prm.p, q: prm.q)
+        .first;
+    _setPrimary(slot, bits, (reRaw: pt.reRaw, imRaw: pt.imRaw));
+    Entropy.wipe(bits);
+    _cancelBoardImport();
+    _sounds.play(UiSound.selectPoint);
+  }
+
+  void _cancelBoardImport() {
+    _pointImport.clear();
+    setState(() => _boardImportSlot = null);
+    _focusViewer();
+  }
+
+  /// The inline import editor for a board point (reuses [_importEditorBody]).
+  Widget _boardImportEditor() {
+    final int slot = _boardImportSlot!;
+    return _importEditorBody(
+      title: 'Import slot $slot\'s point — 3 words or 8 hex (a 32-bit point).',
+      words: 3,
+      hexDigits: 8,
+      onApply: _applyBoardImport,
+      onCancel: _cancelBoardImport,
+    );
+  }
+
   /// Record slot [slot]'s primary chunk + point (copying [bits]) and re-derive
   /// the extra shares from the (possibly now complete) primaries.
   void _setPrimary(int slot, List<int> bits, ({int reRaw, int imRaw}) point) {
@@ -1692,8 +1772,8 @@ class _SetupScreenState extends State<SetupScreen> {
     } else {
       body = Text(
         placed
-            ? 'Point placed. R to pick a new one on the fractal · N to regenerate.'
-            : 'R to place (click a leaf) · N for a random point.',
+            ? 'Point placed. R new click · N regenerate · I import (words/hex).'
+            : 'R to place (click a leaf) · N random · I import (words/hex).',
         style: theme.textTheme.bodySmall,
       );
     }
@@ -2343,6 +2423,12 @@ class _SetupScreenState extends State<SetupScreen> {
           if (_setup.canResume) ...<Widget>[
             const Divider(height: 32),
             _haltedNotice(),
+          ],
+
+          // Inline editor for importing a stage-0 orbit board's point.
+          if (_boardImportSlot != null) ...<Widget>[
+            const Divider(height: 32),
+            _boardImportEditor(),
           ],
 
           // Inline editor for replacing the displayed stage's point by import.
