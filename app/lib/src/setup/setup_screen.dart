@@ -1279,9 +1279,14 @@ class _SetupScreenState extends State<SetupScreen> {
       setState(() => _stageBarHidden = hiding);
       return KeyEventResult.handled;
     }
-    // X — exclude the displayed stage and every stage above it (truncate).
+    // X — exclude the displayed stage and every stage above it (truncate). In
+    // the orbit build this drops the current orbit stage and every deeper one.
     if (event.logicalKey == LogicalKeyboardKey.keyX) {
-      _truncate();
+      if (_hasSession) {
+        _truncate();
+      } else {
+        _truncateOrbit();
+      }
       return KeyEventResult.handled;
     }
     // E — enumerate the canonical leaf areas under the current view and
@@ -2387,6 +2392,33 @@ class _SetupScreenState extends State<SetupScreen> {
             : 'Press $slot again to reset the view (position · zoom · brightness).',
         style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
       ),
+      // Orbit-build stage navigation (pre-session): advance forward once this
+      // stage is complete, and exclude this stage and below (deep stages only).
+      if (!_hasSession) ...<Widget>[
+        if (_orbitK[stage] != null && stage < _maxStage) ...<Widget>[
+          const SizedBox(height: 6),
+          Text(
+            stage == _orbitReachableCeiling
+                ? 'Stage complete. Alt+${stage + 1} advances the orbit (memory-hard).'
+                : 'Stage complete.',
+            style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
+          ),
+        ],
+        if (_orbitK[stage] != null && stage == _maxStage) ...<Widget>[
+          const SizedBox(height: 6),
+          Text(
+            'Deepest stage — its K is the wallet master key (copy with K).',
+            style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
+          ),
+        ],
+        if (stage >= 1) ...<Widget>[
+          const SizedBox(height: 6),
+          Text(
+            'X excludes Stage $stage and every stage below it.',
+            style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
+          ),
+        ],
+      ],
     ];
   }
 
@@ -4722,6 +4754,39 @@ class _SetupScreenState extends State<SetupScreen> {
     _toast(k - 1 >= 1
         ? 'Excluded — setup now has ${k - 1} stage${k - 1 == 1 ? '' : 's'}.'
         : 'Excluded down to the salt/pepper text (no point stages).');
+  }
+
+  /// Exclude the current orbit stage and every deeper one (the `X` hotkey while
+  /// building the orbit). Keeps Stages 0..k-1 and lands on the new terminal
+  /// (k-1); Stage 0 (the σ root) cannot be excluded. The deeper `o_i`/`K_i` and
+  /// their placed points are wiped ([_invalidateDeeperThan]).
+  Future<void> _truncateOrbit() async {
+    final int k = _orbitStage;
+    if (k < 1) {
+      _sounds.play(UiSound.deny);
+      _toast('Stage 0 is the orbit root — it cannot be excluded.');
+      return;
+    }
+    final bool ok = await _consoleConfirm(
+      message: 'Exclude Stage $k and every stage below it? The orbit keeps '
+          'Stages 0–${k - 1}, whose K becomes the wallet key. This cannot be '
+          'undone.',
+      confirmLabel: 'Exclude',
+    );
+    if (!ok || !mounted) return;
+    setState(() {
+      _invalidateDeeperThan(k - 1); // wipe stage k and every deeper stage
+      _orbitStage = k - 1;
+      _editPointMode = false;
+      _boardImportSlot = null;
+      _boardIslands = const <CanvasIsland>[];
+      _boardDecoCache.clear();
+      _boardCanonicalView = false;
+      _boardKey = '';
+    });
+    _recenter();
+    _sounds.play(UiSound.undo);
+    _toast('Excluded — the orbit now ends at Stage ${k - 1}.');
   }
 
   /// The blind BIP39 seed-phrase copy. Operates on whatever has been recalled so
