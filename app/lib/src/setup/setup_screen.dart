@@ -15,6 +15,8 @@ import 'package:qr/qr.dart' as qr;
 import '../core/encoding_constants.dart';
 import '../core/great_wall_core.dart';
 import '../core/namtso_harvester.dart';
+import '../core/orbit_protocol.dart';
+import '../core/stage_params.dart';
 import '../ffi/core_bindings.dart';
 import 'desktop_qr_scanner.dart';
 import 'setup_controller.dart';
@@ -263,6 +265,19 @@ class _SetupScreenState extends State<SetupScreen> {
       (_hasSession ? _setup.displayStageIndex : 0)
           .clamp(0, SetupController.maxPointStages);
 
+  // --- P5: stage-0 orbit board render cache ---------------------------------
+  // Stage 0's fractal slots (#j≥1) render the real board `θ_0_(j-1)` derived
+  // from σ → o₀. The authoritative u64 reservoirs ride `widget.core.source`
+  // (stage_params.dart); [_boardParams] is the display-proxy the canvas uses
+  // only to trigger repaints. Both are cached, keyed by [_boardKey] = "σ#slot",
+  // so panning/zooming (which rebuilds this screen) does not re-run the θ hash
+  // or force a needless canvas repaint. Only ever populated at stage 0, where
+  // the legacy controller leaves the render reservoirs free (stage 0 is its
+  // text stage) — so there is no clash with the deep-stage `_applyReservoirs`.
+  StageParameters? _boardParams;
+  StageReservoirs? _boardReservoirs;
+  String _boardKey = '';
+
   /// A confirmation awaiting an inline answer in the console (replaces modal
   /// dialogs). Resolved by the console's action buttons.
   _ConsolePrompt? _prompt;
@@ -441,6 +456,11 @@ class _SetupScreenState extends State<SetupScreen> {
     }
     // Kill any in-flight Namtso harvest so it can't outlive the screen.
     _harvestSession?.cancel();
+    // Drop any stage-0 orbit board reservoirs we pointed the shared render
+    // source at, so no fractal state outlives this screen.
+    widget.core.source.reservoirs = null;
+    widget.core.leafSource.reservoirs = null;
+    _boardReservoirs?.clear();
     _sigmaCtrl.dispose();
     _explorerCtrl.dispose();
     _setup.removeListener(_onSetupChanged);
@@ -584,16 +604,18 @@ class _SetupScreenState extends State<SetupScreen> {
                     child: Stack(
                       children: <Widget>[
                         // Slot #0 is the salt (Namtso σ at stage 0; retirement
-                        // placeholder at stage i>0). Other slots show the stage's
-                        // fractal (or the legacy salt/pepper panel for stage 0
-                        // until its per-board θ_0_j fractals are wired with the
-                        // orbit protocol, P5).
+                        // placeholder at stage i>0). Fractal slots (#j≥1) at
+                        // stage 0 render the real orbit board θ_0_(j-1) (P5);
+                        // deep-stage fractal slots still use the legacy chain
+                        // canvas until the orbit stage-advance lands.
                         Positioned.fill(
                           child: _slotIndex == 0
                               ? _saltSlotPanel()
-                              : (_setup.isTextStage
-                                  ? _textStagePanel()
-                                  : _canvas()),
+                              : (_activeStage == 0
+                                  ? _orbitBoardPanel(_slotIndex)
+                                  : (_setup.isTextStage
+                                      ? _textStagePanel()
+                                      : _canvas())),
                         ),
                         if (_busy) Positioned.fill(child: _progressOverlay()),
                         if (_selectMode && !_setup.isTextStage)
@@ -923,8 +945,9 @@ class _SetupScreenState extends State<SetupScreen> {
             Text(
               sigma.isEmpty
                   ? 'No σ yet.'
-                  : 'σ set (${sigma.length ~/ 2} bytes). Wiring σ → o₀ into the '
-                      'derivation comes with the orbit protocol step (P5).',
+                  : 'σ set (${sigma.length ~/ 2} bytes) → orbit root o₀. The '
+                      'fractal slots (1..) now render this stage’s boards θ₀,ⱼ; '
+                      'point placement + Kᵢ completion land in the next P5 step.',
               style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
             ),
           ],
@@ -1436,6 +1459,112 @@ class _SetupScreenState extends State<SetupScreen> {
             }
           : null,
     );
+  }
+
+  /// Stage-0 fractal slot (`#j≥1`): the real orbit board `θ_0_(j-1)` derived
+  /// from σ → o₀. Renders read-only for now — placement (tap to encode a point)
+  /// and the Shamir/`K_0` completion land in the next P5 slices, together with
+  /// the deep stages (which still ride the legacy chain canvas until the orbit
+  /// stage-advance is wired). When σ is unset/invalid the board cannot be
+  /// derived, so a short "set σ first" panel is shown instead.
+  Widget _orbitBoardPanel(int slot) {
+    final StageParameters? bp = _stage0BoardParams(slot);
+    if (bp == null) return _boardNeedsSigmaPanel(slot);
+    return FractalCanvas(
+      source: widget.core.source,
+      controller: _viewport,
+      palette: Palette.classicWithHue(_hue),
+      brightness: _brightness,
+      sounds: _sounds,
+      stage: Stage.stage2,
+      stageParameters: bp,
+      maxIterations: _renderMaxIter,
+      overlays: CanvasOverlays.empty,
+      semanticLabel: 'Orbit fractal board (stage 0, slot $slot)',
+      // Read-only in this slice: placement is wired in a later P5 step.
+      onSelect: null,
+    );
+  }
+
+  /// Derive stage-0 board `θ_0_(slot-1)` from the current σ, point the render
+  /// source at its authoritative u64 reservoirs, and return the display-proxy
+  /// [StageParameters] the canvas repaints on. Returns null when σ is unset or
+  /// not valid hex. Cheap `orbitRoot`/`theta` hashes only run when the (σ, slot)
+  /// key changes; otherwise the cached reservoirs are re-pointed (a plain field
+  /// write, in case a deep-stage visit overwrote them) and the cached params are
+  /// returned unchanged so the canvas does not needlessly repaint.
+  StageParameters? _stage0BoardParams(int slot) {
+    final String raw = _sigmaCtrl.text.trim();
+    final String key = '$raw#$slot';
+    if (key != _boardKey) {
+      _boardKey = key;
+      final Uint8List? sigma = _parseHex(raw);
+      if (sigma == null || sigma.isEmpty) {
+        _boardReservoirs = null;
+        _boardParams = null;
+      } else {
+        final Uint8List o0 = widget.core.orbitRoot(sigma);
+        final ({int o, int p, int q}) prm =
+            OrbitProtocol(widget.core).orbitParams(o0, slot - 1);
+        final StageReservoirs res =
+            StageReservoirs(o: prm.o, p: prm.p, q: prm.q);
+        final ({double o, double p, double q}) dk = res.displayKey;
+        _boardReservoirs = res;
+        _boardParams = StageParameters(o: dk.o, p: dk.p, q: dk.q);
+      }
+    }
+    // Re-point the render source every build (cheap): a deep-stage visit may
+    // have set its own reservoirs since this board was last shown. Safe here
+    // because this only runs at stage 0, where the legacy controller renders no
+    // fractal of its own.
+    widget.core.source.reservoirs = _boardReservoirs;
+    widget.core.leafSource.reservoirs = _boardReservoirs;
+    return _boardParams;
+  }
+
+  /// Shown for a stage-0 fractal slot before σ exists: the board is `θ_0_(j-1)`,
+  /// derived from σ → o₀, so it cannot render until σ is set in slot 0.
+  Widget _boardNeedsSigmaPanel(int slot) {
+    final ThemeData theme = Theme.of(context);
+    return ColoredBox(
+      color: theme.colorScheme.surface,
+      child: Align(
+        alignment: const Alignment(0, -0.3),
+        child: Padding(
+          padding: const EdgeInsets.all(32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              const Icon(Icons.blur_on, size: 48),
+              const SizedBox(height: 16),
+              Text('Stage 0 · slot $slot — fractal board',
+                  style: theme.textTheme.titleLarge),
+              const SizedBox(height: 8),
+              Text(
+                'This board is derived from σ → o₀. Set σ in slot 0 (the Namtso '
+                'salt) first; the fractal appears here once σ is valid hex.',
+                textAlign: TextAlign.center,
+                style: theme.textTheme.bodyMedium,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Parse an even-length hex string (whitespace ignored) to bytes; null on any
+  /// malformed input. Ported from the orbit setup screen's σ parser.
+  static Uint8List? _parseHex(String s) {
+    final String h = s.replaceAll(RegExp(r'\s'), '');
+    if (h.isEmpty || h.length.isOdd) return null;
+    final Uint8List out = Uint8List(h.length ~/ 2);
+    for (int i = 0; i < out.length; i++) {
+      final int? b = int.tryParse(h.substring(i * 2, i * 2 + 2), radix: 16);
+      if (b == null) return null;
+      out[i] = b;
+    }
+    return out;
   }
 
   /// The left-pane panel shown for Stage 0 (the salt/pepper text): there is no
