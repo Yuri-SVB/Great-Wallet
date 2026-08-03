@@ -1191,6 +1191,8 @@ class _SetupScreenState extends State<SetupScreen> {
     if (event.logicalKey == LogicalKeyboardKey.keyN) {
       if (_expandTarget != null) {
         _expandNew();
+      } else if (_placeableBoardSlot) {
+        _generatePrimary(_slotIndex);
       } else if (_setup.canEditCurrentPoint) {
         _changePointGenerated();
       } else {
@@ -1567,6 +1569,25 @@ class _SetupScreenState extends State<SetupScreen> {
     return true;
   }
 
+  /// Generate a random 32-bit point for slot [slot] (the app picks the entropy),
+  /// encoding it to a real board point — the board peer of
+  /// [_changePointGenerated] (`N`).
+  void _generatePrimary(int slot) {
+    final ({int o, int p, int q})? prm = _boardPrm(slot);
+    if (prm == null) {
+      _sounds.play(UiSound.denyBlocked);
+      _toast('Set σ in slot 0 first.');
+      return;
+    }
+    final List<int> bits = Entropy.randomBits(32);
+    final EncodedPoint pt = widget.core
+        .encodeStage(List<int>.of(bits), o: prm.o, p: prm.p, q: prm.q)
+        .first;
+    _setPrimary(slot, bits, (reRaw: pt.reRaw, imRaw: pt.imRaw));
+    Entropy.wipe(bits);
+    _sounds.play(UiSound.selectPoint);
+  }
+
   /// Record slot [slot]'s primary chunk + point (copying [bits]) and re-derive
   /// the extra shares from the (possibly now complete) primaries.
   void _setPrimary(int slot, List<int> bits, ({int reRaw, int imRaw}) point) {
@@ -1671,8 +1692,8 @@ class _SetupScreenState extends State<SetupScreen> {
     } else {
       body = Text(
         placed
-            ? 'Point placed. R to pick a new point on the fractal.'
-            : 'R to place this point — then click a leaf on the fractal.',
+            ? 'Point placed. R to pick a new one on the fractal · N to regenerate.'
+            : 'R to place (click a leaf) · N for a random point.',
         style: theme.textTheme.bodySmall,
       );
     }
