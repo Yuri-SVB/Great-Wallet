@@ -229,6 +229,16 @@ class _SetupScreenState extends State<SetupScreen> {
   /// console so the user can dismiss either alone.
   bool _stageBarHidden = false;
 
+  /// The selected **secondary slot** within the active stage (the orbit builder's
+  /// lower tab row, `0..`[_maxSlot]). Slot `#0` is the salt; `#j≥1` are the
+  /// fractals (their content is wired in later phases —
+  /// next-steps/orbit-setup-tab-ui-pathway.md, P2+). Selected by a plain digit;
+  /// stage selection moved to `Alt`+digit.
+  int _slotIndex = 0;
+
+  /// Highest secondary slot index — a fixed row of seven tabs (`0..6`).
+  static const int _maxSlot = 6;
+
   /// A confirmation awaiting an inline answer in the console (replaces modal
   /// dialogs). Resolved by the console's action buttons.
   _ConsolePrompt? _prompt;
@@ -582,7 +592,15 @@ class _SetupScreenState extends State<SetupScreen> {
                             top: 0,
                             left: 0,
                             right: 0,
-                            child: _stageTabs(),
+                            // Stage bar (Alt+digit) with the secondary slot bar
+                            // (plain digit) stacked directly beneath it.
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: <Widget>[
+                                _stageTabs(),
+                                _slotTabs(),
+                              ],
+                            ),
                           ),
                         // The console always floats over the foot of the viewer
                         // (expanded or as a thin minimized bar) — it never takes
@@ -614,6 +632,58 @@ class _SetupScreenState extends State<SetupScreen> {
   /// setup's stage count, not yet derived, or before any session — stay visible
   /// but greyed out and inert. Tapping a reachable tab focuses it (the same as
   /// pressing its number key).
+  /// Select a **secondary slot** within the active stage (the lower tab row).
+  /// Out-of-range digits give the usual blocked cue. Content per slot is wired
+  /// in later phases; for now this just moves the selection.
+  void _selectSlot(int i) {
+    if (i < 0 || i > _maxSlot) {
+      _sounds.play(UiSound.denyBlocked);
+      return;
+    }
+    if (i == _slotIndex) return;
+    _sounds.play(UiSound.navStage);
+    setState(() => _slotIndex = i);
+  }
+
+  /// The **secondary slot tabs** — a fixed row of seven numbered tabs (`0..6`)
+  /// directly beneath the stage bar. Slot `#0` is the salt; `#j≥1` are the
+  /// fractals. Reuses [_StageTab] so it shares the stage bar's stable layout;
+  /// per-slot content lands in P2+ (this row is navigation only for now).
+  Widget _slotTabs() {
+    return Material(
+      type: MaterialType.transparency,
+      child: SizedBox(
+        height: 44,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 6),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              for (int i = 0; i <= _maxSlot; i++)
+                Expanded(
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 3),
+                    child: _StageTab(
+                      index: i,
+                      inSetup: true,
+                      selected: _hasSession && i == _slotIndex,
+                      available: _hasSession,
+                      deriving: false,
+                      progress: 0,
+                      tooltip: i == 0
+                          ? 'Slot 0 — salt'
+                          : 'Slot $i — fractal (wired in P3)',
+                      onTap: _hasSession ? () => _selectSlot(i) : null,
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _stageTabs() {
     const int maxTab = SetupController.maxPointStages; // 0..4 → five fixed tabs
     final int current = _setup.displayStageIndex;
@@ -725,6 +795,13 @@ class _SetupScreenState extends State<SetupScreen> {
       // focuses the raw derivation-steps field).
       if (event.logicalKey == LogicalKeyboardKey.keyD) {
         _openCalibrationDialog();
+        return KeyEventResult.handled;
+      }
+      // Alt+digit — select that **stage** (the upper/main tabs). Stage selection
+      // moved to Alt so plain digits can drive the secondary slot tabs.
+      final int? altStage = _digitKeys[event.logicalKey];
+      if (altStage != null) {
+        _selectStage(altStage);
         return KeyEventResult.handled;
       }
     }
@@ -862,10 +939,11 @@ class _SetupScreenState extends State<SetupScreen> {
         return KeyEventResult.handled;
       }
     }
-    // 0–4 — select that stage: focus it, or derive it if it is next.
+    // 0–6 — select that **secondary slot** within the active stage. (Stage
+    // selection is Alt+digit; the `9` bar toggle is handled above.)
     final int? digit = _digitKeys[event.logicalKey];
     if (digit != null) {
-      _selectStage(digit);
+      _selectSlot(digit);
       return KeyEventResult.handled;
     }
     return KeyEventResult.ignored;
@@ -1300,7 +1378,8 @@ class _SetupScreenState extends State<SetupScreen> {
     'F1 manual · F2 Setup · F3 Train · F4 Accelerate · F5 Inherit',
     'Esc  return to the fractal (leave a text field) · Tab cycles fields',
     'M  console   9  stage bar   Z  reset (asks first)',
-    '0–4  go to that stage (recenters); press again to zoom to its point',
+    'Alt+0–4  go to that stage (recenters); press again to zoom to its point',
+    '0–6  select the secondary slot (0 = salt · 1–6 = fractals)',
     'N / I / R  New seed / Import / Recall (config) · on a stage: change its point',
     'I import = BIP39 words · Alt+I import = hex (config & point edit alike)',
     'Click/press a ghost slot past the last stage to grow the setup (N/I/R)',
