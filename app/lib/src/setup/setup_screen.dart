@@ -733,7 +733,15 @@ class _SetupScreenState extends State<SetupScreen> {
       _sounds.play(UiSound.denyBlocked);
       return;
     }
-    if (i == _slotIndex) return;
+    if (i == _slotIndex) {
+      // Re-selecting the current board slot resets its view (position, zoom and
+      // brightness) — the recenter that stage navigation does on arrival.
+      if (_isBoardSlot) {
+        _sounds.play(UiSound.navZoom);
+        _recenter();
+      }
+      return;
+    }
     if (_boardImportSlot != null) _pointImport.clear();
     _sounds.play(UiSound.navStage);
     setState(() {
@@ -742,6 +750,9 @@ class _SetupScreenState extends State<SetupScreen> {
       _editPointMode = false;
       _boardImportSlot = null;
     });
+    // Landing on a board resets the view, so each fractal opens centred at the
+    // default zoom/brightness (the same recenter stage selection performs).
+    if (_isBoardSlot) _recenter();
   }
 
   /// The **secondary slot tabs** — a fixed row of seven numbered tabs (`0..6`)
@@ -1743,9 +1754,9 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   /// Informational panel section for the active stage-0 board: the slot's role,
-  /// its placed/derived state, and the hotkeys that set the point — routed
-  /// through the existing point-entry mechanisms, so there are no bespoke
-  /// buttons. (`R` manual click here; `N`/`I` join in the next commits.)
+  /// its placed/derived state, the hotkeys that set the point (`R` manual click,
+  /// `N` random, `I`/`Alt+I` import) — routed through the existing point-entry
+  /// mechanisms, so there are no bespoke buttons — and the reset-view gesture.
   List<Widget> _boardStatus() {
     final int slot = _slotIndex;
     final int r0 = _requiredFractals[0];
@@ -1782,6 +1793,9 @@ class _SetupScreenState extends State<SetupScreen> {
           style: theme.textTheme.titleMedium),
       const SizedBox(height: 4),
       body,
+      const SizedBox(height: 6),
+      Text('Press $slot again to reset the view (position · zoom · brightness).',
+          style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor)),
     ];
   }
 
