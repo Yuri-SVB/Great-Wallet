@@ -14,6 +14,7 @@ import 'package:qr/qr.dart' as qr;
 
 import '../core/encoding_constants.dart';
 import '../core/great_wall_core.dart';
+import '../core/namtso_harvester.dart';
 import '../ffi/core_bindings.dart';
 import 'desktop_qr_scanner.dart';
 import 'setup_controller.dart';
@@ -239,6 +240,16 @@ class _SetupScreenState extends State<SetupScreen> {
   /// Highest secondary slot index — a fixed row of seven tabs (`0..6`).
   static const int _maxSlot = 6;
 
+  // --- salt slot (`#0`) — Namtso σ harvest (stage 0) / retirement (stage i>0).
+  // The salt slot's input; wiring σ → the orbit root o₀ into the derivation is a
+  // later phase (P5). Ported from the orbit setup screen's harvest panel.
+  bool _harvesting = false;
+  String? _harvestNote;
+  DateTime? _harvestedDate;
+  HarvestSession? _harvestSession;
+  final TextEditingController _sigmaCtrl = TextEditingController();
+  final TextEditingController _explorerCtrl = TextEditingController();
+
   /// A confirmation awaiting an inline answer in the console (replaces modal
   /// dialogs). Resolved by the console's action buttons.
   _ConsolePrompt? _prompt;
@@ -415,6 +426,10 @@ class _SetupScreenState extends State<SetupScreen> {
     if (_prompt != null && !_prompt!.completer.isCompleted) {
       _prompt!.completer.complete(false);
     }
+    // Kill any in-flight Namtso harvest so it can't outlive the screen.
+    _harvestSession?.cancel();
+    _sigmaCtrl.dispose();
+    _explorerCtrl.dispose();
     _setup.removeListener(_onSetupChanged);
     _setup.dispose();
     _viewport.dispose();
@@ -555,11 +570,16 @@ class _SetupScreenState extends State<SetupScreen> {
                     onPointerDown: (_) => _hotkeys.requestFocus(),
                     child: Stack(
                       children: <Widget>[
-                        // Stage 0 has no fractal/point — show the salt/pepper
-                        // panel.
+                        // Slot #0 is the salt (Namtso σ at stage 0; retirement
+                        // placeholder at stage i>0). Other slots show the stage's
+                        // fractal (or the legacy salt/pepper panel for stage 0
+                        // until its fractal slots are wired in P3).
                         Positioned.fill(
-                          child:
-                              _setup.isTextStage ? _textStagePanel() : _canvas(),
+                          child: _slotIndex == 0
+                              ? _saltSlotPanel()
+                              : (_setup.isTextStage
+                                  ? _textStagePanel()
+                                  : _canvas()),
                         ),
                         if (_busy) Positioned.fill(child: _progressOverlay()),
                         if (_selectMode && !_setup.isTextStage)
@@ -666,17 +686,210 @@ class _SetupScreenState extends State<SetupScreen> {
                     child: _StageTab(
                       index: i,
                       inSetup: true,
-                      selected: _hasSession && i == _slotIndex,
-                      available: _hasSession,
+                      selected: i == _slotIndex,
+                      // Always navigable: the salt slot (#0) is usable even
+                      // before a session (harvest σ first); the fractal slots
+                      // just show the stage's current base view.
+                      available: true,
                       deriving: false,
                       progress: 0,
                       tooltip: i == 0
-                          ? 'Slot 0 — salt'
+                          ? 'Slot 0 — salt (σ / retirement)'
                           : 'Slot $i — fractal (wired in P3)',
-                      onTap: _hasSession ? () => _selectSlot(i) : null,
+                      onTap: () => _selectSlot(i),
                     ),
                   ),
                 ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // --- salt slot (`#0`) content ---------------------------------------------
+
+  /// The salt slot's panel: Namtso σ harvest at stage 0, or the (future)
+  /// stage-retirement placeholder at stage `i>0`.
+  Widget _saltSlotPanel() {
+    final int stage = _hasSession ? _setup.displayStageIndex : 0;
+    return stage > 0 ? _retirementPlaceholder(stage) : _namtsoSaltPanel();
+  }
+
+  /// Pick a date and harvest σ from the Namtso CLI (desktop); fills the σ field.
+  /// Ported from the orbit setup screen. Cancellable and timeout-bounded.
+  Future<void> _harvestFromDate() async {
+    final DateTime now = DateTime.now();
+    final DateTime today = DateTime(now.year, now.month, now.day);
+    final DateTime? picked = await showDatePicker(
+      context: context,
+      initialDate: _harvestedDate ?? today,
+      firstDate: DateTime(2009, 1, 3), // Bitcoin genesis
+      lastDate: today,
+      helpText: 'Harvest σ from the timechain at a date',
+    );
+    if (picked == null) return;
+    setState(() {
+      _harvesting = true;
+      _harvestNote = null;
+    });
+    final HarvestSession session = const NamtsoHarvester()
+        .start(date: picked, explorer: _explorerCtrl.text.trim());
+    _harvestSession = session;
+    try {
+      final String sigma = await session.result;
+      if (!mounted) return;
+      setState(() {
+        _sigmaCtrl.text = sigma;
+        _harvestedDate = picked;
+        _harvestNote = 'σ harvested for ${_isoDate(picked)} '
+            '(${sigma.length ~/ 2} bytes).';
+      });
+    } on NamtsoCancelled {
+      if (mounted) setState(() => _harvestNote = 'Harvest cancelled.');
+    } on NamtsoUnavailable catch (e) {
+      if (mounted) {
+        setState(() => _harvestNote = 'Namtso unavailable: ${e.message} — '
+            'build it with app/native/build_namtso.sh, or paste σ below.');
+      }
+    } on NamtsoError catch (e) {
+      if (mounted) setState(() => _harvestNote = e.message);
+    } finally {
+      _harvestSession = null;
+      if (mounted) setState(() => _harvesting = false);
+    }
+  }
+
+  void _cancelHarvest() => _harvestSession?.cancel();
+
+  static String _isoDate(DateTime d) => '${d.year.toString().padLeft(4, '0')}-'
+      '${d.month.toString().padLeft(2, '0')}-'
+      '${d.day.toString().padLeft(2, '0')}';
+
+  /// Stage-0 salt slot: the Namtso σ harvest. σ → the orbit root `o₀`; the actual
+  /// derivation wiring lands with the orbit protocol step (P5).
+  Widget _namtsoSaltPanel() {
+    final ThemeData theme = Theme.of(context);
+    final String sigma = _sigmaCtrl.text.trim();
+    return ColoredBox(
+      color: theme.colorScheme.surface,
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.all(32),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            Row(
+              children: <Widget>[
+                const Icon(Icons.calendar_month, size: 32),
+                const SizedBox(width: 12),
+                Text('Stage 0 · slot 0 — salt (σ)',
+                    style: theme.textTheme.titleLarge),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'The Namtso salt: a memorable date → σ (1024 bits derived from '
+              'Bitcoin block headers) → the orbit root o₀. σ is public; its job '
+              'is to rule out precomputation, not secrecy.',
+              style: theme.textTheme.bodyMedium,
+            ),
+            const SizedBox(height: 20),
+            if (NamtsoHarvester.isSupported)
+              Row(
+                children: <Widget>[
+                  OutlinedButton.icon(
+                    onPressed: _harvesting ? null : _harvestFromDate,
+                    icon: const Icon(Icons.calendar_month),
+                    label: const Text('Harvest from date'),
+                  ),
+                  const SizedBox(width: 12),
+                  if (_harvesting) ...<Widget>[
+                    const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2)),
+                    const SizedBox(width: 12),
+                    Text('Fetching headers…', style: theme.textTheme.bodySmall),
+                    const SizedBox(width: 12),
+                    TextButton(
+                        onPressed: _cancelHarvest,
+                        child: const Text('Cancel')),
+                  ],
+                ],
+              )
+            else
+              Text('Namtso harvesting needs a desktop platform; paste σ below.',
+                  style: theme.textTheme.bodySmall),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _explorerCtrl,
+              enabled: !_harvesting,
+              style: theme.textTheme.bodySmall,
+              decoration: const InputDecoration(
+                border: OutlineInputBorder(),
+                isDense: true,
+                labelText: 'Esplora URLs (advanced, optional)',
+                hintText: 'https://esplora.example/api, … — blank = defaults',
+              ),
+            ),
+            if (_harvestNote != null) ...<Widget>[
+              const SizedBox(height: 10),
+              Text(_harvestNote!, style: theme.textTheme.bodySmall),
+            ],
+            const SizedBox(height: 16),
+            Text('σ (hex)', style: theme.textTheme.labelLarge),
+            const SizedBox(height: 4),
+            TextField(
+              controller: _sigmaCtrl,
+              maxLines: 2,
+              style: theme.textTheme.bodySmall,
+              onChanged: (_) => setState(() {}),
+              decoration: const InputDecoration(
+                border: OutlineInputBorder(),
+                isDense: true,
+                hintText: 'harvest a date, or paste σ hex',
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              sigma.isEmpty
+                  ? 'No σ yet.'
+                  : 'σ set (${sigma.length ~/ 2} bytes). Wiring σ → o₀ into the '
+                      'derivation comes with the orbit protocol step (P5).',
+              style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Stage `i>0` salt slot: the future retirement feature (bury `o_i` on-chain
+  /// to retire the stages below). Disabled placeholder for now.
+  Widget _retirementPlaceholder(int stage) {
+    final ThemeData theme = Theme.of(context);
+    return ColoredBox(
+      color: theme.colorScheme.surface,
+      child: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              Icon(Icons.lock_clock, size: 40, color: theme.disabledColor),
+              const SizedBox(height: 12),
+              Text('Stage $stage · slot 0 — retirement',
+                  style: theme.textTheme.titleLarge),
+              const SizedBox(height: 8),
+              Text(
+                'Retire the stages below this one by burying o_$stage on-chain '
+                '(burial date + identifier as the substitute salt) — a future, '
+                'irreversible action. Coming soon.',
+                textAlign: TextAlign.center,
+                style: theme.textTheme.bodyMedium
+                    ?.copyWith(color: theme.hintColor),
+              ),
             ],
           ),
         ),
