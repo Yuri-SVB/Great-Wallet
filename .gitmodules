@@ -10,3 +10,6 @@
 [submodule "great-wall-ux"]
 	path = great-wall-ux
 	url = git@github.com-yuri-svb:yuri-svb/great-wall-ux.git
+[submodule "namtso-the-sacred-salt"]
+	path = namtso-the-sacred-salt
+	url = git@github.com:yuri-svb/namtso-the-sacred-salt.git

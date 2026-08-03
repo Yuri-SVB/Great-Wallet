@@ -298,6 +298,75 @@ class GreatWallCore {
     return completer.future;
   }
 
+  // ---------------------------------------------------------------------------
+  // Orbit protocol (0.4.0) — coercion-resistant per-stage derivation.
+  //
+  // These wrap the engine's orbit primitives (core_bindings.dart `orbit*` /
+  // `shamir*` / `setupTier*`), the Dart peers of protocol.py. The cheap ones
+  // (H = SHA-256, GF(2^32) interpolation, tier lookup) run inline; the single
+  // memory-hard step (`advanceOrbit`, H* = Argon2d) runs in a worker isolate so
+  // it never stalls the UI isolate — exactly like [argon2idMaster].
+  // ---------------------------------------------------------------------------
+
+  /// `o_0 = H(sigma)` — the orbit root from the Namtso salt [sigma].
+  Uint8List orbitRoot(Uint8List sigma) => bindings.orbitRoot(sigma);
+
+  /// `theta_i_j = H(o_i ‖ j)` — board `j`'s fractal-parameter digest at [oI].
+  Uint8List theta(Uint8List oI, int j) => bindings.theta(oI, j);
+
+  /// `K_i = H(o_i ‖ Sh_i)` — the per-stage master secret (cheap `H`). [sh] is the
+  /// serialized Shamir polynomial ([GreatWallCoreBindings.shToBytes]).
+  Uint8List masterSecret(Uint8List oI, Uint8List sh) =>
+      bindings.masterSecret(oI, sh);
+
+  /// Interpolate the full Shamir polynomial `Sh` (subset-invariant) over
+  /// GF(2^32) from the `t` fractal points `(xs, ys)`; returns its coefficients.
+  List<int> shamirInterp(List<int> xs, List<int> ys) =>
+      bindings.shamirInterp(xs, ys);
+
+  /// Canonical per-stage thresholds `t_i` for a setup [level] (index 0 = stage 0,
+  /// `1..N` the deep stages); `[]` for an invalid level.
+  List<int> setupTierThresholds(int level) =>
+      bindings.setupTierThresholds(level);
+
+  /// Whether a setup [level] is the substandard entry tier (Setup 1, 64-bit deep
+  /// stage). The UX MUST surface this loudly wherever Setup 1 is offered.
+  bool setupTierSubstandard(int level) => bindings.setupTierSubstandard(level);
+
+  /// One orbit step — `K_i = H(o_i ‖ Sh_i)` then `o_{i+1} = H*(K_i)` over [steps]
+  /// (`D`) memory-hard Argon2d passes at [profile] — run in a short-lived worker
+  /// isolate so the >= 1 GiB/pass blocking call never stalls the UI isolate.
+  /// Returns `(k, next)`, each 32 bytes. Not cancellable (a single pass cannot be
+  /// preempted mid-call), matching [argon2idMaster].
+  Future<({Uint8List k, Uint8List next})> advanceOrbit(
+    Uint8List oI,
+    Uint8List sh, {
+    int steps = 1,
+    Argon2Profile profile = Argon2Profile.basic,
+  }) async {
+    final ReceivePort port = ReceivePort();
+    final Completer<({Uint8List k, Uint8List next})> completer =
+        Completer<({Uint8List k, Uint8List next})>();
+    await Isolate.spawn<(SendPort, Uint8List, Uint8List, int, int)>(
+      _orbitAdvanceIsolateEntry,
+      (port.sendPort, oI, sh, steps, profile.value),
+      onError: port.sendPort,
+      errorsAreFatal: true,
+    );
+    port.listen((dynamic msg) {
+      if (msg is (Uint8List, Uint8List)) {
+        if (!completer.isCompleted) {
+          completer.complete((k: msg.$1, next: msg.$2));
+        }
+      } else if (!completer.isCompleted) {
+        // Error payload (from the isolate body or onError): [message, stack].
+        completer.completeError(StateError('Orbit advance failed'));
+      }
+      port.close();
+    });
+    return completer.future;
+  }
+
   /// Start a **cancellable** on-device Argon2 micro-benchmark at [profile] in a
   /// worker isolate (heavy, blocking), returning an [Argon2BenchJob] whose
   /// `result` is the **median** seconds per pass (one pass == one derivation
@@ -392,6 +461,19 @@ void _argon2idMasterIsolateEntry((SendPort, Uint8List, int) args) {
   final GreatWallCoreBindings bindings = GreatWallCoreBindings.open();
   final Uint8List out = bindings.argon2idMaster(message, outLen: outLen);
   send.send(out);
+}
+
+/// Worker-isolate entry: open the engine and run one orbit step, sending back
+/// `(K_i, o_next)`. The engine zeroizes the raw `{o_i, Sh_i}` copies before the
+/// memory-hard advance (orbit.rs `orbit_step`).
+void _orbitAdvanceIsolateEntry((SendPort, Uint8List, Uint8List, int, int) args) {
+  final (SendPort send, Uint8List oI, Uint8List sh, int steps, int profileValue) =
+      args;
+  final Argon2Profile profile = Argon2Profile.values[profileValue];
+  final GreatWallCoreBindings bindings = GreatWallCoreBindings.open();
+  final ({Uint8List k, Uint8List next}) r =
+      bindings.orbitAdvance(oI, sh, steps, profile);
+  send.send((r.k, r.next));
 }
 
 /// Worker-isolate entry: open the engine, run the Argon2 loop, and after each

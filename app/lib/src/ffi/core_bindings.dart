@@ -6,6 +6,11 @@ import 'package:ffi/ffi.dart';
 import 'fixed.dart';
 import 'library_loader.dart';
 
+/// Length in bytes of an orbit point `o_i` (and of `theta`, `K_i`) — a SHA-256
+/// digest. Mirrors `ORBIT_POINT_LEN` in the engine (orbit.rs) and
+/// `ORBIT_POINT_BYTES` in the Python bridge (burning_ship_engine.py).
+const int kOrbitPointLen = 32;
+
 /// Raw `dart:ffi` binding to great-wall-core's C ABI
 /// (great-wall-core/burning_ship/rust_engine/src/ffi.rs).
 ///
@@ -104,6 +109,23 @@ class GreatWallCoreBindings {
             'bs_salt_pepper_canonicalize');
     _chainInput =
         _lib.lookupFunction<_ChainInputC, _ChainInputDart>('bs_chain_input');
+    _orbitRoot =
+        _lib.lookupFunction<_OrbitRootC, _OrbitRootDart>('bs_orbit_root');
+    _theta = _lib.lookupFunction<_ThetaC, _ThetaDart>('bs_theta');
+    _masterSecret =
+        _lib.lookupFunction<_MasterSecretC, _MasterSecretDart>('bs_master_secret');
+    _orbitAdvance =
+        _lib.lookupFunction<_OrbitAdvanceC, _OrbitAdvanceDart>('bs_orbit_advance');
+    _shamirInterp =
+        _lib.lookupFunction<_ShamirInterpC, _ShamirInterpDart>('bs_shamir_interp');
+    _setupTierThresholds =
+        _lib.lookupFunction<_SetupTierThresholdsC, _SetupTierThresholdsDart>(
+      'bs_setup_tier_thresholds',
+    );
+    _setupTierSubstandard =
+        _lib.lookupFunction<_SetupTierSubstandardC, _SetupTierSubstandardDart>(
+      'bs_setup_tier_substandard',
+    );
     _encodeParams =
         _lib.lookupFunction<_EncodeParamsC, _EncodeParamsDart>('bs_encode_params');
     _encodeArea =
@@ -158,6 +180,13 @@ class GreatWallCoreBindings {
   late final _Argon2idMasterDart _argon2idMaster;
   late final _SaltPepperCanonicalizeDart _saltPepperCanonicalize;
   late final _ChainInputDart _chainInput;
+  late final _OrbitRootDart _orbitRoot;
+  late final _ThetaDart _theta;
+  late final _MasterSecretDart _masterSecret;
+  late final _OrbitAdvanceDart _orbitAdvance;
+  late final _ShamirInterpDart _shamirInterp;
+  late final _SetupTierThresholdsDart _setupTierThresholds;
+  late final _SetupTierSubstandardDart _setupTierSubstandard;
   late final _EncodeParamsDart _encodeParams;
   late final _EncodeAreaDart _encodeArea;
   late final _BitsPerPointDart _bitsPerPoint;
@@ -622,6 +651,176 @@ class GreatWallCoreBindings {
     }
   }
 
+  /// Derive the orbit root `o_0 = H(sigma)` (SHA-256) from the Namtso salt
+  /// [sigma] (`bs_orbit_root`). This is the sole seam between Namtso and the
+  /// orbit protocol: the app harvests [sigma] from Namtso (the flat submodule
+  /// `namtso-the-sacred-salt`, via its CLI) and the engine consumes it here —
+  /// great-wall-core never depends on Namtso itself (ARCHITECTURE.md
+  /// §"Submodule Rules": no nested submodules; the core takes a pre-harvested
+  /// sigma). Returns the 32-byte root.
+  ///
+  /// SECURITY: [sigma] is public (a precomputation-ruling-out salt), but the
+  /// returned root seeds the coercion-relevant orbit, so callers zero it after
+  /// use. The input/output buffers here are zeroed and freed on every path.
+  Uint8List orbitRoot(Uint8List sigma) {
+    final Pointer<Uint8> inPtr = calloc<Uint8>(sigma.length);
+    final Pointer<Uint8> outPtr = calloc<Uint8>(32);
+    try {
+      inPtr.asTypedList(sigma.length).setAll(0, sigma);
+      _orbitRoot(inPtr, sigma.length, outPtr);
+      return Uint8List.fromList(outPtr.asTypedList(32));
+    } finally {
+      _zeroAndFree(inPtr, sigma.length);
+      _zeroAndFree(outPtr, 32);
+    }
+  }
+
+  /// `theta_i_j = H(o_i ‖ j)` — the 32-byte fractal-parameter digest of board
+  /// `j` at orbit point [oI] (`bs_theta`). The `(o, p, q)` attribution over this
+  /// digest is applied downstream (see `_orbit_params` in protocol.py); this is
+  /// the same cheap `H` = SHA-256 the Python bridge exposes. [oI] must be 32
+  /// bytes.
+  ///
+  /// SECURITY: [oI] is coercion-relevant (an orbit point). Zeroed before free.
+  Uint8List theta(Uint8List oI, int j) {
+    assert(oI.length == kOrbitPointLen, 'o_i must be 32 bytes');
+    final Pointer<Uint8> oPtr = calloc<Uint8>(kOrbitPointLen);
+    final Pointer<Uint8> outPtr = calloc<Uint8>(32);
+    try {
+      oPtr.asTypedList(kOrbitPointLen).setAll(0, oI);
+      _theta(oPtr, j, outPtr);
+      return Uint8List.fromList(outPtr.asTypedList(32));
+    } finally {
+      _zeroAndFree(oPtr, kOrbitPointLen);
+      _zeroAndFree(outPtr, 32);
+    }
+  }
+
+  /// `K_i = H(o_i ‖ Sh_i)` — the per-stage master secret (`i > 0`), the cheap-`H`
+  /// commitment (`bs_master_secret`). [oI] is the 32-byte orbit point; [sh] is
+  /// the serialized Shamir polynomial ([shToBytes]). Returns 32 bytes.
+  ///
+  /// SECURITY: both inputs and the output are coercion-relevant; every buffer is
+  /// zeroed before free.
+  Uint8List masterSecret(Uint8List oI, Uint8List sh) {
+    assert(oI.length == kOrbitPointLen, 'o_i must be 32 bytes');
+    final Pointer<Uint8> oPtr = calloc<Uint8>(kOrbitPointLen);
+    final int m = sh.isEmpty ? 1 : sh.length;
+    final Pointer<Uint8> shPtr = calloc<Uint8>(m);
+    final Pointer<Uint8> outPtr = calloc<Uint8>(32);
+    try {
+      oPtr.asTypedList(kOrbitPointLen).setAll(0, oI);
+      if (sh.isNotEmpty) shPtr.asTypedList(sh.length).setAll(0, sh);
+      _masterSecret(oPtr, shPtr, sh.length, outPtr);
+      return Uint8List.fromList(outPtr.asTypedList(32));
+    } finally {
+      _zeroAndFree(oPtr, kOrbitPointLen);
+      _zeroAndFree(shPtr, m);
+      _zeroAndFree(outPtr, 32);
+    }
+  }
+
+  /// One orbit step: `K_i = H(o_i ‖ Sh_i)` and `o_{i+1} = H*(K_i)` over [steps]
+  /// (`D`) memory-hard Argon2d passes at [profile] (`bs_orbit_advance`). Returns
+  /// `(k, next)`, each 32 bytes. The engine zeroizes the raw `{o_i, Sh_i}` copies
+  /// before the memory-hard step.
+  ///
+  /// WARNING: this is the heavy, blocking memory-hard call (>= 1 GiB per pass) —
+  /// callers run it off the UI isolate, exactly like [argon2idMaster].
+  ({Uint8List k, Uint8List next}) orbitAdvance(
+    Uint8List oI,
+    Uint8List sh,
+    int steps,
+    Argon2Profile profile,
+  ) {
+    assert(oI.length == kOrbitPointLen, 'o_i must be 32 bytes');
+    final Pointer<Uint8> oPtr = calloc<Uint8>(kOrbitPointLen);
+    final int m = sh.isEmpty ? 1 : sh.length;
+    final Pointer<Uint8> shPtr = calloc<Uint8>(m);
+    final Pointer<Uint8> outK = calloc<Uint8>(32);
+    final Pointer<Uint8> outNext = calloc<Uint8>(32);
+    try {
+      oPtr.asTypedList(kOrbitPointLen).setAll(0, oI);
+      if (sh.isNotEmpty) shPtr.asTypedList(sh.length).setAll(0, sh);
+      _orbitAdvance(oPtr, shPtr, sh.length, steps, profile.value, outK, outNext);
+      return (
+        k: Uint8List.fromList(outK.asTypedList(32)),
+        next: Uint8List.fromList(outNext.asTypedList(32)),
+      );
+    } finally {
+      _zeroAndFree(oPtr, kOrbitPointLen);
+      _zeroAndFree(shPtr, m);
+      _zeroAndFree(outK, 32);
+      _zeroAndFree(outNext, 32);
+    }
+  }
+
+  /// Interpolate the **full** Shamir polynomial `Sh` over GF(2^32) from `t`
+  /// points (`bs_shamir_interp`). [xs]/[ys] are the `t` abscissae/points; returns
+  /// the `t` coefficients (ascending powers). `Sh` is the whole polynomial
+  /// (`t·32` bits) — NOT the constant term `f(0)`; subset-invariance of `Sh` is
+  /// load-bearing (DESIGN.md §"Shamir over the fractal points").
+  List<int> shamirInterp(List<int> xs, List<int> ys) {
+    final int t = xs.length;
+    assert(t == ys.length, 'xs and ys must have equal length');
+    if (t == 0) return const <int>[];
+    final Pointer<Uint32> xsPtr = calloc<Uint32>(t);
+    final Pointer<Uint32> ysPtr = calloc<Uint32>(t);
+    final Pointer<Uint32> outPtr = calloc<Uint32>(t);
+    try {
+      xsPtr.asTypedList(t).setAll(0, xs);
+      ysPtr.asTypedList(t).setAll(0, ys);
+      _shamirInterp(xsPtr, ysPtr, t, outPtr);
+      return List<int>.from(outPtr.asTypedList(t));
+    } finally {
+      // Coefficients are coercion-relevant (they reconstruct K_i): wipe them.
+      xsPtr.asTypedList(t).fillRange(0, t, 0);
+      ysPtr.asTypedList(t).fillRange(0, t, 0);
+      outPtr.asTypedList(t).fillRange(0, t, 0);
+      calloc
+        ..free(xsPtr)
+        ..free(ysPtr)
+        ..free(outPtr);
+    }
+  }
+
+  /// Serialize Shamir `Sh` coefficients (`u32` list) to big-endian bytes — the
+  /// wire form matching `shamir::sh_to_bytes` / the Python bridge, fed to
+  /// [masterSecret] and [orbitAdvance]. Pure Dart (no FFI); kept here so the
+  /// serialization lives beside its only consumers.
+  static Uint8List shToBytes(List<int> coeffs) {
+    final Uint8List out = Uint8List(coeffs.length * 4);
+    for (int i = 0; i < coeffs.length; i++) {
+      final int c = coeffs[i];
+      out[i * 4] = (c >> 24) & 0xFF;
+      out[i * 4 + 1] = (c >> 16) & 0xFF;
+      out[i * 4 + 2] = (c >> 8) & 0xFF;
+      out[i * 4 + 3] = c & 0xFF;
+    }
+    return out;
+  }
+
+  /// Canonical per-stage Shamir thresholds `t_i` for a setup [level] (1-based):
+  /// index 0 is stage 0, `1..N` the deep stages (`t_i == r_i`, `t_i·32` bits)
+  /// (`bs_setup_tier_thresholds`). Query-then-fill, like the Python bridge.
+  /// Returns `[]` for an invalid level (`0` or `> MAX_SETUP_LEVEL`).
+  List<int> setupTierThresholds(int level) {
+    final int count = _setupTierThresholds(level, nullptr, 0);
+    if (count == 0) return const <int>[];
+    final Pointer<Uint32> buf = calloc<Uint32>(count);
+    try {
+      _setupTierThresholds(level, buf, count);
+      return List<int>.from(buf.asTypedList(count));
+    } finally {
+      calloc.free(buf);
+    }
+  }
+
+  /// Whether a setup [level] is the **substandard** entry tier (Setup 1, whose
+  /// single deep stage carries only 64 bits) (`bs_setup_tier_substandard`).
+  /// UIs MUST surface this loudly wherever Setup 1 is offered.
+  bool setupTierSubstandard(int level) => _setupTierSubstandard(level) != 0;
+
   /// Run the **master-secret export** — one Argon2id pass over the reproducible
   /// setup-transcript [message] (`bs_argon2id_master`). Uses the fixed master
   /// profile (Argon2id, `m = 64 MiB`, `t = 8`, `p = 2`) and the fixed salt
@@ -1046,6 +1245,35 @@ typedef _Argon2SingleC = Void Function(
   Pointer<Uint8>, Uint32, Uint8, Pointer<Uint8>);
 typedef _Argon2SingleDart = void Function(
   Pointer<Uint8>, int, int, Pointer<Uint8>);
+
+typedef _OrbitRootC = Void Function(Pointer<Uint8>, Uint32, Pointer<Uint8>);
+typedef _OrbitRootDart = void Function(Pointer<Uint8>, int, Pointer<Uint8>);
+
+typedef _ThetaC = Void Function(Pointer<Uint8>, Uint32, Pointer<Uint8>);
+typedef _ThetaDart = void Function(Pointer<Uint8>, int, Pointer<Uint8>);
+
+typedef _MasterSecretC = Void Function(
+  Pointer<Uint8>, Pointer<Uint8>, Uint32, Pointer<Uint8>);
+typedef _MasterSecretDart = void Function(
+  Pointer<Uint8>, Pointer<Uint8>, int, Pointer<Uint8>);
+
+typedef _OrbitAdvanceC = Void Function(
+  Pointer<Uint8>, Pointer<Uint8>, Uint32, Uint32, Uint8,
+  Pointer<Uint8>, Pointer<Uint8>);
+typedef _OrbitAdvanceDart = void Function(
+  Pointer<Uint8>, Pointer<Uint8>, int, int, int,
+  Pointer<Uint8>, Pointer<Uint8>);
+
+typedef _ShamirInterpC = Void Function(
+  Pointer<Uint32>, Pointer<Uint32>, Uint32, Pointer<Uint32>);
+typedef _ShamirInterpDart = void Function(
+  Pointer<Uint32>, Pointer<Uint32>, int, Pointer<Uint32>);
+
+typedef _SetupTierThresholdsC = Uint32 Function(Uint32, Pointer<Uint32>, Uint32);
+typedef _SetupTierThresholdsDart = int Function(int, Pointer<Uint32>, int);
+
+typedef _SetupTierSubstandardC = Uint8 Function(Uint32);
+typedef _SetupTierSubstandardDart = int Function(int);
 
 typedef _Argon2idMasterC = Void Function(
   Pointer<Uint8>, Uint32, Pointer<Uint8>, Uint32);
