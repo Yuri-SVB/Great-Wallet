@@ -5004,9 +5004,11 @@ class _SetupScreenState extends State<SetupScreen> {
             '4 = 12 words / 128 bits. ← → or drag to change.';
       case _Field.iterations:
         final String n = _iterationsField.text.trim();
-        return 'Derivation steps between stages (Argon2 N) = '
-            '${n.isEmpty ? '—' : n} (0…∞). Higher = a longer, stronger '
-            'derivation (hours to weeks).';
+        return 'Derivation steps per stage (D) = ${n.isEmpty ? '—' : n} (0…∞): '
+            'the memory-hard passes each stage runs — the orbit advance '
+            'oᵢ₊₁ = H*(Kᵢ), and the legacy chain alike. Higher = longer, '
+            'stronger (hours to weeks); 0 = instant pass-through (dev only, not '
+            'memory-hard).';
       case _Field.profile:
         final int idx =
             _profiles.indexOf(_profile).clamp(0, _profiles.length - 1);
@@ -5953,7 +5955,7 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
                     Row(
                       children: <Widget>[
                         Expanded(
-                          child: Text('Calibrate Argon2 derivation time',
+                          child: Text('Calibrate derivation steps / stage (D)',
                               style: theme.textTheme.titleLarge),
                         ),
                         IconButton(
