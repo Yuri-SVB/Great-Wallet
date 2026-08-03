@@ -246,6 +246,13 @@ class _SetupScreenState extends State<SetupScreen> {
   /// Highest secondary slot index — a fixed row of seven tabs (`0..6`).
   static const int _maxSlot = 6;
 
+  /// The **orbit** stage cursor (`0..`[_maxStage]) — the screen-owned active
+  /// stage while building the orbit pre-session. Stage 0 is rooted by σ; a deep
+  /// stage is entered by the forward memory-hard advance `o_i = H*(K_{i-1})`.
+  /// (During a legacy chain session the active stage instead follows the
+  /// controller's `displayStageIndex`; see [_activeStage].)
+  int _orbitStage = 0;
+
   // --- salt slot (`#0`) — Namtso σ harvest (stage 0) / retirement (stage i>0).
   // The salt slot's input; wiring σ → the orbit root o₀ into the derivation is a
   // later phase (P5). Ported from the orbit setup screen's harvest panel.
@@ -264,10 +271,12 @@ class _SetupScreenState extends State<SetupScreen> {
   final List<int> _requiredFractals = List<int>.generate(
       SetupController.maxPointStages + 1, (int i) => i == 0 ? 2 : 3);
 
-  /// The stage whose slots/`r_i` the secondary row currently reflects.
+  /// The stage whose slots/`r_i` the secondary row currently reflects. In a
+  /// legacy chain session it follows the controller's `displayStageIndex`; while
+  /// building the orbit (pre-session) it is the screen-owned [_orbitStage].
   int get _activeStage =>
-      (_hasSession ? _setup.displayStageIndex : 0)
-          .clamp(0, SetupController.maxPointStages);
+      (_hasSession ? _setup.displayStageIndex : _orbitStage)
+          .clamp(0, _maxStage);
 
   // --- P5: stage-0 orbit board render cache ---------------------------------
   // Stage 0's fractal slots (#j≥1) render the real board `θ_0_(j-1)` derived
@@ -351,8 +360,11 @@ class _SetupScreenState extends State<SetupScreen> {
   /// elongated island still fits fully on screen (overflow guard).
   static const double _kCanonicalLargeEdgeCap = 0.9;
 
-  /// True at a stage-0 fractal slot (`#j≥1`) — the orbit-board context.
-  bool get _isBoardSlot => _activeStage == 0 && _slotIndex >= 1;
+  /// True at an orbit-board fractal slot (`#j≥1`). While building the orbit
+  /// (pre-session) every stage's fractal slots are boards; during a legacy chain
+  /// session only stage 0's are (deep session stages ride the chain canvas).
+  bool get _isBoardSlot =>
+      _slotIndex >= 1 && (!_hasSession || _activeStage == 0);
 
   /// True when the current slot is a **primary** board that still takes a point
   /// (slot `1..r_i`, not a derived share) — i.e. placement is allowed.
@@ -697,14 +709,15 @@ class _SetupScreenState extends State<SetupScreen> {
                     child: Stack(
                       children: <Widget>[
                         // Slot #0 is the salt (Namtso σ at stage 0; retirement
-                        // placeholder at stage i>0). Fractal slots (#j≥1) at
-                        // stage 0 render the real orbit board θ_0_(j-1) (P5);
-                        // deep-stage fractal slots still use the legacy chain
-                        // canvas until the orbit stage-advance lands.
+                        // placeholder at stage i>0). Fractal slots (#j≥1) render
+                        // the real orbit board θ_i_(j-1) whenever the board flow
+                        // is active ([_isBoardSlot] — every stage pre-session,
+                        // stage 0 during a legacy session); a legacy session's
+                        // deep stages fall through to the chain canvas.
                         Positioned.fill(
                           child: _slotIndex == 0
                               ? _saltSlotPanel()
-                              : (_activeStage == 0
+                              : (_isBoardSlot
                                   ? _orbitBoardPanel(_slotIndex)
                                   : (_setup.isTextStage
                                       ? _textStagePanel()
@@ -912,7 +925,7 @@ class _SetupScreenState extends State<SetupScreen> {
   /// The salt slot's panel: Namtso σ harvest at stage 0, or the (future)
   /// stage-retirement placeholder at stage `i>0`.
   Widget _saltSlotPanel() {
-    final int stage = _hasSession ? _setup.displayStageIndex : 0;
+    final int stage = _activeStage;
     return stage > 0 ? _retirementPlaceholder(stage) : _namtsoSaltPanel();
   }
 
@@ -1102,7 +1115,12 @@ class _SetupScreenState extends State<SetupScreen> {
 
   Widget _stageTabs() {
     const int maxTab = SetupController.maxPointStages; // 0..4 → five fixed tabs
-    final int current = _setup.displayStageIndex;
+    final bool session = _hasSession;
+    // Orbit build (pre-session): the cursor is [_orbitStage]; a stage is
+    // reachable up to the derived ceiling, and the next stage is tappable to
+    // advance into it.
+    final int ceiling = session ? 0 : _orbitReachableCeiling;
+    final int current = session ? _setup.displayStageIndex : _orbitStage;
     final int? deriving = _setup.derivingStageIndex;
     final double progress = _setup.stageProgress;
     // Transparent so the tabs hover over the fractal (no opaque bar).
@@ -1122,24 +1140,32 @@ class _SetupScreenState extends State<SetupScreen> {
                     child: _StageTab(
                       index: i,
                       // In the (possibly slider-previewed) setup, so it shows as
-                      // a real box rather than an out-of-setup ghost slot.
-                      inSetup: i < _setup.nStages,
-                      selected: _hasSession && i == current,
-                      available: _hasSession && _setup.isStageAvailable(i),
+                      // a real box rather than an out-of-setup ghost slot. In the
+                      // orbit build the derived stages plus the next (advanceable)
+                      // one are the setup so far.
+                      inSetup:
+                          session ? i < _setup.nStages : i <= ceiling + 1,
+                      selected: i == current,
+                      available: session
+                          ? _setup.isStageAvailable(i)
+                          : i <= ceiling,
                       deriving: deriving == i,
                       progress: progress,
                       tooltip: _tabTooltip(i),
                       // Tappable for a stage in the active setup; a ghost slot
                       // beyond it is tappable too when the setup can grow, to
-                      // start an expansion up to that slot.
-                      onTap: (_hasSession && i < _setup.nStages)
-                          ? () => _selectStage(i)
-                          : (_hasSession &&
-                                  _setup.canExpand &&
-                                  i >= _setup.nStages &&
-                                  i <= SetupController.maxPointStages)
-                              ? () => _beginExpand(i)
-                              : null,
+                      // start an expansion up to that slot. In the orbit build the
+                      // reachable stages and the next (advanceable) one are
+                      // tappable via [_selectStage] → [_selectOrbitStage].
+                      onTap: session
+                          ? ((i < _setup.nStages)
+                              ? () => _selectStage(i)
+                              : (_setup.canExpand &&
+                                      i >= _setup.nStages &&
+                                      i <= SetupController.maxPointStages)
+                                  ? () => _beginExpand(i)
+                                  : null)
+                          : (i <= ceiling + 1 ? () => _selectStage(i) : null),
                     ),
                   ),
                 ),
@@ -1422,8 +1448,13 @@ class _SetupScreenState extends State<SetupScreen> {
   /// trigger that stage's derivation. Anything else (out of range, or a gap
   /// beyond the next stage) sounds a deny cue and explains why.
   void _selectStage(int index) {
-    if (_busy || !_hasSession) {
+    if (_busy) {
       _sounds.play(UiSound.denyBlocked);
+      return;
+    }
+    // Building the orbit (no legacy session): the screen owns the stage cursor.
+    if (!_hasSession) {
+      _selectOrbitStage(index);
       return;
     }
     if (index == _setup.displayStageIndex) {
@@ -1494,6 +1525,68 @@ class _SetupScreenState extends State<SetupScreen> {
       case DeriveOutcome.busy:
         break;
     }
+  }
+
+  /// Highest **derived** orbit stage: stage 0 plus the contiguous run of deep
+  /// stages whose `o_i` the forward advance has already produced. The next stage
+  /// (`+1`) is the one a forward navigation would advance into.
+  int get _orbitReachableCeiling {
+    int c = 0;
+    for (int i = 1; i <= _maxStage; i++) {
+      if (_orbitO[i] != null) {
+        c = i;
+      } else {
+        break;
+      }
+    }
+    return c;
+  }
+
+  /// Navigate the orbit stage cursor (pre-session). Stage 0 is always reachable
+  /// (rooted by σ); a deep stage is reachable once its `o_i` has been produced by
+  /// the forward advance. Forward navigation into the next, not-yet-derived stage
+  /// is what triggers that memory-hard advance (wired in the next commit); until
+  /// then it reports that the stage must be advanced into first.
+  void _selectOrbitStage(int index) {
+    if (index < 0 || index > _maxStage) {
+      _sounds.play(UiSound.denyBlocked);
+      return;
+    }
+    if (index == _orbitStage) {
+      // Re-selecting the current stage recenters its board view.
+      _recenter();
+      return;
+    }
+    // Backward, or into an already-derived deep stage: just move the cursor.
+    if (index < _orbitStage || _stageOrbit(index) != null) {
+      _sounds.play(UiSound.navStage);
+      _setOrbitStage(index);
+      return;
+    }
+    // Forward into the immediate next stage: needs the memory-hard advance.
+    if (index == _orbitReachableCeiling + 1) {
+      _sounds.play(UiSound.denyPending);
+      _toast('Finish this stage’s points, then advance forward (coming next).');
+      return;
+    }
+    _sounds.play(UiSound.denyBlocked);
+    _toast('Reach the earlier stages first.');
+  }
+
+  /// Move the orbit cursor to [index] and reset the per-board transient state so
+  /// the new stage's board opens clean (default view, no armed edit / import /
+  /// island reveal, fresh render + decoration caches).
+  void _setOrbitStage(int index) {
+    setState(() {
+      _orbitStage = index;
+      _editPointMode = false;
+      _boardImportSlot = null;
+      _boardIslands = const <CanvasIsland>[];
+      _boardDecoCache.clear();
+      _boardCanonicalView = false;
+      _boardKey = ''; // force the render cache to rebuild for the new stage
+    });
+    _recenter();
   }
 
   /// Whether the keyboard focus is currently inside an editable text field, so
