@@ -13,11 +13,13 @@ import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:qr/qr.dart' as qr;
 
 import '../core/encoding_constants.dart';
+import '../core/entropy.dart';
 import '../core/great_wall_core.dart';
 import '../core/namtso_harvester.dart';
 import '../core/orbit_protocol.dart';
 import '../core/stage_params.dart';
 import '../ffi/core_bindings.dart';
+import '../ffi/fixed.dart';
 import 'desktop_qr_scanner.dart';
 import 'setup_controller.dart';
 import 'setup_crypto.dart';
@@ -278,6 +280,27 @@ class _SetupScreenState extends State<SetupScreen> {
   StageReservoirs? _boardReservoirs;
   String _boardKey = '';
 
+  // --- P5: stage-0 point placement + Shamir extrapolation -------------------
+  // Per fractal slot (1..[_maxSlot]) of stage 0: the placed 32-bit chunk and its
+  // encoded board point. Slots 1..r_0 are user-placed (primary); slots r_0+1..6
+  // are DERIVED — Sh_0 evaluated at the resistance abscissae (by the engine) —
+  // and locked. Index 0 (salt) is unused. Session-only; wiped when σ changes.
+  final List<List<int>?> _stage0Chunks =
+      List<List<int>?>.filled(_maxSlot + 1, null);
+  final List<({int reRaw, int imRaw})?> _stage0Points =
+      List<({int reRaw, int imRaw})?>.filled(_maxSlot + 1, null);
+  final List<bool> _stage0Derived = List<bool>.filled(_maxSlot + 1, false);
+
+  /// True at a stage-0 fractal slot (`#j≥1`) — the orbit-board context.
+  bool get _isBoardSlot => _activeStage == 0 && _slotIndex >= 1;
+
+  /// True when the current slot is a **primary** board that still takes a point
+  /// (slot `1..r_0`, not a derived share) — i.e. placement is allowed.
+  bool get _placeableBoardSlot =>
+      _isBoardSlot &&
+      _slotIndex <= _requiredFractals[0] &&
+      !_stage0Derived[_slotIndex];
+
   /// A confirmation awaiting an inline answer in the console (replaces modal
   /// dialogs). Resolved by the console's action buttons.
   _ConsolePrompt? _prompt;
@@ -461,6 +484,8 @@ class _SetupScreenState extends State<SetupScreen> {
     widget.core.source.reservoirs = null;
     widget.core.leafSource.reservoirs = null;
     _boardReservoirs?.clear();
+    // Wipe placed/derived board chunks (session-only point material).
+    _clearStage0Placements();
     _sigmaCtrl.dispose();
     _explorerCtrl.dispose();
     _setup.removeListener(_onSetupChanged);
@@ -626,7 +651,7 @@ class _SetupScreenState extends State<SetupScreen> {
                                 ? 'Add stage — click your point'
                                 : 'Recall — click your point'),
                           ),
-                        if (_editPointMode && !_setup.isTextStage)
+                        if (_editPointMode && (!_setup.isTextStage || _isBoardSlot))
                           const Positioned(
                             top: 56,
                             left: 12,
@@ -700,7 +725,11 @@ class _SetupScreenState extends State<SetupScreen> {
     }
     if (i == _slotIndex) return;
     _sounds.play(UiSound.navStage);
-    setState(() => _slotIndex = i);
+    setState(() {
+      _slotIndex = i;
+      // Any manual point-placement armed for the previous slot no longer applies.
+      _editPointMode = false;
+    });
   }
 
   /// The **secondary slot tabs** — a fixed row of seven numbered tabs (`0..6`)
@@ -934,7 +963,9 @@ class _SetupScreenState extends State<SetupScreen> {
               controller: _sigmaCtrl,
               maxLines: 2,
               style: theme.textTheme.bodySmall,
-              onChanged: (_) => setState(() {}),
+              // A new σ re-roots every board, so any placed/derived points no
+              // longer decode — drop them.
+              onChanged: (_) => setState(_clearStage0Placements),
               decoration: const InputDecoration(
                 border: OutlineInputBorder(),
                 isDense: true,
@@ -1183,7 +1214,11 @@ class _SetupScreenState extends State<SetupScreen> {
         _expandManual();
         return KeyEventResult.handled;
       }
-      if (_setup.canEditCurrentPoint) {
+      // At a primary orbit board slot, R arms a manual point placement (the same
+      // click-to-place mechanism as a chain point edit).
+      if (_placeableBoardSlot) {
+        _armBoardManual();
+      } else if (_setup.canEditCurrentPoint) {
         _changePointManual();
       } else {
         _setSource(_SourceMode.recall, focusInput: true);
@@ -1462,14 +1497,21 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   /// Stage-0 fractal slot (`#j≥1`): the real orbit board `θ_0_(j-1)` derived
-  /// from σ → o₀. Renders read-only for now — placement (tap to encode a point)
-  /// and the Shamir/`K_0` completion land in the next P5 slices, together with
-  /// the deep stages (which still ride the legacy chain canvas until the orbit
-  /// stage-advance is wired). When σ is unset/invalid the board cannot be
-  /// derived, so a short "set σ first" panel is shown instead.
+  /// from σ → o₀. A primary slot (`1..r_0`) carries a placed point shown as a
+  /// white cross; slots beyond `r_0` are the derived (locked) shares. Point
+  /// entry uses the *existing* mechanisms — `R` arms a manual click, exactly
+  /// like editing a chain point (so the canvas takes a click only in select /
+  /// edit mode). When σ is unset/invalid a "set σ first" panel is shown.
   Widget _orbitBoardPanel(int slot) {
     final StageParameters? bp = _stage0BoardParams(slot);
     if (bp == null) return _boardNeedsSigmaPanel(slot);
+    final ({int reRaw, int imRaw})? pt = _stage0Points[slot];
+    final CanvasOverlays overlays = pt == null
+        ? CanvasOverlays.empty
+        : CanvasOverlays(crosses: <CrossMarker>[
+            CrossMarker(
+                re: fixedToDouble(pt.reRaw), im: fixedToDouble(pt.imRaw)),
+          ]);
     return FractalCanvas(
       source: widget.core.source,
       controller: _viewport,
@@ -1479,11 +1521,167 @@ class _SetupScreenState extends State<SetupScreen> {
       stage: Stage.stage2,
       stageParameters: bp,
       maxIterations: _renderMaxIter,
-      overlays: CanvasOverlays.empty,
+      overlays: overlays,
       semanticLabel: 'Orbit fractal board (stage 0, slot $slot)',
-      // Read-only in this slice: placement is wired in a later P5 step.
-      onSelect: null,
+      // Same gate as the chain canvas: a click lands only while select / edit
+      // mode is armed (here, by `R`), and routes through [_onCanvasSelect].
+      onSelect: (_selectMode || _editPointMode)
+          ? (FractalSelection sel) => _onCanvasSelect(sel)
+          : null,
     );
+  }
+
+  /// Board reservoirs `(o, p, q)` for stage-0 slot [slot] (board `θ_0_(slot-1)`),
+  /// or null when σ is unset/invalid. Cheap (`orbitRoot` + `theta`).
+  ({int o, int p, int q})? _boardPrm(int slot) {
+    final Uint8List? sigma = _parseHex(_sigmaCtrl.text.trim());
+    if (sigma == null || sigma.isEmpty) return null;
+    final Uint8List o0 = widget.core.orbitRoot(sigma);
+    return OrbitProtocol(widget.core).orbitParams(o0, slot - 1);
+  }
+
+  /// Arm a manual point placement for the current board slot — the board peer of
+  /// [_changePointManual]: the next canvas click sets slot [_slotIndex]'s point.
+  void _armBoardManual() {
+    setState(() => _editPointMode = true);
+    _sounds.play(UiSound.click);
+    _toast('Click the point for slot $_slotIndex (Esc to cancel).');
+  }
+
+  /// Decode a tapped leaf as slot [slot]'s primary point (under the board's
+  /// reservoirs) and record it. Returns true when a point was placed.
+  bool _placePrimaryAt(int slot, FractalSelection sel) {
+    final ({int o, int p, int q})? prm = _boardPrm(slot);
+    if (prm == null) return false;
+    final int reRaw = fixedFromDouble(sel.re);
+    final int imRaw = fixedFromDouble(sel.im);
+    final CoreDecodeResult d = widget.core.decodePoint(
+        reRaw: reRaw, imRaw: imRaw, o: prm.o, p: prm.p, q: prm.q);
+    if (!d.valid) {
+      _sounds.play(UiSound.denyMiss);
+      _toast('No encodable leaf there — zoom in and click closer.');
+      return false;
+    }
+    _setPrimary(slot, d.bits, (reRaw: reRaw, imRaw: imRaw));
+    _sounds.play(UiSound.selectPoint);
+    return true;
+  }
+
+  /// Record slot [slot]'s primary chunk + point (copying [bits]) and re-derive
+  /// the extra shares from the (possibly now complete) primaries.
+  void _setPrimary(int slot, List<int> bits, ({int reRaw, int imRaw}) point) {
+    setState(() {
+      final List<int>? old = _stage0Chunks[slot];
+      if (old != null) Entropy.wipe(old);
+      _stage0Chunks[slot] = List<int>.of(bits);
+      _stage0Points[slot] = point;
+      _stage0Derived[slot] = false;
+      _recomputeExtraShares();
+    });
+  }
+
+  /// Derive the forgetting-resistance shares (slots `r_0+1..`[_maxSlot]) from the
+  /// `r_0` primary points. `Sh_0 = shamirInterp(primaries)`; the engine evaluates
+  /// it at the reserved resistance abscissae
+  /// ([GreatWallCore.generateResistanceShares]); each value is encoded onto its
+  /// board `θ_0_(s-1)` for display. Missing a primary (or σ) simply clears them.
+  /// Any `r_0` of the boards reconstruct the identical `Sh_0` (orbit_protocol
+  /// _test). Must run inside a [setState].
+  void _recomputeExtraShares() {
+    final int r0 = _requiredFractals[0];
+    for (int s = r0 + 1; s <= _maxSlot; s++) {
+      if (_stage0Derived[s]) {
+        final List<int>? c = _stage0Chunks[s];
+        if (c != null) Entropy.wipe(c);
+        _stage0Chunks[s] = null;
+        _stage0Points[s] = null;
+        _stage0Derived[s] = false;
+      }
+    }
+    final List<int> xs = <int>[];
+    final List<int> ys = <int>[];
+    for (int s = 1; s <= r0; s++) {
+      final List<int>? c = _stage0Chunks[s];
+      if (c == null || _stage0Derived[s]) return; // primaries incomplete
+      xs.add(s); // primary abscissa = slot number
+      ys.add(OrbitProtocol.bitsToU32(c));
+    }
+    final Uint8List? sigma = _parseHex(_sigmaCtrl.text.trim());
+    if (sigma == null || sigma.isEmpty) return;
+    final Uint8List o0 = widget.core.orbitRoot(sigma);
+    final OrbitProtocol orbit = OrbitProtocol(widget.core);
+    final List<int> sh = widget.core.shamirInterp(xs, ys);
+    final int extras = _maxSlot - r0;
+    final List<int> shares = widget.core.generateResistanceShares(sh, extras);
+    for (int i = 0; i < extras; i++) {
+      final int s = r0 + 1 + i;
+      final List<int> bits = OrbitProtocol.u32ToBits(shares[i]);
+      final ({int o, int p, int q}) prm = orbit.orbitParams(o0, s - 1);
+      final EncodedPoint pt = widget.core
+          .encodeStage(List<int>.of(bits), o: prm.o, p: prm.p, q: prm.q)
+          .first;
+      _stage0Chunks[s] = bits; // owns it
+      _stage0Points[s] = (reRaw: pt.reRaw, imRaw: pt.imRaw);
+      _stage0Derived[s] = true;
+    }
+    for (int i = 0; i < sh.length; i++) {
+      sh[i] = 0; // Sh_0 is coercion-relevant — zero it once shares are made.
+    }
+  }
+
+  /// Drop every stage-0 placement (wiping chunks) — called when σ changes, since
+  /// a new σ re-roots every board and old points no longer decode.
+  void _clearStage0Placements() {
+    for (int s = 1; s <= _maxSlot; s++) {
+      final List<int>? c = _stage0Chunks[s];
+      if (c != null) Entropy.wipe(c);
+      _stage0Chunks[s] = null;
+      _stage0Points[s] = null;
+      _stage0Derived[s] = false;
+    }
+  }
+
+  /// Informational panel section for the active stage-0 board: the slot's role,
+  /// its placed/derived state, and the hotkeys that set the point — routed
+  /// through the existing point-entry mechanisms, so there are no bespoke
+  /// buttons. (`R` manual click here; `N`/`I` join in the next commits.)
+  List<Widget> _boardStatus() {
+    final int slot = _slotIndex;
+    final int r0 = _requiredFractals[0];
+    final bool derived = _stage0Derived[slot];
+    final bool primary = slot <= r0;
+    final bool placed = _stage0Points[slot] != null;
+    final bool hasSigma = _parseHex(_sigmaCtrl.text.trim()) != null;
+    final ThemeData theme = Theme.of(context);
+    final Widget body;
+    if (derived) {
+      body = Text(
+        'Derived share (locked): Sh₀ extrapolated onto this board’s '
+        'forgetting-resistance point.',
+        style: theme.textTheme.bodySmall,
+      );
+    } else if (!primary) {
+      body = Text(
+        'Extra share — fills automatically once the $r0 required points '
+        '(slots 1–$r0) are placed.',
+        style: theme.textTheme.bodySmall,
+      );
+    } else if (!hasSigma) {
+      body = Text('Set σ in slot 0 first.', style: theme.textTheme.bodySmall);
+    } else {
+      body = Text(
+        placed
+            ? 'Point placed. R to pick a new point on the fractal.'
+            : 'R to place this point — then click a leaf on the fractal.',
+        style: theme.textTheme.bodySmall,
+      );
+    }
+    return <Widget>[
+      Text('Slot $slot — ${primary ? 'required point' : 'extra share'}',
+          style: theme.textTheme.titleMedium),
+      const SizedBox(height: 4),
+      body,
+    ];
   }
 
   /// Derive stage-0 board `θ_0_(slot-1)` from the current σ, point the render
@@ -1650,6 +1848,14 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   Future<void> _onCanvasSelect(FractalSelection sel) async {
+    // Placing a stage-0 orbit board point (the `R` manual arm): the click sets
+    // this slot's point. On an invalid leaf the mode stays armed to retry.
+    if (_editPointMode && _placeableBoardSlot) {
+      if (_placePrimaryAt(_slotIndex, sel)) {
+        setState(() => _editPointMode = false);
+      }
+      return;
+    }
     // Editing the displayed stage's point (the R edit): the click sets the new
     // point and the tail (if any) was already confirmed when arming the mode.
     if (_editPointMode) {
@@ -2084,6 +2290,14 @@ class _SetupScreenState extends State<SetupScreen> {
       padding: const EdgeInsets.all(16),
       child: ListView(
         children: <Widget>[
+
+          // Stage-0 orbit board status (role + placed/derived + the hotkeys that
+          // set the point). Point entry reuses the existing mechanisms — there
+          // are no bespoke buttons here.
+          if (_isBoardSlot) ...<Widget>[
+            ..._boardStatus(),
+            const Divider(height: 32),
+          ],
 
           if (_setup.phase == SetupPhase.recallComplete)
             ..._recallCompleteControls()
