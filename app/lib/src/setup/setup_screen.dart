@@ -1684,7 +1684,11 @@ class _SetupScreenState extends State<SetupScreen> {
     // same fractal that is on screen.
     widget.core.leafSource.reservoirs =
         StageReservoirs(o: prm.o, p: prm.p, q: prm.q);
-    final LeafAreasResult res = await widget.core.leafSource.leafAreas(
+    // Use the RAW enumeration (exact I4F60 rects). Passing the rect back to
+    // canonicalIsland through a double round-trip changes which island the
+    // discovery returns, so the E-revealed island would disagree with the one a
+    // click on it resolves (which uses the exact rect from decodeFull).
+    final CoreLeafAreasResult res = widget.core.leafSource.leafAreasRaw(
       LeafAreasRequest(
         viewport: _viewport.viewport,
         stage: Stage.stage2,
@@ -1699,9 +1703,9 @@ class _SetupScreenState extends State<SetupScreen> {
       return;
     }
     final List<CanvasIsland> islands = <CanvasIsland>[];
-    for (final LeafArea leaf in res.leaves) {
+    for (final CoreLeafArea leaf in res.leaves) {
       final _BoardDeco? deco = _boardIslandDecoForLeaf(
-        FixedRect.fromDoubles(leaf.reMin, leaf.reMax, leaf.imMin, leaf.imMax),
+        leaf.rect, // exact rect — no Fixed→double→Fixed round-trip
         leaf.path,
         prm.o,
         prm.p,

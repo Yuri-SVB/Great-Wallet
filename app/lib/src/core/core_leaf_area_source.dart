@@ -44,6 +44,30 @@ class CoreLeafAreaSource implements LeafAreaSource {
 
   @override
   Future<LeafAreasResult> leafAreas(LeafAreasRequest request) async {
+    final CoreLeafAreasResult res = leafAreasRaw(request);
+    if (res.tooMany) {
+      return LeafAreasResult.tooMany(res.maxLeaves);
+    }
+    return LeafAreasResult.leaves(<LeafArea>[
+      for (final CoreLeafArea leaf in res.leaves)
+        LeafArea(
+          reMin: fixedToDouble(leaf.rect.reMin),
+          reMax: fixedToDouble(leaf.rect.reMax),
+          imMin: fixedToDouble(leaf.rect.imMin),
+          imMax: fixedToDouble(leaf.rect.imMax),
+          path: leaf.path,
+        ),
+    ]);
+  }
+
+  /// Enumerate leaf areas returning the **raw** engine result — the exact I4F60
+  /// (`int`) leaf rectangles, not the lossy `double` [LeafArea]s that [leafAreas]
+  /// hands the UX layer for drawing. Callers that feed a leaf rect *back into the
+  /// engine* (e.g. `canonicalIsland`) MUST use this: island discovery is
+  /// sensitive to sub-`double` precision, so a `Fixed → double → Fixed`
+  /// round-trip on the rect can change which island is returned — which would
+  /// make an `E`-revealed island disagree with the one a click on it resolves.
+  CoreLeafAreasResult leafAreasRaw(LeafAreasRequest request) {
     final FractalViewport vp = request.viewport;
     final int w = vp.widthPx;
     final int h = vp.heightPx;
@@ -70,7 +94,7 @@ class CoreLeafAreaSource implements LeafAreaSource {
     final int p = request.stage == Stage.stage2 ? _requireReservoirs().p : 0;
     final int q = request.stage == Stage.stage2 ? _requireReservoirs().q : 0;
 
-    final CoreLeafAreasResult res = _bindings.enumerateLeafAreas(
+    return _bindings.enumerateLeafAreas(
       originRe: originRe,
       originIm: originIm,
       step: u,
@@ -86,20 +110,6 @@ class CoreLeafAreaSource implements LeafAreaSource {
       p: p,
       q: q,
     );
-
-    if (res.tooMany) {
-      return LeafAreasResult.tooMany(res.maxLeaves);
-    }
-    return LeafAreasResult.leaves(<LeafArea>[
-      for (final CoreLeafArea leaf in res.leaves)
-        LeafArea(
-          reMin: fixedToDouble(leaf.rect.reMin),
-          reMax: fixedToDouble(leaf.rect.reMax),
-          imMin: fixedToDouble(leaf.rect.imMin),
-          imMax: fixedToDouble(leaf.rect.imMax),
-          path: leaf.path,
-        ),
-    ]);
   }
 
   StageReservoirs _requireReservoirs() {
