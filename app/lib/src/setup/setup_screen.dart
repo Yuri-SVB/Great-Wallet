@@ -150,7 +150,7 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   /// Number of fractal **point stages** for a fresh/recall setup, chosen on a
-  /// discrete slider with nine positions, 0..[SetupController.maxPointStages].
+  /// discrete slider with five positions, 0..[SetupController.maxPointStages].
   /// 0 is a Stage-0-text-only setup (no fractal points); each higher position
   /// adds one 32-bit fractal stage (`32 × count` bits / `3 × count` BIP39
   /// words). Every position is a valid setup, so the count needs no validity
@@ -607,7 +607,7 @@ class _SetupScreenState extends State<SetupScreen> {
     );
   }
 
-  /// The upper-edge stage tabs: a **fixed** bar of nine numbered tabs (0..8,
+  /// The upper-edge stage tabs: a **fixed** bar of five numbered tabs (0..4,
   /// the protocol ceiling) spanning the fractal-view width. Stage 0 is the
   /// salt/pepper text; 1..N-1 are the chain-derived fractals. The stage under
   /// focus is highlighted; tabs that are not currently reachable — outside this
@@ -615,7 +615,7 @@ class _SetupScreenState extends State<SetupScreen> {
   /// but greyed out and inert. Tapping a reachable tab focuses it (the same as
   /// pressing its number key).
   Widget _stageTabs() {
-    const int maxTab = SetupController.maxPointStages; // 0..8 → nine fixed tabs
+    const int maxTab = SetupController.maxPointStages; // 0..4 → five fixed tabs
     final int current = _setup.displayStageIndex;
     final int? deriving = _setup.derivingStageIndex;
     final double progress = _setup.stageProgress;
@@ -862,7 +862,7 @@ class _SetupScreenState extends State<SetupScreen> {
         return KeyEventResult.handled;
       }
     }
-    // 0–8 — select that stage: focus it, or derive it if it is next.
+    // 0–4 — select that stage: focus it, or derive it if it is next.
     final int? digit = _digitKeys[event.logicalKey];
     if (digit != null) {
       _selectStage(digit);
@@ -1300,7 +1300,7 @@ class _SetupScreenState extends State<SetupScreen> {
     'F1 manual · F2 Setup · F3 Train · F4 Accelerate · F5 Inherit',
     'Esc  return to the fractal (leave a text field) · Tab cycles fields',
     'M  console   9  stage bar   Z  reset (asks first)',
-    '0–8  go to that stage (recenters); press again to zoom to its point',
+    '0–4  go to that stage (recenters); press again to zoom to its point',
     'N / I / R  New seed / Import / Recall (config) · on a stage: change its point',
     'I import = BIP39 words · Alt+I import = hex (config & point edit alike)',
     'Click/press a ghost slot past the last stage to grow the setup (N/I/R)',
@@ -1605,7 +1605,7 @@ class _SetupScreenState extends State<SetupScreen> {
           else
             ..._memoriseControls(),
 
-          // (Stage navigation lives in the fixed 0–8 tab bar above the canvas;
+          // (Stage navigation lives in the fixed 0–4 tab bar above the canvas;
           // the redundant "< Stage k / N >" row was dropped.)
 
           // Background generation progress: later stages are still deriving
@@ -1859,8 +1859,8 @@ class _SetupScreenState extends State<SetupScreen> {
     ];
   }
 
-  /// Discrete slider for the number of fractal **point stages**, with nine
-  /// positions `0..maxPointStages` (0..8). `divisions` snaps to whole stages so
+  /// Discrete slider for the number of fractal **point stages**, with five
+  /// positions `0..maxPointStages` (0..4). `divisions` snaps to whole stages so
   /// there is no ambiguous in-between value. 0 is a Stage-0-text-only setup; each
   /// higher position adds one 32-bit fractal stage (`32 × count` bits / `3 ×
   /// count` BIP39 words). Every position is valid, so — unlike the old free-text
@@ -3465,8 +3465,8 @@ class _SetupScreenState extends State<SetupScreen> {
   String _fieldHelp(_Field f) {
     switch (f) {
       case _Field.stages:
-        return 'Number of stages: $_pointStages (0–8). 0 = Stage-0 text only; '
-            '8 = 24 words / 256 bits. ← → or drag to change.';
+        return 'Number of stages: $_pointStages (0–4). 0 = Stage-0 text only; '
+            '4 = 12 words / 128 bits. ← → or drag to change.';
       case _Field.iterations:
         final String n = _iterationsField.text.trim();
         return 'Derivation steps between stages (Argon2 N) = '
@@ -3831,9 +3831,10 @@ class _ConsolePrompt {
   final Completer<bool> completer;
 }
 
-/// Maps the number-row and numpad digit keys 0..8 to a stage index, so pressing
-/// a number focuses that stage (when no text field holds the keystroke). 9 is
-/// included so it produces the usual out-of-range cue rather than nothing.
+/// Maps the number-row and numpad digit keys to a stage index, so pressing a
+/// number focuses that stage (when no text field holds the keystroke). Valid
+/// stages are 0..4 ([SetupController.maxPointStages]); 5..9 are included so they
+/// produce the usual out-of-range cue rather than nothing.
 ///
 /// Not `const`: [LogicalKeyboardKey] has no primitive `==`, so it cannot be a
 /// constant map key — a lazily-initialised `final` map is the idiomatic form.

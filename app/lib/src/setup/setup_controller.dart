@@ -131,16 +131,17 @@ class SetupController extends ChangeNotifier {
 
   /// Configured number of fractal **point stages** for a fresh/recall session
   /// (1..[maxPointStages]). Each point stage is one 32-bit chunk, so this fixes
-  /// the entropy width (`32 ×`) — every value 1..8 is a valid setup, not just the
+  /// the entropy width (`32 ×`) — every value 1..4 is a valid setup, not just the
   /// old mini/default/large presets. An imported seed phrase overrides it with
   /// its own word count. Used only as the pre-session fallback for [nStages].
   int _pointStages = 4;
   int get configuredPointStages => _pointStages;
 
-  /// The largest number of point stages a setup may have: 8 (256-bit / 24-word
-  /// BIP39), the BIP39 ceiling. Stage 0 (text) sits on top, so the displayed
-  /// stages run 0..8 at most.
-  static const int maxPointStages = 8;
+  /// The largest number of point stages a setup may have: 4 (128-bit / 12-word
+  /// BIP39). Stage 0 (text) sits on top, so the displayed stages run 0..4 at
+  /// most — the upper (stage) slots of the orbit builder
+  /// (next-steps/orbit-setup-tab-ui-pathway.md, P1: `0..4` not `0..8`).
+  static const int maxPointStages = 4;
 
   /// Total number of displayed stages of the active session: the Stage-0 text
   /// stage plus one per 32-bit fractal point (`pointStageCount + 1`). For an
