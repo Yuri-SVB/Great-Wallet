@@ -301,6 +301,19 @@ class _SetupScreenState extends State<SetupScreen> {
   /// active board's fractal — cleared on any slot / σ change.
   List<CanvasIsland> _boardIslands = const <CanvasIsland>[];
 
+  /// The placed point's focus decoration (canonical island cells + bbox) per
+  /// slot, cached until the point / σ changes. Drives the square frame and the
+  /// cross↔square switch.
+  final Map<int, _BoardDeco?> _boardDecoCache = <int, _BoardDeco?>{};
+
+  /// Whether the active board's placed point is drawn as a **square** (frame +
+  /// island cells) rather than a **cross**. Switches on the island's on-screen
+  /// pixel span with a hysteresis band ([_kMarkerSquareEnterPx] /
+  /// [_kMarkerSquareExitPx]) so it does not flicker at the threshold.
+  bool _boardMarkerSquare = false;
+  static const double _kMarkerSquareEnterPx = 64;
+  static const double _kMarkerSquareExitPx = 40;
+
   /// True at a stage-0 fractal slot (`#j≥1`) — the orbit-board context.
   bool get _isBoardSlot => _activeStage == 0 && _slotIndex >= 1;
 
@@ -319,6 +332,9 @@ class _SetupScreenState extends State<SetupScreen> {
   void initState() {
     super.initState();
     _setup.addListener(_onSetupChanged);
+    // Drive the board's cross↔square switch as the view zooms (the screen does
+    // not otherwise rebuild on pan/zoom).
+    _viewport.addListener(_onBoardViewportChanged);
   }
 
   void _onSetupChanged() {
@@ -500,6 +516,7 @@ class _SetupScreenState extends State<SetupScreen> {
     _explorerCtrl.dispose();
     _setup.removeListener(_onSetupChanged);
     _setup.dispose();
+    _viewport.removeListener(_onBoardViewportChanged);
     _viewport.dispose();
     _brightness.dispose();
     _sounds.dispose();
@@ -1560,18 +1577,40 @@ class _SetupScreenState extends State<SetupScreen> {
     );
   }
 
-  /// Overlays for the active board: the placed point's marker plus any islands
-  /// revealed by `E`. The marker is a fixed cross for now; the cross↔square
-  /// switch (with the focus island's cells and frame) folds in next.
+  /// Overlays for the active board: any islands revealed by `E`, plus the placed
+  /// point's marker. Shallow zoom (island small on screen) draws a fixed cross;
+  /// once the island spans enough pixels it becomes a square frame around its
+  /// cells (the switch has hysteresis — see [_updateBoardMarkerMode]).
   CanvasOverlays _boardOverlays(int slot) {
     final ({int reRaw, int imRaw})? pt = _stage0Points[slot];
+    final _BoardDeco? deco = pt == null ? null : _boardDecoFor(slot);
+    final bool square = _boardMarkerSquare && deco != null;
+    final List<CrossMarker> crosses = <CrossMarker>[];
+    if (pt != null && !square) {
+      // The cross sits on the island's centre when it resolved, else the point.
+      final double re = deco != null
+          ? (deco.reMin + deco.reMax) / 2.0
+          : fixedToDouble(pt.reRaw);
+      final double im = deco != null
+          ? (deco.imMin + deco.imMax) / 2.0
+          : fixedToDouble(pt.imRaw);
+      crosses.add(CrossMarker(re: re, im: im));
+    }
     return CanvasOverlays(
-      islands: _boardIslands,
-      crosses: <CrossMarker>[
-        if (pt != null)
-          CrossMarker(
-              re: fixedToDouble(pt.reRaw), im: fixedToDouble(pt.imRaw)),
+      islands: <CanvasIsland>[
+        ..._boardIslands,
+        if (square && deco!.cells.pointsReIm.isNotEmpty) deco.cells,
       ],
+      frames: <SelectionFrame>[
+        if (square)
+          SelectionFrame(
+            reMin: deco!.reMin,
+            reMax: deco.reMax,
+            imMin: deco.imMin,
+            imMax: deco.imMax,
+          ),
+      ],
+      crosses: crosses,
     );
   }
 
@@ -1679,6 +1718,67 @@ class _SetupScreenState extends State<SetupScreen> {
       _toast('Highlighted ${islands.length} canonical island(s).');
     }
   }
+
+  /// Focus decoration for a board's placed point: the canonical island (cells +
+  /// bbox) when it resolves, else the whole leaf rect (no cells) so the point is
+  /// always framed. Peer of SetupController's `_focusDecoForLeaf`.
+  _BoardDeco _boardFocusDecoForLeaf(
+      FixedRect leafRect, String path, int o, int p, int q) {
+    final _BoardDeco? isl = _boardIslandDecoForLeaf(leafRect, path, o, p, q);
+    if (isl != null) return isl;
+    return _BoardDeco(
+      cells: const CanvasIsland(cellSize: 0.0, pointsReIm: <double>[]),
+      reMin: fixedToDouble(leafRect.reMin),
+      reMax: fixedToDouble(leafRect.reMax),
+      imMin: fixedToDouble(leafRect.imMin),
+      imMax: fixedToDouble(leafRect.imMax),
+    );
+  }
+
+  /// The placed point's focus decoration for [slot] (island cells + bbox),
+  /// computed by decoding the stored point on its board and cached until the
+  /// point / σ changes. Null when the slot has no point.
+  _BoardDeco? _boardDecoFor(int slot) {
+    if (_boardDecoCache.containsKey(slot)) return _boardDecoCache[slot];
+    final ({int reRaw, int imRaw})? pt = _stage0Points[slot];
+    final ({int o, int p, int q})? prm = _boardPrm(slot);
+    _BoardDeco? deco;
+    if (pt != null && prm != null) {
+      final CoreDecodeResult d = widget.core.decodePoint(
+          reRaw: pt.reRaw, imRaw: pt.imRaw, o: prm.o, p: prm.p, q: prm.q);
+      if (d.valid) {
+        deco = _boardFocusDecoForLeaf(d.leafRect, d.path, prm.o, prm.p, prm.q);
+      }
+    }
+    _boardDecoCache[slot] = deco;
+    return deco;
+  }
+
+  /// Recompute the cross↔square mode for the active board from the placed
+  /// island's on-screen pixel span, applying the hysteresis band. Cheap: reads
+  /// the cached [_boardDecoFor] and only rebuilds when the mode flips. Driven by
+  /// the viewport listener (zoom) and after placement / slot changes.
+  void _updateBoardMarkerMode() {
+    if (!mounted || !_isBoardSlot) return;
+    final _BoardDeco? deco = _boardDecoFor(_slotIndex);
+    final bool next;
+    if (deco == null) {
+      next = false;
+    } else {
+      final ViewportMath m = ViewportMath(_viewport.viewport);
+      final (double x0, double y0) = m.coordToPixel(deco.reMin, deco.imMin);
+      final (double x1, double y1) = m.coordToPixel(deco.reMax, deco.imMax);
+      final double spanPx = math.max((x1 - x0).abs(), (y1 - y0).abs());
+      next = _boardMarkerSquare
+          ? spanPx > _kMarkerSquareExitPx
+          : spanPx >= _kMarkerSquareEnterPx;
+    }
+    if (next != _boardMarkerSquare) {
+      setState(() => _boardMarkerSquare = next);
+    }
+  }
+
+  void _onBoardViewportChanged() => _updateBoardMarkerMode();
 
   /// Arm a manual point placement for the current board slot — the board peer of
   /// [_changePointManual]: the next canvas click sets slot [_slotIndex]'s point.
@@ -1800,7 +1900,12 @@ class _SetupScreenState extends State<SetupScreen> {
       _stage0Points[slot] = point;
       _stage0Derived[slot] = false;
       _recomputeExtraShares();
+      // Placing this point (and re-deriving the shares) invalidates the cached
+      // island decorations.
+      _boardDecoCache.clear();
     });
+    // Pick the marker mode for the freshly placed point at the current zoom.
+    _updateBoardMarkerMode();
   }
 
   /// Derive the forgetting-resistance shares (slots `r_0+1..`[_maxSlot]) from the
@@ -1863,6 +1968,7 @@ class _SetupScreenState extends State<SetupScreen> {
       _stage0Derived[s] = false;
     }
     _boardIslands = const <CanvasIsland>[];
+    _boardDecoCache.clear();
   }
 
   /// Informational panel section for the active stage-0 board: the slot's role,
