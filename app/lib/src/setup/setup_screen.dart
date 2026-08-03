@@ -213,6 +213,11 @@ class _SetupScreenState extends State<SetupScreen> {
   /// tap on "Copy master secret" is ignored until it finishes.
   bool _exporting = false;
 
+  /// True while the memory-hard orbit advance `o_{i+1} = H*(K_i)` is running in a
+  /// worker isolate (a forward stage navigation). Folds into [_busy] so the
+  /// progress scrim shows and other hotkeys/navigation are blocked meanwhile.
+  bool _advancing = false;
+
   // --- Bottom console ---------------------------------------------------------
   // The console at the foot of the screen is the app's single message surface:
   // toasts, the help text of whatever control is under focus, and confirmation
@@ -589,6 +594,7 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   bool get _busy =>
+      _advancing ||
       _setup.phase == SetupPhase.encoding ||
       _setup.phase == SetupPhase.deriving;
 
@@ -1545,8 +1551,7 @@ class _SetupScreenState extends State<SetupScreen> {
   /// Navigate the orbit stage cursor (pre-session). Stage 0 is always reachable
   /// (rooted by σ); a deep stage is reachable once its `o_i` has been produced by
   /// the forward advance. Forward navigation into the next, not-yet-derived stage
-  /// is what triggers that memory-hard advance (wired in the next commit); until
-  /// then it reports that the stage must be advanced into first.
+  /// triggers that memory-hard advance ([_advanceOrbitInto]).
   void _selectOrbitStage(int index) {
     if (index < 0 || index > _maxStage) {
       _sounds.play(UiSound.denyBlocked);
@@ -1563,14 +1568,92 @@ class _SetupScreenState extends State<SetupScreen> {
       _setOrbitStage(index);
       return;
     }
-    // Forward into the immediate next stage: needs the memory-hard advance.
+    // Forward into the immediate next stage: run the memory-hard advance
+    // o_{index} = H*(K_{index-1}) from the (now complete) preceding stage.
     if (index == _orbitReachableCeiling + 1) {
-      _sounds.play(UiSound.denyPending);
-      _toast('Finish this stage’s points, then advance forward (coming next).');
+      unawaited(_advanceOrbitInto(index));
       return;
     }
     _sounds.play(UiSound.denyBlocked);
     _toast('Reach the earlier stages first.');
+  }
+
+  /// Serialize stage [stage]'s Shamir polynomial `Sh_i` by re-interpolating it
+  /// from the stage's `r_i` primary points, or null if they are not all placed.
+  /// `Sh_i` is coercion-relevant, so the interim coefficients are wiped before
+  /// returning; the caller owns (and wipes) the returned bytes.
+  Uint8List? _stageShBytes(int stage) {
+    final int r = _requiredFractals[stage];
+    final List<int> xs = <int>[];
+    final List<int> ys = <int>[];
+    for (int s = 1; s <= r; s++) {
+      final List<int>? c = _boardChunks[stage][s];
+      if (c == null || _boardDerived[stage][s]) return null;
+      xs.add(s);
+      ys.add(OrbitProtocol.bitsToU32(c));
+    }
+    final List<int> sh = widget.core.shamirInterp(xs, ys);
+    final Uint8List shBytes = GreatWallCoreBindings.shToBytes(sh);
+    for (int i = 0; i < sh.length; i++) {
+      sh[i] = 0; // wipe the interim polynomial
+    }
+    return shBytes;
+  }
+
+  /// Advance the orbit forward into stage [target]: run the memory-hard step
+  /// `o_target = H*(K_{target-1})` (via [GreatWallCore.advanceOrbit] in a worker
+  /// isolate, at the current `P`/`D` profile + derivation steps) and, on success,
+  /// store `o_target` and land on it. The preceding stage must be complete
+  /// (`K_{target-1}` derived); otherwise this reports what is missing. Re-placing
+  /// a point in an earlier stage cascade-invalidates the deeper `o_i`/`K_i` (see
+  /// [_setPrimary]), so a forward advance always rebuilds from a settled prefix.
+  Future<void> _advanceOrbitInto(int target) async {
+    final int from = target - 1;
+    final Uint8List? oFrom = _stageOrbit(from);
+    if (oFrom == null || _orbitK[from] == null) {
+      _sounds.play(UiSound.denyBlocked);
+      _toast('Place stage $from’s ${_requiredFractals[from]} required points '
+          'first.');
+      return;
+    }
+    final Uint8List? shBytes = _stageShBytes(from);
+    if (shBytes == null) {
+      _sounds.play(UiSound.denyBlocked);
+      _toast('Place stage $from’s ${_requiredFractals[from]} required points '
+          'first.');
+      return;
+    }
+    setState(() => _advancing = true);
+    _sounds.play(UiSound.focus);
+    ({Uint8List k, Uint8List next})? adv;
+    try {
+      adv = await widget.core.advanceOrbit(
+        oFrom,
+        shBytes,
+        steps: _iterations < 1 ? 1 : _iterations,
+        profile: _profile,
+      );
+    } catch (_) {
+      adv = null;
+    } finally {
+      Entropy.wipe(shBytes);
+      if (mounted) setState(() => _advancing = false);
+    }
+    if (!mounted) return;
+    if (adv == null) {
+      _sounds.play(UiSound.warn);
+      _toast('Orbit advance failed — try again.');
+      return;
+    }
+    // adv.k == K_{from}; adv.next == o_{target}. Keep only o_target; the K copy
+    // is redundant with _orbitK[from] and is wiped.
+    Entropy.wipe(adv.k);
+    final Uint8List? oldNext = _orbitO[target];
+    if (oldNext != null) Entropy.wipe(oldNext);
+    _orbitO[target] = adv.next;
+    _setOrbitStage(target);
+    _sounds.play(UiSound.stageReady);
+    _toast('Advanced to stage $target — place its points.');
   }
 
   /// Move the orbit cursor to [index] and reset the per-board transient state so
@@ -2118,6 +2201,10 @@ class _SetupScreenState extends State<SetupScreen> {
       _boardPoints[stage][slot] = point;
       _boardDerived[stage][slot] = false;
       _recomputeExtraShares(stage);
+      // Changing a point in this stage re-roots every deeper stage
+      // (o_{i+1}=H*(K_i)), so their advanced o_i / K_i and any placed points no
+      // longer decode — drop them; the user re-advances from the settled prefix.
+      _invalidateDeeperThan(stage);
       // Placing this point (and re-deriving the shares) invalidates the cached
       // island decorations; the canonical view (if any) referred to the old one.
       _boardDecoCache.clear();
@@ -2125,6 +2212,32 @@ class _SetupScreenState extends State<SetupScreen> {
     });
     // Pick the marker mode for the freshly placed point at the current zoom.
     _updateBoardMarkerMode();
+  }
+
+  /// Drop every stage deeper than [stage] (wiping its chunks, points, `o_i` and
+  /// `K_i`). Called when an earlier stage's point changes, since a re-rooted
+  /// prefix invalidates the whole memory-hard advance chain below it. Must run
+  /// inside a [setState].
+  void _invalidateDeeperThan(int stage) {
+    for (int st = stage + 1; st <= _maxStage; st++) {
+      for (int s = 1; s <= _maxSlot; s++) {
+        final List<int>? c = _boardChunks[st][s];
+        if (c != null) Entropy.wipe(c);
+        _boardChunks[st][s] = null;
+        _boardPoints[st][s] = null;
+        _boardDerived[st][s] = false;
+      }
+      final Uint8List? k = _orbitK[st];
+      if (k != null) {
+        Entropy.wipe(k);
+        _orbitK[st] = null;
+      }
+      final Uint8List? o = _orbitO[st];
+      if (o != null) {
+        Entropy.wipe(o);
+        _orbitO[st] = null;
+      }
+    }
   }
 
   /// Derive [stage]'s forgetting-resistance shares (slots `r_i+1..`[_maxSlot])
@@ -2574,7 +2687,11 @@ class _SetupScreenState extends State<SetupScreen> {
                 child: const Text('Halt'),
               )
             : Text(
-                _setup.phase == SetupPhase.encoding ? 'Encoding…' : 'Working…',
+                _advancing
+                    ? 'Advancing the orbit (memory-hard)…'
+                    : _setup.phase == SetupPhase.encoding
+                        ? 'Encoding…'
+                        : 'Working…',
                 style: const TextStyle(color: Colors.white),
               ),
       ),
