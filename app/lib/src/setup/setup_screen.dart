@@ -297,6 +297,10 @@ class _SetupScreenState extends State<SetupScreen> {
   /// import surface, mutually exclusive with the chain import.
   int? _boardImportSlot;
 
+  /// Canonical islands enumerated under the current view (the `E` reveal) on the
+  /// active board's fractal — cleared on any slot / σ change.
+  List<CanvasIsland> _boardIslands = const <CanvasIsland>[];
+
   /// True at a stage-0 fractal slot (`#j≥1`) — the orbit-board context.
   bool get _isBoardSlot => _activeStage == 0 && _slotIndex >= 1;
 
@@ -746,9 +750,11 @@ class _SetupScreenState extends State<SetupScreen> {
     _sounds.play(UiSound.navStage);
     setState(() {
       _slotIndex = i;
-      // Any point entry armed for the previous slot no longer applies.
+      // Any point entry armed for the previous slot no longer applies, and the
+      // revealed islands belonged to the previous board's fractal.
       _editPointMode = false;
       _boardImportSlot = null;
+      _boardIslands = const <CanvasIsland>[];
     });
     // Landing on a board resets the view, so each fractal opens centred at the
     // default zoom/brightness (the same recenter stage selection performs).
@@ -1200,7 +1206,7 @@ class _SetupScreenState extends State<SetupScreen> {
     // busy.
     if (event.logicalKey == LogicalKeyboardKey.keyE) {
       if (!_busy) {
-        unawaited(_enumerateIslands());
+        unawaited(_isBoardSlot ? _boardEnumerateIslands() : _enumerateIslands());
       }
       return KeyEventResult.handled;
     }
@@ -1534,13 +1540,7 @@ class _SetupScreenState extends State<SetupScreen> {
   Widget _orbitBoardPanel(int slot) {
     final StageParameters? bp = _stage0BoardParams(slot);
     if (bp == null) return _boardNeedsSigmaPanel(slot);
-    final ({int reRaw, int imRaw})? pt = _stage0Points[slot];
-    final CanvasOverlays overlays = pt == null
-        ? CanvasOverlays.empty
-        : CanvasOverlays(crosses: <CrossMarker>[
-            CrossMarker(
-                re: fixedToDouble(pt.reRaw), im: fixedToDouble(pt.imRaw)),
-          ]);
+    final CanvasOverlays overlays = _boardOverlays(slot);
     return FractalCanvas(
       source: widget.core.source,
       controller: _viewport,
@@ -1560,6 +1560,21 @@ class _SetupScreenState extends State<SetupScreen> {
     );
   }
 
+  /// Overlays for the active board: the placed point's marker plus any islands
+  /// revealed by `E`. The marker is a fixed cross for now; the cross↔square
+  /// switch (with the focus island's cells and frame) folds in next.
+  CanvasOverlays _boardOverlays(int slot) {
+    final ({int reRaw, int imRaw})? pt = _stage0Points[slot];
+    return CanvasOverlays(
+      islands: _boardIslands,
+      crosses: <CrossMarker>[
+        if (pt != null)
+          CrossMarker(
+              re: fixedToDouble(pt.reRaw), im: fixedToDouble(pt.imRaw)),
+      ],
+    );
+  }
+
   /// Board reservoirs `(o, p, q)` for stage-0 slot [slot] (board `θ_0_(slot-1)`),
   /// or null when σ is unset/invalid. Cheap (`orbitRoot` + `theta`).
   ({int o, int p, int q})? _boardPrm(int slot) {
@@ -1567,6 +1582,102 @@ class _SetupScreenState extends State<SetupScreen> {
     if (sigma == null || sigma.isEmpty) return null;
     final Uint8List o0 = widget.core.orbitRoot(sigma);
     return OrbitProtocol(widget.core).orbitParams(o0, slot - 1);
+  }
+
+  /// Discovery params for resolving a canonical island's *shape* — the engine's
+  /// encode params with a larger flood cap so the island is a real shape, not a
+  /// speck. Pure visualisation; never affects encoded bits. (Peer of
+  /// SetupController's `_islandVizParams`.)
+  CoreDiscoveryParams get _islandVizParams {
+    final CoreDiscoveryParams b = widget.core.encodeParams;
+    return CoreDiscoveryParams(
+      maxIter: b.maxIter,
+      targetGood: b.targetGood,
+      maxFloodPoints: EncodingConstants.canonicalIslandMaxFloodPoints,
+      minGridCells: b.minGridCells,
+      pMaxShift: b.pMaxShift,
+      exclusionThresholdNum: b.exclusionThresholdNum,
+      rngSeed: b.rngSeed,
+    );
+  }
+
+  /// Build the canonical-island decoration (cells + bbox) for a known leaf on the
+  /// board's `(o, p, q)`, or null if the island can't be resolved. (Peer of
+  /// SetupController's `_islandDecoForLeaf`.)
+  _BoardDeco? _boardIslandDecoForLeaf(
+      FixedRect leafRect, String path, int o, int p, int q) {
+    final CoreCanonicalIsland? isl = widget.core.bindings.canonicalIsland(
+      leafRect: leafRect,
+      params: _islandVizParams,
+      o: o,
+      p: p,
+      q: q,
+      path: path,
+    );
+    if (isl == null || isl.pointsRaw.isEmpty) return null;
+    final List<double> pts = List<double>.filled(isl.pointsRaw.length, 0);
+    for (int i = 0; i < isl.pointsRaw.length; i++) {
+      pts[i] = fixedToDouble(isl.pointsRaw[i]);
+    }
+    return _BoardDeco(
+      cells: CanvasIsland(
+          cellSize: fixedToDouble(isl.pixelDeltaRaw), pointsReIm: pts),
+      reMin: fixedToDouble(isl.bbox.reMin),
+      reMax: fixedToDouble(isl.bbox.reMax),
+      imMin: fixedToDouble(isl.bbox.imMin),
+      imMax: fixedToDouble(isl.bbox.imMax),
+    );
+  }
+
+  /// `E` on a board: enumerate the canonical leaf areas under the current view on
+  /// the active board's fractal and highlight each one's island (the board peer
+  /// of [_enumerateIslands] / SetupController.enumerateCanonicalIslands).
+  Future<void> _boardEnumerateIslands() async {
+    final int slot = _slotIndex;
+    final ({int o, int p, int q})? prm = _boardPrm(slot);
+    final StageParameters? bp = _boardParams;
+    if (prm == null || bp == null) {
+      _sounds.play(UiSound.denyBlocked);
+      return;
+    }
+    _sounds.play(UiSound.focus);
+    // Point the leaf source at this board so the decode/enumerate run on the
+    // same fractal that is on screen.
+    widget.core.leafSource.reservoirs =
+        StageReservoirs(o: prm.o, p: prm.p, q: prm.q);
+    final LeafAreasResult res = await widget.core.leafSource.leafAreas(
+      LeafAreasRequest(
+        viewport: _viewport.viewport,
+        stage: Stage.stage2,
+        stageParameters: bp,
+        numBits: EncodingConstants.bitsPerPoint,
+      ),
+    );
+    if (!mounted) return;
+    if (res.tooMany) {
+      _sounds.play(UiSound.warn);
+      _toast('Too many / too dense to enumerate here — zoom in.');
+      return;
+    }
+    final List<CanvasIsland> islands = <CanvasIsland>[];
+    for (final LeafArea leaf in res.leaves) {
+      final _BoardDeco? deco = _boardIslandDecoForLeaf(
+        FixedRect.fromDoubles(leaf.reMin, leaf.reMax, leaf.imMin, leaf.imMax),
+        leaf.path,
+        prm.o,
+        prm.p,
+        prm.q,
+      );
+      if (deco != null) islands.add(deco.cells);
+    }
+    setState(() => _boardIslands = islands);
+    if (islands.isEmpty) {
+      _sounds.play(UiSound.denyMiss);
+      _toast('No canonical islands in view — zoom in.');
+    } else {
+      _sounds.play(UiSound.confirm);
+      _toast('Highlighted ${islands.length} canonical island(s).');
+    }
   }
 
   /// Arm a manual point placement for the current board slot — the board peer of
@@ -1751,6 +1862,7 @@ class _SetupScreenState extends State<SetupScreen> {
       _stage0Points[s] = null;
       _stage0Derived[s] = false;
     }
+    _boardIslands = const <CanvasIsland>[];
   }
 
   /// Informational panel section for the active stage-0 board: the slot's role,
@@ -4490,6 +4602,25 @@ class _SetupScreenState extends State<SetupScreen> {
 /// imported BIP39 phrase, or a cold-start recall of an existing setup (derive
 /// from the salt and reconstruct the seed from the user's clicks).
 enum _SourceMode { fresh, import, recall }
+
+/// A stage-0 board's canonical-island decoration: the island cells plus its
+/// bounding box (fractal coords), used to draw the square frame and to size the
+/// cross↔square switch. The orbit peer of SetupController's `_IslandDeco`.
+class _BoardDeco {
+  const _BoardDeco({
+    required this.cells,
+    required this.reMin,
+    required this.reMax,
+    required this.imMin,
+    required this.imMax,
+  });
+
+  final CanvasIsland cells;
+  final double reMin;
+  final double reMax;
+  final double imMin;
+  final double imMax;
+}
 
 /// How imported entropy is entered: BIP39 words, or blind uppercase hex (for
 /// users who trust an external randomness source over the device RNG).
