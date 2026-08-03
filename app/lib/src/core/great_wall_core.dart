@@ -347,12 +347,23 @@ class GreatWallCore {
   /// isolate so the >= 1 GiB/pass blocking call never stalls the UI isolate.
   /// Returns `(k, next)`, each 32 bytes. Not cancellable (a single pass cannot be
   /// preempted mid-call), matching [argon2idMaster].
+  ///
+  /// [steps] `== 0` is the **pass-through** case — zero memory-hard applications,
+  /// so `o_{i+1} = advance_with(K_i, 0) = K_i`. It is computed inline with the
+  /// cheap `H` (no isolate, instant), mirroring [startStageDerivation]'s
+  /// `iterations == 0` identity. Both this build path and recovery go through the
+  /// facade, so a `D == 0` orbit is self-consistent — but it is **not
+  /// memory-hard**, so it is a dev / testing convenience, not a production setup.
   Future<({Uint8List k, Uint8List next})> advanceOrbit(
     Uint8List oI,
     Uint8List sh, {
     int steps = 1,
     Argon2Profile profile = Argon2Profile.basic,
   }) async {
+    if (steps <= 0) {
+      final Uint8List k = masterSecret(oI, sh); // K_i = H(o_i ‖ Sh_i)
+      return (k: k, next: Uint8List.fromList(k)); // o_{i+1} = K_i (0 passes)
+    }
     final ReceivePort port = ReceivePort();
     final Completer<({Uint8List k, Uint8List next})> completer =
         Completer<({Uint8List k, Uint8List next})>();

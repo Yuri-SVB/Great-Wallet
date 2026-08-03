@@ -1628,21 +1628,26 @@ class _SetupScreenState extends State<SetupScreen> {
           'first.');
       return;
     }
-    setState(() => _advancing = true);
+    // D (`_iterations`) is the number of memory-hard passes per advance. D == 0
+    // is the instant pass-through (o_{i+1} = K_i, non-memory-hard) — a dev/test
+    // convenience, so it skips the "advancing" scrim; D >= 1 shows it.
+    final int steps = _iterations;
+    final bool memoryHard = steps >= 1;
+    if (memoryHard) setState(() => _advancing = true);
     _sounds.play(UiSound.focus);
     ({Uint8List k, Uint8List next})? adv;
     try {
       adv = await widget.core.advanceOrbit(
         oFrom,
         shBytes,
-        steps: _iterations < 1 ? 1 : _iterations,
+        steps: steps,
         profile: _profile,
       );
     } catch (_) {
       adv = null;
     } finally {
       Entropy.wipe(shBytes);
-      if (mounted) setState(() => _advancing = false);
+      if (memoryHard && mounted) setState(() => _advancing = false);
     }
     if (!mounted) return;
     if (adv == null) {
