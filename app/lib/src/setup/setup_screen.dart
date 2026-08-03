@@ -282,24 +282,39 @@ class _SetupScreenState extends State<SetupScreen> {
   StageReservoirs? _boardReservoirs;
   String _boardKey = '';
 
-  // --- P5: stage-0 point placement + Shamir extrapolation -------------------
-  // Per fractal slot (1..[_maxSlot]) of stage 0: the placed 32-bit chunk and its
-  // encoded board point. Slots 1..r_0 are user-placed (primary); slots r_0+1..6
-  // are DERIVED — Sh_0 evaluated at the resistance abscissae (by the engine) —
-  // and locked. Index 0 (salt) is unused. Session-only; wiped when σ changes.
-  final List<List<int>?> _stage0Chunks =
-      List<List<int>?>.filled(_maxSlot + 1, null);
-  final List<({int reRaw, int imRaw})?> _stage0Points =
-      List<({int reRaw, int imRaw})?>.filled(_maxSlot + 1, null);
-  final List<bool> _stage0Derived = List<bool>.filled(_maxSlot + 1, false);
+  // --- P5: per-stage orbit board state --------------------------------------
+  // Highest orbit stage index (mirrors the legacy stage ceiling).
+  static const int _maxStage = SetupController.maxPointStages;
 
-  /// The stage-0 master secret `K_0 = H(o_0 ‖ Sh_0)`, recomputed by
-  /// [_recomputeExtraShares] whenever the `r_0` primaries are complete, and null
-  /// otherwise. Coercion-relevant — wiped and nulled on any placement clear (and
-  /// hence on dispose, via [_clearStage0Placements]). The board export (`K` /
-  /// `Alt+K`) copies this (optionally domain-separated by the export-salt label)
-  /// through [_copyOrbitMaster].
-  Uint8List? _k0;
+  // Per orbit stage i (0..[_maxStage]) and fractal slot (1..[_maxSlot]): the
+  // placed 32-bit chunk and its encoded board point. Slots 1..r_i are
+  // user-placed (primary); slots r_i+1.. are DERIVED — Sh_i evaluated at the
+  // resistance abscissae (by the engine) — and locked. Slot 0 (salt) is unused.
+  // Session-only; wiped when σ changes. Indexed `[stage][slot]`.
+  final List<List<List<int>?>> _boardChunks = List<List<List<int>?>>.generate(
+      _maxStage + 1, (_) => List<List<int>?>.filled(_maxSlot + 1, null));
+  final List<List<({int reRaw, int imRaw})?>> _boardPoints =
+      List<List<({int reRaw, int imRaw})?>>.generate(_maxStage + 1,
+          (_) => List<({int reRaw, int imRaw})?>.filled(_maxSlot + 1, null));
+  final List<List<bool>> _boardDerived = List<List<bool>>.generate(
+      _maxStage + 1, (_) => List<bool>.filled(_maxSlot + 1, false));
+
+  /// Per-stage orbit point `o_i`. `o_0` is derived on the fly from σ (see
+  /// [_stageOrbit]); `o_i` (`i≥1`) is the memory-hard advance `o_i = H*(K_{i-1})`,
+  /// filled when the user advances forward (P5 deep stages). Null until derived.
+  /// Coercion-relevant — wiped on any placement clear / dispose.
+  final List<Uint8List?> _orbitO = List<Uint8List?>.filled(_maxStage + 1, null);
+
+  /// Per-stage master secret `K_i = H(o_i ‖ Sh_i)`, recomputed by
+  /// [_recomputeExtraShares] whenever stage `i`'s `r_i` primaries are complete,
+  /// and null otherwise. Coercion-relevant — wiped and nulled on any placement
+  /// clear (and hence on dispose, via [_clearOrbitPlacements]). The board export
+  /// (`K` / `Alt+K`) copies the active stage's `K_i` (optionally domain-separated
+  /// by the export-salt label) through [_copyOrbitMaster].
+  final List<Uint8List?> _orbitK = List<Uint8List?>.filled(_maxStage + 1, null);
+
+  /// The active stage's master secret `K_i`, or null until its primaries are in.
+  Uint8List? get _activeK => _orbitK[_activeStage];
 
   /// The stage-0 slot whose point is being imported inline, or null. Reuses the
   /// legacy point-import editor ([_importEditorBody] / [_pointImport]) — one
@@ -340,11 +355,11 @@ class _SetupScreenState extends State<SetupScreen> {
   bool get _isBoardSlot => _activeStage == 0 && _slotIndex >= 1;
 
   /// True when the current slot is a **primary** board that still takes a point
-  /// (slot `1..r_0`, not a derived share) — i.e. placement is allowed.
+  /// (slot `1..r_i`, not a derived share) — i.e. placement is allowed.
   bool get _placeableBoardSlot =>
       _isBoardSlot &&
-      _slotIndex <= _requiredFractals[0] &&
-      !_stage0Derived[_slotIndex];
+      _slotIndex <= _requiredFractals[_activeStage] &&
+      !_boardDerived[_activeStage][_slotIndex];
 
   /// A confirmation awaiting an inline answer in the console (replaces modal
   /// dialogs). Resolved by the console's action buttons.
@@ -533,7 +548,7 @@ class _SetupScreenState extends State<SetupScreen> {
     widget.core.leafSource.reservoirs = null;
     _boardReservoirs?.clear();
     // Wipe placed/derived board chunks (session-only point material).
-    _clearStage0Placements();
+    _clearOrbitPlacements();
     _sigmaCtrl.dispose();
     _explorerCtrl.dispose();
     _setup.removeListener(_onSetupChanged);
@@ -1031,7 +1046,7 @@ class _SetupScreenState extends State<SetupScreen> {
               style: theme.textTheme.bodySmall,
               // A new σ re-roots every board, so any placed/derived points no
               // longer decode — drop them.
-              onChanged: (_) => setState(_clearStage0Placements),
+              onChanged: (_) => setState(_clearOrbitPlacements),
               decoration: const InputDecoration(
                 border: OutlineInputBorder(),
                 isDense: true,
@@ -1303,8 +1318,8 @@ class _SetupScreenState extends State<SetupScreen> {
     // (which could be stale): a live setup means the export label.
     if (event.logicalKey == LogicalKeyboardKey.keyS) {
       // The export-salt field is shown either in a live setup or on a stage-0
-      // board once K_0 is derived; the config-screen salt/pepper otherwise.
-      if (_hasSession || (_isBoardSlot && _k0 != null)) {
+      // board once K_i is derived; the config-screen salt/pepper otherwise.
+      if (_hasSession || (_isBoardSlot && _activeK != null)) {
         _focusField(_exportLabelFocus, 'export salt');
       } else {
         _focusField(_stage0Focus, 'salt / pepper');
@@ -1577,7 +1592,7 @@ class _SetupScreenState extends State<SetupScreen> {
   /// like editing a chain point (so the canvas takes a click only in select /
   /// edit mode). When σ is unset/invalid a "set σ first" panel is shown.
   Widget _orbitBoardPanel(int slot) {
-    final StageParameters? bp = _stage0BoardParams(slot);
+    final StageParameters? bp = _boardRenderParams(slot);
     if (bp == null) return _boardNeedsSigmaPanel(slot);
     final CanvasOverlays overlays = _boardOverlays(slot);
     return FractalCanvas(
@@ -1604,7 +1619,7 @@ class _SetupScreenState extends State<SetupScreen> {
   /// once the island spans enough pixels it becomes a square frame around its
   /// cells (the switch has hysteresis — see [_updateBoardMarkerMode]).
   CanvasOverlays _boardOverlays(int slot) {
-    final ({int reRaw, int imRaw})? pt = _stage0Points[slot];
+    final ({int reRaw, int imRaw})? pt = _boardPoints[_activeStage][slot];
     final _BoardDeco? deco = pt == null ? null : _boardDecoFor(slot);
     final bool square = _boardMarkerSquare && deco != null;
     final List<CrossMarker> crosses = <CrossMarker>[];
@@ -1636,13 +1651,27 @@ class _SetupScreenState extends State<SetupScreen> {
     );
   }
 
-  /// Board reservoirs `(o, p, q)` for stage-0 slot [slot] (board `θ_0_(slot-1)`),
-  /// or null when σ is unset/invalid. Cheap (`orbitRoot` + `theta`).
+  /// The orbit point `o_i` for [stage]. Stage 0 is `o_0 = H(σ)` (derived on the
+  /// fly from slot 0's Namtso salt, so there is no separate `o_0` state to keep
+  /// in sync); a deep stage's `o_i = H*(K_{i-1})` is read from [_orbitO], filled
+  /// by the forward-navigation advance. Null when σ is unset/invalid (stage 0) or
+  /// the stage has not been advanced into yet (deep stages).
+  Uint8List? _stageOrbit(int stage) {
+    if (stage == 0) {
+      final Uint8List? sigma = _parseHex(_sigmaCtrl.text.trim());
+      if (sigma == null || sigma.isEmpty) return null;
+      return widget.core.orbitRoot(sigma);
+    }
+    return _orbitO[stage];
+  }
+
+  /// Board reservoirs `(o, p, q)` for the active stage's slot [slot] (board
+  /// `θ_i_(slot-1)`), or null when the stage's `o_i` is unavailable. Cheap
+  /// (`orbitRoot`/`theta`).
   ({int o, int p, int q})? _boardPrm(int slot) {
-    final Uint8List? sigma = _parseHex(_sigmaCtrl.text.trim());
-    if (sigma == null || sigma.isEmpty) return null;
-    final Uint8List o0 = widget.core.orbitRoot(sigma);
-    return OrbitProtocol(widget.core).orbitParams(o0, slot - 1);
+    final Uint8List? oi = _stageOrbit(_activeStage);
+    if (oi == null) return null;
+    return OrbitProtocol(widget.core).orbitParams(oi, slot - 1);
   }
 
   /// Discovery params for resolving a canonical island's *shape* — the engine's
@@ -1768,7 +1797,7 @@ class _SetupScreenState extends State<SetupScreen> {
   /// point / σ changes. Null when the slot has no point.
   _BoardDeco? _boardDecoFor(int slot) {
     if (_boardDecoCache.containsKey(slot)) return _boardDecoCache[slot];
-    final ({int reRaw, int imRaw})? pt = _stage0Points[slot];
+    final ({int reRaw, int imRaw})? pt = _boardPoints[_activeStage][slot];
     final ({int o, int p, int q})? prm = _boardPrm(slot);
     _BoardDeco? deco;
     if (pt != null && prm != null) {
@@ -1984,16 +2013,18 @@ class _SetupScreenState extends State<SetupScreen> {
     );
   }
 
-  /// Record slot [slot]'s primary chunk + point (copying [bits]) and re-derive
-  /// the extra shares from the (possibly now complete) primaries.
+  /// Record slot [slot]'s primary chunk + point (copying [bits]) on the active
+  /// stage and re-derive that stage's extra shares from the (possibly now
+  /// complete) primaries.
   void _setPrimary(int slot, List<int> bits, ({int reRaw, int imRaw}) point) {
+    final int stage = _activeStage;
     setState(() {
-      final List<int>? old = _stage0Chunks[slot];
+      final List<int>? old = _boardChunks[stage][slot];
       if (old != null) Entropy.wipe(old);
-      _stage0Chunks[slot] = List<int>.of(bits);
-      _stage0Points[slot] = point;
-      _stage0Derived[slot] = false;
-      _recomputeExtraShares();
+      _boardChunks[stage][slot] = List<int>.of(bits);
+      _boardPoints[stage][slot] = point;
+      _boardDerived[stage][slot] = false;
+      _recomputeExtraShares(stage);
       // Placing this point (and re-deriving the shares) invalidates the cached
       // island decorations; the canonical view (if any) referred to the old one.
       _boardDecoCache.clear();
@@ -2003,112 +2034,132 @@ class _SetupScreenState extends State<SetupScreen> {
     _updateBoardMarkerMode();
   }
 
-  /// Derive the forgetting-resistance shares (slots `r_0+1..`[_maxSlot]) from the
-  /// `r_0` primary points. `Sh_0 = shamirInterp(primaries)`; the engine evaluates
-  /// it at the reserved resistance abscissae
-  /// ([GreatWallCore.generateResistanceShares]); each value is encoded onto its
-  /// board `θ_0_(s-1)` for display. Missing a primary (or σ) simply clears them.
-  /// Any `r_0` of the boards reconstruct the identical `Sh_0` (orbit_protocol
-  /// _test). Must run inside a [setState].
-  void _recomputeExtraShares() {
-    final int r0 = _requiredFractals[0];
-    // K_0 is only valid while the primaries are complete; drop the previous one
+  /// Derive [stage]'s forgetting-resistance shares (slots `r_i+1..`[_maxSlot])
+  /// from its `r_i` primary points, and (re)compute `K_i = H(o_i ‖ Sh_i)` into
+  /// [_orbitK]. `Sh_i = shamirInterp(primaries)`; the engine evaluates it at the
+  /// reserved resistance abscissae ([GreatWallCore.generateResistanceShares]);
+  /// each value is encoded onto its board `θ_i_(s-1)` for display. Missing a
+  /// primary (or `o_i`) simply clears them and `K_i`. Any `r_i` of the boards
+  /// reconstruct the identical `Sh_i` (orbit_protocol_test). Must run inside a
+  /// [setState].
+  void _recomputeExtraShares(int stage) {
+    final int r = _requiredFractals[stage];
+    // K_i is only valid while the primaries are complete; drop the previous one
     // up front so every incomplete early-return below leaves it null.
-    if (_k0 != null) {
-      Entropy.wipe(_k0!);
-      _k0 = null;
+    final Uint8List? oldK = _orbitK[stage];
+    if (oldK != null) {
+      Entropy.wipe(oldK);
+      _orbitK[stage] = null;
     }
-    for (int s = r0 + 1; s <= _maxSlot; s++) {
-      if (_stage0Derived[s]) {
-        final List<int>? c = _stage0Chunks[s];
+    for (int s = r + 1; s <= _maxSlot; s++) {
+      if (_boardDerived[stage][s]) {
+        final List<int>? c = _boardChunks[stage][s];
         if (c != null) Entropy.wipe(c);
-        _stage0Chunks[s] = null;
-        _stage0Points[s] = null;
-        _stage0Derived[s] = false;
+        _boardChunks[stage][s] = null;
+        _boardPoints[stage][s] = null;
+        _boardDerived[stage][s] = false;
       }
     }
     final List<int> xs = <int>[];
     final List<int> ys = <int>[];
-    for (int s = 1; s <= r0; s++) {
-      final List<int>? c = _stage0Chunks[s];
-      if (c == null || _stage0Derived[s]) return; // primaries incomplete
+    for (int s = 1; s <= r; s++) {
+      final List<int>? c = _boardChunks[stage][s];
+      if (c == null || _boardDerived[stage][s]) return; // primaries incomplete
       xs.add(s); // primary abscissa = slot number
       ys.add(OrbitProtocol.bitsToU32(c));
     }
-    final Uint8List? sigma = _parseHex(_sigmaCtrl.text.trim());
-    if (sigma == null || sigma.isEmpty) return;
-    final Uint8List o0 = widget.core.orbitRoot(sigma);
+    final Uint8List? oi = _stageOrbit(stage);
+    if (oi == null) return;
     final OrbitProtocol orbit = OrbitProtocol(widget.core);
     final List<int> sh = widget.core.shamirInterp(xs, ys);
-    // K_0 = H(o_0 ‖ Sh_0): the stage-0 master secret, exported (optionally
-    // domain-separated) by K / Alt+K. Computed here while Sh_0 is in hand.
+    // K_i = H(o_i ‖ Sh_i): the per-stage master secret, exported (optionally
+    // domain-separated) by K / Alt+K. Computed here while Sh_i is in hand.
     final Uint8List shBytes = GreatWallCoreBindings.shToBytes(sh);
-    _k0 = widget.core.masterSecret(o0, shBytes);
+    _orbitK[stage] = widget.core.masterSecret(oi, shBytes);
     Entropy.wipe(shBytes);
-    final int extras = _maxSlot - r0;
+    final int extras = _maxSlot - r;
     final List<int> shares = widget.core.generateResistanceShares(sh, extras);
     for (int i = 0; i < extras; i++) {
-      final int s = r0 + 1 + i;
+      final int s = r + 1 + i;
       final List<int> bits = OrbitProtocol.u32ToBits(shares[i]);
-      final ({int o, int p, int q}) prm = orbit.orbitParams(o0, s - 1);
+      final ({int o, int p, int q}) prm = orbit.orbitParams(oi, s - 1);
       final EncodedPoint pt = widget.core
           .encodeStage(List<int>.of(bits), o: prm.o, p: prm.p, q: prm.q)
           .first;
-      _stage0Chunks[s] = bits; // owns it
-      _stage0Points[s] = (reRaw: pt.reRaw, imRaw: pt.imRaw);
-      _stage0Derived[s] = true;
+      _boardChunks[stage][s] = bits; // owns it
+      _boardPoints[stage][s] = (reRaw: pt.reRaw, imRaw: pt.imRaw);
+      _boardDerived[stage][s] = true;
     }
     for (int i = 0; i < sh.length; i++) {
-      sh[i] = 0; // Sh_0 is coercion-relevant — zero it once shares are made.
+      sh[i] = 0; // Sh_i is coercion-relevant — zero it once shares are made.
     }
   }
 
-  /// Drop every stage-0 placement (wiping chunks) — called when σ changes, since
-  /// a new σ re-roots every board and old points no longer decode.
-  void _clearStage0Placements() {
-    for (int s = 1; s <= _maxSlot; s++) {
-      final List<int>? c = _stage0Chunks[s];
-      if (c != null) Entropy.wipe(c);
-      _stage0Chunks[s] = null;
-      _stage0Points[s] = null;
-      _stage0Derived[s] = false;
+  /// Drop every orbit placement across all stages (wiping chunks, `o_i` and
+  /// `K_i`) — called when σ changes, since a new σ re-roots the whole orbit and
+  /// old points no longer decode, and on dispose.
+  void _clearOrbitPlacements() {
+    for (int st = 0; st <= _maxStage; st++) {
+      for (int s = 1; s <= _maxSlot; s++) {
+        final List<int>? c = _boardChunks[st][s];
+        if (c != null) Entropy.wipe(c);
+        _boardChunks[st][s] = null;
+        _boardPoints[st][s] = null;
+        _boardDerived[st][s] = false;
+      }
+      final Uint8List? k = _orbitK[st];
+      if (k != null) {
+        Entropy.wipe(k);
+        _orbitK[st] = null;
+      }
+      // o_0 is derived on the fly (never stored); wipe the advanced deep points.
+      final Uint8List? o = _orbitO[st];
+      if (o != null) {
+        Entropy.wipe(o);
+        _orbitO[st] = null;
+      }
     }
-    if (_k0 != null) {
-      Entropy.wipe(_k0!);
-      _k0 = null;
-    }
+    _boardKey = '';
     _boardIslands = const <CanvasIsland>[];
     _boardDecoCache.clear();
     _boardCanonicalView = false;
   }
 
-  /// Informational panel section for the active stage-0 board: the slot's role,
+  /// Informational panel section for the active orbit board: the slot's role,
   /// its placed/derived state, the hotkeys that set the point (`R` manual click,
   /// `N` random, `I`/`Alt+I` import) — routed through the existing point-entry
   /// mechanisms, so there are no bespoke buttons — and the reset-view gesture.
   List<Widget> _boardStatus() {
     final int slot = _slotIndex;
-    final int r0 = _requiredFractals[0];
-    final bool derived = _stage0Derived[slot];
-    final bool primary = slot <= r0;
-    final bool placed = _stage0Points[slot] != null;
-    final bool hasSigma = _parseHex(_sigmaCtrl.text.trim()) != null;
+    final int stage = _activeStage;
+    final int r = _requiredFractals[stage];
+    final bool derived = _boardDerived[stage][slot];
+    final bool primary = slot <= r;
+    final bool placed = _boardPoints[stage][slot] != null;
+    final bool hasRoot = stage == 0
+        ? _parseHex(_sigmaCtrl.text.trim()) != null
+        : _orbitO[stage] != null;
     final ThemeData theme = Theme.of(context);
     final Widget body;
     if (derived) {
       body = Text(
-        'Derived share (locked): Sh₀ extrapolated onto this board’s '
-        'forgetting-resistance point.',
+        'Derived share (locked): the stage’s Shamir polynomial extrapolated '
+        'onto this board’s forgetting-resistance point.',
         style: theme.textTheme.bodySmall,
       );
     } else if (!primary) {
       body = Text(
-        'Extra share — fills automatically once the $r0 required points '
-        '(slots 1–$r0) are placed.',
+        'Extra share — fills automatically once the $r required points '
+        '(slots 1–$r) are placed.',
         style: theme.textTheme.bodySmall,
       );
-    } else if (!hasSigma) {
-      body = Text('Set σ in slot 0 first.', style: theme.textTheme.bodySmall);
+    } else if (!hasRoot) {
+      body = Text(
+        stage == 0
+            ? 'Set σ in slot 0 first.'
+            : 'Advance into this stage first.',
+        style: theme.textTheme.bodySmall,
+      );
     } else {
       body = Text(
         placed
@@ -2140,19 +2191,22 @@ class _SetupScreenState extends State<SetupScreen> {
   /// key changes; otherwise the cached reservoirs are re-pointed (a plain field
   /// write, in case a deep-stage visit overwrote them) and the cached params are
   /// returned unchanged so the canvas does not needlessly repaint.
-  StageParameters? _stage0BoardParams(int slot) {
-    final String raw = _sigmaCtrl.text.trim();
-    final String key = '$raw#$slot';
+  StageParameters? _boardRenderParams(int slot) {
+    final int stage = _activeStage;
+    // Cache key: stage 0 keys on the σ text (so no `orbitRoot` hash runs on a
+    // pan/zoom rebuild); deep stages key on `stage#slot` alone, since their `o_i`
+    // is stable until an advance / σ change — both of which reset [_boardKey].
+    final String key =
+        stage == 0 ? '0#$slot#${_sigmaCtrl.text.trim()}' : '$stage#$slot';
     if (key != _boardKey) {
       _boardKey = key;
-      final Uint8List? sigma = _parseHex(raw);
-      if (sigma == null || sigma.isEmpty) {
+      final Uint8List? oi = _stageOrbit(stage);
+      if (oi == null) {
         _boardReservoirs = null;
         _boardParams = null;
       } else {
-        final Uint8List o0 = widget.core.orbitRoot(sigma);
         final ({int o, int p, int q}) prm =
-            OrbitProtocol(widget.core).orbitParams(o0, slot - 1);
+            OrbitProtocol(widget.core).orbitParams(oi, slot - 1);
         final StageReservoirs res =
             StageReservoirs(o: prm.o, p: prm.p, q: prm.q);
         final ({double o, double p, double q}) dk = res.displayKey;
@@ -2160,10 +2214,9 @@ class _SetupScreenState extends State<SetupScreen> {
         _boardParams = StageParameters(o: dk.o, p: dk.p, q: dk.q);
       }
     }
-    // Re-point the render source every build (cheap): a deep-stage visit may
-    // have set its own reservoirs since this board was last shown. Safe here
-    // because this only runs at stage 0, where the legacy controller renders no
-    // fractal of its own.
+    // Re-point the render source every build (cheap): a deep-stage visit or the
+    // legacy chain may have set its own reservoirs since this board was last
+    // shown, so reclaim the shared source for the board on screen.
     widget.core.source.reservoirs = _boardReservoirs;
     widget.core.leafSource.reservoirs = _boardReservoirs;
     return _boardParams;
@@ -2740,14 +2793,15 @@ class _SetupScreenState extends State<SetupScreen> {
       child: ListView(
         children: <Widget>[
 
-          // Stage-0 orbit board status (role + placed/derived + the hotkeys that
-          // set the point). Point entry reuses the existing mechanisms — there
-          // are no bespoke buttons here.
+          // Orbit board status (role + placed/derived + the hotkeys that set the
+          // point). Point entry reuses the existing mechanisms — there are no
+          // bespoke buttons here.
           if (_isBoardSlot) ...<Widget>[
             ..._boardStatus(),
-            // Master-secret (K_0) export — offered once the r_0 primaries are
-            // complete (K_0 derived). Reuses the export-salt field + Copy button.
-            if (_k0 != null) ...<Widget>[
+            // Master-secret (K_i) export — offered once the active stage's r_i
+            // primaries are complete (K_i derived). Reuses the export-salt field
+            // + Copy button.
+            if (_activeK != null) ...<Widget>[
               const Divider(height: 32),
               ..._masterExportControls(),
             ],
@@ -4542,7 +4596,7 @@ class _SetupScreenState extends State<SetupScreen> {
   /// (all [MasterSecret.outputBytes] as hex).
   Future<void> _copyMasterSecret({bool full = false}) async {
     if (_exporting) return;
-    // On a stage-0 orbit board the "master secret" is the cheap `K_0`
+    // On an orbit board the "master secret" is the cheap per-stage `K_i`
     // (no Argon2id transcript pass); route to the orbit export.
     if (_isBoardSlot) {
       await _copyOrbitMaster(full: full);
@@ -4578,27 +4632,27 @@ class _SetupScreenState extends State<SetupScreen> {
         : 'Key copied — paste it, then clear the clipboard.');
   }
 
-  /// Copy the stage-0 orbit master secret `K_0` to the clipboard, reusing the
-  /// same field, hotkeys and button as the legacy export. An empty export-salt
-  /// label copies `K_0` itself; a non-empty one copies the domain-separated
-  /// `H(K_0 ‖ label)` (the demoted `[A-Z0-9-]` pepper — one setup, many keys).
+  /// Copy the active orbit stage's master secret `K_i` to the clipboard, reusing
+  /// the same field, hotkeys and button as the legacy export. An empty export-salt
+  /// label copies `K_i` itself; a non-empty one copies the domain-separated
+  /// `H(K_i ‖ label)` (the demoted `[A-Z0-9-]` pepper — one setup, many keys).
   /// `K` copies the conventional first-32-hex view; `Alt+K` ([full]) the whole
   /// digest. Cheap `H` throughout — no Argon2id pass, so no deriving spinner.
   Future<void> _copyOrbitMaster({bool full = false}) async {
-    final Uint8List? k0 = _k0;
-    if (k0 == null) {
+    final Uint8List? ki = _activeK;
+    if (ki == null) {
       _sounds.play(UiSound.deny);
       return;
     }
     final String label = widget.core.canonicalizeSaltPepper(_exportLabel.text);
     // Canonical `[A-Z0-9-]` is pure ASCII, so the code units are the bytes.
     final Uint8List key = label.isEmpty
-        ? k0
-        : widget.core.masterSecret(k0, Uint8List.fromList(label.codeUnits));
+        ? ki
+        : widget.core.masterSecret(ki, Uint8List.fromList(label.codeUnits));
     final String secret =
         full ? MasterSecret.fullHex(key) : MasterSecret.displayHex(key);
-    // Wipe the transient salted derivation (but never K_0, which is state).
-    if (!identical(key, k0)) Entropy.wipe(key);
+    // Wipe the transient salted derivation (but never K_i, which is state).
+    if (!identical(key, ki)) Entropy.wipe(key);
     final int chars = secret.length;
     await Clipboard.setData(ClipboardData(text: secret));
     if (!mounted) return;
@@ -4711,8 +4765,8 @@ class _SetupScreenState extends State<SetupScreen> {
             '${standard ? '' : ' (sub-standard length)'}.';
       case _Field.exportLabel:
         if (_isBoardSlot) {
-          return 'Key (master-secret export): the stage-0 orbit key '
-              'K₀ = H(o₀ ‖ Sh₀), fixed once your primary points are placed. '
+          return 'Key (master-secret export): this stage’s orbit key '
+              'Kᵢ = H(oᵢ ‖ Shᵢ), fixed once its primary points are placed. '
               'Paste into another wallet or use as a downstream pepper. This '
               'optional salt versions the key (e.g. SIGNING-1, '
               'uppercase/digits/hyphen). Press K to copy — blind, never shown.';
