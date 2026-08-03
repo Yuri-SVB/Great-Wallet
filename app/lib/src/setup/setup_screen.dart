@@ -16,6 +16,7 @@ import '../core/bip39.dart';
 import '../core/encoding_constants.dart';
 import '../core/entropy.dart';
 import '../core/great_wall_core.dart';
+import '../core/master_secret.dart';
 import '../core/namtso_harvester.dart';
 import '../core/orbit_protocol.dart';
 import '../core/stage_params.dart';
@@ -291,6 +292,14 @@ class _SetupScreenState extends State<SetupScreen> {
   final List<({int reRaw, int imRaw})?> _stage0Points =
       List<({int reRaw, int imRaw})?>.filled(_maxSlot + 1, null);
   final List<bool> _stage0Derived = List<bool>.filled(_maxSlot + 1, false);
+
+  /// The stage-0 master secret `K_0 = H(o_0 ‖ Sh_0)`, recomputed by
+  /// [_recomputeExtraShares] whenever the `r_0` primaries are complete, and null
+  /// otherwise. Coercion-relevant — wiped and nulled on any placement clear (and
+  /// hence on dispose, via [_clearStage0Placements]). The board export (`K` /
+  /// `Alt+K`) copies this (optionally domain-separated by the export-salt label)
+  /// through [_copyOrbitMaster].
+  Uint8List? _k0;
 
   /// The stage-0 slot whose point is being imported inline, or null. Reuses the
   /// legacy point-import editor ([_importEditorBody] / [_pointImport]) — one
@@ -1293,7 +1302,9 @@ class _SetupScreenState extends State<SetupScreen> {
     // coexist, so pick by session state rather than a focus node's context
     // (which could be stale): a live setup means the export label.
     if (event.logicalKey == LogicalKeyboardKey.keyS) {
-      if (_hasSession) {
+      // The export-salt field is shown either in a live setup or on a stage-0
+      // board once K_0 is derived; the config-screen salt/pepper otherwise.
+      if (_hasSession || (_isBoardSlot && _k0 != null)) {
         _focusField(_exportLabelFocus, 'export salt');
       } else {
         _focusField(_stage0Focus, 'salt / pepper');
@@ -2001,6 +2012,12 @@ class _SetupScreenState extends State<SetupScreen> {
   /// _test). Must run inside a [setState].
   void _recomputeExtraShares() {
     final int r0 = _requiredFractals[0];
+    // K_0 is only valid while the primaries are complete; drop the previous one
+    // up front so every incomplete early-return below leaves it null.
+    if (_k0 != null) {
+      Entropy.wipe(_k0!);
+      _k0 = null;
+    }
     for (int s = r0 + 1; s <= _maxSlot; s++) {
       if (_stage0Derived[s]) {
         final List<int>? c = _stage0Chunks[s];
@@ -2023,6 +2040,11 @@ class _SetupScreenState extends State<SetupScreen> {
     final Uint8List o0 = widget.core.orbitRoot(sigma);
     final OrbitProtocol orbit = OrbitProtocol(widget.core);
     final List<int> sh = widget.core.shamirInterp(xs, ys);
+    // K_0 = H(o_0 ‖ Sh_0): the stage-0 master secret, exported (optionally
+    // domain-separated) by K / Alt+K. Computed here while Sh_0 is in hand.
+    final Uint8List shBytes = GreatWallCoreBindings.shToBytes(sh);
+    _k0 = widget.core.masterSecret(o0, shBytes);
+    Entropy.wipe(shBytes);
     final int extras = _maxSlot - r0;
     final List<int> shares = widget.core.generateResistanceShares(sh, extras);
     for (int i = 0; i < extras; i++) {
@@ -2050,6 +2072,10 @@ class _SetupScreenState extends State<SetupScreen> {
       _stage0Chunks[s] = null;
       _stage0Points[s] = null;
       _stage0Derived[s] = false;
+    }
+    if (_k0 != null) {
+      Entropy.wipe(_k0!);
+      _k0 = null;
     }
     _boardIslands = const <CanvasIsland>[];
     _boardDecoCache.clear();
@@ -2719,6 +2745,12 @@ class _SetupScreenState extends State<SetupScreen> {
           // are no bespoke buttons here.
           if (_isBoardSlot) ...<Widget>[
             ..._boardStatus(),
+            // Master-secret (K_0) export — offered once the r_0 primaries are
+            // complete (K_0 derived). Reuses the export-salt field + Copy button.
+            if (_k0 != null) ...<Widget>[
+              const Divider(height: 32),
+              ..._masterExportControls(),
+            ],
             const Divider(height: 32),
           ],
 
@@ -4510,6 +4542,12 @@ class _SetupScreenState extends State<SetupScreen> {
   /// (all [MasterSecret.outputBytes] as hex).
   Future<void> _copyMasterSecret({bool full = false}) async {
     if (_exporting) return;
+    // On a stage-0 orbit board the "master secret" is the cheap `K_0`
+    // (no Argon2id transcript pass); route to the orbit export.
+    if (_isBoardSlot) {
+      await _copyOrbitMaster(full: full);
+      return;
+    }
     final int idx = _setup.displayStageIndex;
     setState(() => _exporting = true);
     // The Argon2id pass runs off the UI isolate, so this awaits; the finally
@@ -4530,6 +4568,37 @@ class _SetupScreenState extends State<SetupScreen> {
       _sounds.play(UiSound.deny);
       return;
     }
+    final int chars = secret.length;
+    await Clipboard.setData(ClipboardData(text: secret));
+    if (!mounted) return;
+    _sounds.play(UiSound.exportOk);
+    // Confirmation never echoes the secret itself.
+    _toast(full
+        ? 'Full key copied ($chars chars) — paste it, then clear the clipboard.'
+        : 'Key copied — paste it, then clear the clipboard.');
+  }
+
+  /// Copy the stage-0 orbit master secret `K_0` to the clipboard, reusing the
+  /// same field, hotkeys and button as the legacy export. An empty export-salt
+  /// label copies `K_0` itself; a non-empty one copies the domain-separated
+  /// `H(K_0 ‖ label)` (the demoted `[A-Z0-9-]` pepper — one setup, many keys).
+  /// `K` copies the conventional first-32-hex view; `Alt+K` ([full]) the whole
+  /// digest. Cheap `H` throughout — no Argon2id pass, so no deriving spinner.
+  Future<void> _copyOrbitMaster({bool full = false}) async {
+    final Uint8List? k0 = _k0;
+    if (k0 == null) {
+      _sounds.play(UiSound.deny);
+      return;
+    }
+    final String label = widget.core.canonicalizeSaltPepper(_exportLabel.text);
+    // Canonical `[A-Z0-9-]` is pure ASCII, so the code units are the bytes.
+    final Uint8List key = label.isEmpty
+        ? k0
+        : widget.core.masterSecret(k0, Uint8List.fromList(label.codeUnits));
+    final String secret =
+        full ? MasterSecret.fullHex(key) : MasterSecret.displayHex(key);
+    // Wipe the transient salted derivation (but never K_0, which is state).
+    if (!identical(key, k0)) Entropy.wipe(key);
     final int chars = secret.length;
     await Clipboard.setData(ClipboardData(text: secret));
     if (!mounted) return;
@@ -4641,6 +4710,13 @@ class _SetupScreenState extends State<SetupScreen> {
         return 'Import phrase: $wc words → ${wc ~/ 3} stages'
             '${standard ? '' : ' (sub-standard length)'}.';
       case _Field.exportLabel:
+        if (_isBoardSlot) {
+          return 'Key (master-secret export): the stage-0 orbit key '
+              'K₀ = H(o₀ ‖ Sh₀), fixed once your primary points are placed. '
+              'Paste into another wallet or use as a downstream pepper. This '
+              'optional salt versions the key (e.g. SIGNING-1, '
+              'uppercase/digits/hyphen). Press K to copy — blind, never shown.';
+        }
         final int idx = _setup.displayStageIndex;
         return 'Key (master-secret export): Argon2id over your setup so far '
             '(stages 1–$idx). Paste into another wallet or use as a downstream '
