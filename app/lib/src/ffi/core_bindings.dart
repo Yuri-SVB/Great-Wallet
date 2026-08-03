@@ -118,6 +118,12 @@ class GreatWallCoreBindings {
         _lib.lookupFunction<_OrbitAdvanceC, _OrbitAdvanceDart>('bs_orbit_advance');
     _shamirInterp =
         _lib.lookupFunction<_ShamirInterpC, _ShamirInterpDart>('bs_shamir_interp');
+    _shamirEval =
+        _lib.lookupFunction<_ShamirEvalC, _ShamirEvalDart>('bs_shamir_eval');
+    _shamirGenShares =
+        _lib.lookupFunction<_ShamirGenSharesC, _ShamirGenSharesDart>(
+      'bs_shamir_generate_resistance_shares',
+    );
     _setupTierThresholds =
         _lib.lookupFunction<_SetupTierThresholdsC, _SetupTierThresholdsDart>(
       'bs_setup_tier_thresholds',
@@ -185,6 +191,8 @@ class GreatWallCoreBindings {
   late final _MasterSecretDart _masterSecret;
   late final _OrbitAdvanceDart _orbitAdvance;
   late final _ShamirInterpDart _shamirInterp;
+  late final _ShamirEvalDart _shamirEval;
+  late final _ShamirGenSharesDart _shamirGenShares;
   late final _SetupTierThresholdsDart _setupTierThresholds;
   late final _SetupTierSubstandardDart _setupTierSubstandard;
   late final _EncodeParamsDart _encodeParams;
@@ -784,6 +792,45 @@ class GreatWallCoreBindings {
     }
   }
 
+  /// Evaluate the Shamir polynomial [sh] (`t` ascending `u32` coefficients) at
+  /// abscissa [x] over GF(2^32) (`bs_shamir_eval`). The field arithmetic lives in
+  /// the engine — never re-implemented Dart-side (an independent Dart reference
+  /// exists only in tests, as a cross-check oracle).
+  int shamirEval(List<int> sh, int x) {
+    final int t = sh.length;
+    if (t == 0) return 0;
+    final Pointer<Uint32> shPtr = calloc<Uint32>(t);
+    try {
+      shPtr.asTypedList(t).setAll(0, sh);
+      return _shamirEval(shPtr, t, x & 0xFFFFFFFF);
+    } finally {
+      shPtr.asTypedList(t).fillRange(0, t, 0); // Sh is coercion-relevant.
+      calloc.free(shPtr);
+    }
+  }
+
+  /// Generate the next [count] **forgetting-resistance** share values from the
+  /// Shamir polynomial [sh] — `f(resistance_abscissa(k))` for `k` in `0..count`
+  /// (`bs_shamir_generate_resistance_shares`). Both the GF(2^32) evaluation and
+  /// the reserved-abscissa convention stay inside the engine.
+  List<int> generateResistanceShares(List<int> sh, int count) {
+    final int t = sh.length;
+    if (t == 0 || count <= 0) return const <int>[];
+    final Pointer<Uint32> shPtr = calloc<Uint32>(t);
+    final Pointer<Uint32> outPtr = calloc<Uint32>(count);
+    try {
+      shPtr.asTypedList(t).setAll(0, sh);
+      _shamirGenShares(shPtr, t, count, outPtr);
+      return List<int>.from(outPtr.asTypedList(count));
+    } finally {
+      shPtr.asTypedList(t).fillRange(0, t, 0);
+      outPtr.asTypedList(count).fillRange(0, count, 0);
+      calloc
+        ..free(shPtr)
+        ..free(outPtr);
+    }
+  }
+
   /// Serialize Shamir `Sh` coefficients (`u32` list) to big-endian bytes — the
   /// wire form matching `shamir::sh_to_bytes` / the Python bridge, fed to
   /// [masterSecret] and [orbitAdvance]. Pure Dart (no FFI); kept here so the
@@ -1268,6 +1315,14 @@ typedef _ShamirInterpC = Void Function(
   Pointer<Uint32>, Pointer<Uint32>, Uint32, Pointer<Uint32>);
 typedef _ShamirInterpDart = void Function(
   Pointer<Uint32>, Pointer<Uint32>, int, Pointer<Uint32>);
+
+typedef _ShamirEvalC = Uint32 Function(Pointer<Uint32>, Uint32, Uint32);
+typedef _ShamirEvalDart = int Function(Pointer<Uint32>, int, int);
+
+typedef _ShamirGenSharesC = Void Function(
+  Pointer<Uint32>, Uint32, Uint32, Pointer<Uint32>);
+typedef _ShamirGenSharesDart = void Function(
+  Pointer<Uint32>, int, int, Pointer<Uint32>);
 
 typedef _SetupTierThresholdsC = Uint32 Function(Uint32, Pointer<Uint32>, Uint32);
 typedef _SetupTierThresholdsDart = int Function(int, Pointer<Uint32>, int);

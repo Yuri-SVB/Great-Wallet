@@ -268,7 +268,108 @@ void main() {
       }
     });
   });
+
+  // The forgetting-resistance property: a stage's extra boards (beyond its r_i
+  // required ones) carry Shamir shares that are Sh_i *evaluated* at reserved
+  // abscissae — not independent secrets. The engine owns the GF(2^32) eval and
+  // the abscissa convention (bs_shamir_eval / bs_shamir_generate_resistance_
+  // shares); these tests pin that engine output against an INDEPENDENT Dart
+  // GF(2^32) reference ([_gfEval]) — the only place a second implementation is
+  // legitimate — and confirm any r_i of the shares reconstruct the identical Sh.
+  group('Shamir extrapolation — engine vs independent GF reference', () {
+    test('engine eval + resistance-share generation match the Dart reference',
+        () {
+      final GreatWallCore? c = core;
+      if (c == null) {
+        markTestSkipped('engine unavailable — $openError');
+        return;
+      }
+      final _Rng rng = _Rng(0x5A17);
+      for (int r = 2; r <= 5; r++) {
+        final List<int> xsP = <int>[for (int j = 0; j < r; j++) _primaryAbscissa(j)];
+        final List<int> ysP = <int>[
+          for (int j = 0; j < r; j++) OrbitProtocol.bitsToU32(_randChunk(rng)),
+        ];
+        final List<int> sh = c.shamirInterp(xsP, ysP);
+        expect(sh.length, r, reason: 'r=$r: Sh has r coefficients');
+
+        // Engine eval == independent Dart GF eval, at primary + resistance x.
+        for (int j = 0; j < r; j++) {
+          expect(c.shamirEval(sh, xsP[j]), _gfEval(sh, xsP[j]),
+              reason: 'r=$r: engine eval != reference at primary $j');
+          expect(c.shamirEval(sh, xsP[j]), ysP[j],
+              reason: 'r=$r: eval at primary $j must reproduce its value');
+        }
+        const int extra = 3;
+        final List<int> engShares = c.generateResistanceShares(sh, extra);
+        final List<int> refShares = <int>[
+          for (int k = 0; k < extra; k++) _gfEval(sh, _resistanceAbscissa(k)),
+        ];
+        expect(engShares, refShares,
+            reason: 'r=$r: engine resistance shares != Dart reference');
+
+        // Any r of the (r primary + extra resistance) boards reconstruct Sh.
+        final List<int> xsAll = <int>[
+          ...xsP,
+          for (int k = 0; k < extra; k++) _resistanceAbscissa(k),
+        ];
+        final List<int> ysAll = <int>[...ysP, ...engShares];
+        final int s = xsAll.length;
+        final List<List<int>> subsets = <List<int>>[
+          <int>[for (int i = 0; i < r; i++) i],
+          <int>[for (int i = 1; i <= r; i++) i],
+          <int>[for (int i = s - r; i < s; i++) i],
+        ];
+        for (final List<int> sub in subsets) {
+          final List<int> sx = <int>[for (final int i in sub) xsAll[i]];
+          final List<int> sy = <int>[for (final int i in sub) ysAll[i]];
+          expect(c.shamirInterp(sx, sy), sh,
+              reason: 'r=$r: any r of $s boards reconstruct the identical Sh');
+        }
+      }
+    });
+
+    test('u32ToBits is the exact inverse of bitsToU32', () {
+      final _Rng rng = _Rng(0xB175);
+      for (int i = 0; i < 64; i++) {
+        final List<int> bits = _randChunk(rng);
+        expect(OrbitProtocol.u32ToBits(OrbitProtocol.bitsToU32(bits)), bits);
+      }
+    });
+  });
 }
+
+// --- independent GF(2^32) reference (mirrors src/shamir.rs; reduction 0x8D) ---
+// Test-only. Production NEVER re-implements the field arithmetic — it calls the
+// engine (bs_shamir_eval). This second implementation exists solely to catch an
+// engine/ABI regression the round-trip alone might miss.
+
+const int _kReduction = 0x8D;
+
+int _gfMul(int a, int b) {
+  int acc = 0;
+  int x = a & 0xFFFFFFFF;
+  int y = b & 0xFFFFFFFF;
+  while (y != 0) {
+    if (y & 1 != 0) acc ^= x;
+    final int carry = x & 0x80000000;
+    x = (x << 1) & 0xFFFFFFFF;
+    if (carry != 0) x ^= _kReduction;
+    y >>= 1;
+  }
+  return acc & 0xFFFFFFFF;
+}
+
+int _gfEval(List<int> coeffs, int x) {
+  int acc = 0;
+  for (int i = coeffs.length - 1; i >= 0; i--) {
+    acc = _gfMul(acc, x) ^ (coeffs[i] & 0xFFFFFFFF);
+  }
+  return acc & 0xFFFFFFFF;
+}
+
+int _primaryAbscissa(int k) => k + 1;
+int _resistanceAbscissa(int k) => 0x80000000 | (k + 1);
 
 // --- vector location ---------------------------------------------------------
 
