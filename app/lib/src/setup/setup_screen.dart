@@ -314,6 +314,19 @@ class _SetupScreenState extends State<SetupScreen> {
   static const double _kMarkerSquareEnterPx = 64;
   static const double _kMarkerSquareExitPx = 40;
 
+  /// Whether the board is currently showing the **canonical** view (island
+  /// centred + zoomed + brightened) rather than the initial default view.
+  /// Re-pressing the active slot's digit toggles between the two.
+  bool _boardCanonicalView = false;
+
+  /// Canonical-view zoom: the island's **smaller** edge targets this fraction of
+  /// the shorter screen axis (zoom in to inspect)…
+  static const double _kCanonicalSmallEdgeRatio = 0.4;
+
+  /// …but never let the island's **larger** edge exceed this fraction, so an
+  /// elongated island still fits fully on screen (overflow guard).
+  static const double _kCanonicalLargeEdgeCap = 0.9;
+
   /// True at a stage-0 fractal slot (`#j≥1`) — the orbit-board context.
   bool get _isBoardSlot => _activeStage == 0 && _slotIndex >= 1;
 
@@ -755,12 +768,9 @@ class _SetupScreenState extends State<SetupScreen> {
       return;
     }
     if (i == _slotIndex) {
-      // Re-selecting the current board slot resets its view (position, zoom and
-      // brightness) — the recenter that stage navigation does on arrival.
-      if (_isBoardSlot) {
-        _sounds.play(UiSound.navZoom);
-        _recenter();
-      }
+      // Re-pressing the active board slot toggles between the initial default
+      // view and the canonical view (island centred, zoomed, brightened).
+      if (_isBoardSlot) _toggleBoardView();
       return;
     }
     if (_boardImportSlot != null) _pointImport.clear();
@@ -772,6 +782,7 @@ class _SetupScreenState extends State<SetupScreen> {
       _editPointMode = false;
       _boardImportSlot = null;
       _boardIslands = const <CanvasIsland>[];
+      _boardCanonicalView = false; // arriving on a board starts at the default view
     });
     // Landing on a board resets the view, so each fractal opens centred at the
     // default zoom/brightness (the same recenter stage selection performs).
@@ -1665,6 +1676,7 @@ class _SetupScreenState extends State<SetupScreen> {
       reMax: fixedToDouble(isl.bbox.reMax),
       imMin: fixedToDouble(isl.bbox.imMin),
       imMax: fixedToDouble(isl.bbox.imMax),
+      escapeCount: isl.escapeCount,
     );
   }
 
@@ -1736,6 +1748,7 @@ class _SetupScreenState extends State<SetupScreen> {
       reMax: fixedToDouble(leafRect.reMax),
       imMin: fixedToDouble(leafRect.imMin),
       imMax: fixedToDouble(leafRect.imMax),
+      escapeCount: 0, // no island resolved — brightness stays at default
     );
   }
 
@@ -1783,6 +1796,72 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   void _onBoardViewportChanged() => _updateBoardMarkerMode();
+
+  /// Re-pressing the active board slot's digit alternates between the initial
+  /// default view and the canonical view. Falls back to the default view when
+  /// there is no placed point to focus.
+  void _toggleBoardView() {
+    final bool canFocus = _boardDecoFor(_slotIndex) != null;
+    if (_boardCanonicalView || !canFocus) {
+      _boardCanonicalView = false;
+      _sounds.play(UiSound.navZoom);
+      _recenter(); // default position + zoom + brightness (its own setState)
+    } else {
+      _boardCanonicalView = true;
+      _focusBoardCanonical();
+    }
+  }
+
+  /// The **canonical view** of the active board's placed island: centre it,
+  /// zoom so its smaller edge nears [_kCanonicalSmallEdgeRatio] of the shorter
+  /// screen axis (without letting the larger edge overflow past
+  /// [_kCanonicalLargeEdgeCap]), and raise the brightness offset just enough
+  /// that the island reaches at least half brightness at that zoom.
+  void _focusBoardCanonical() {
+    final _BoardDeco? deco = _boardDecoFor(_slotIndex);
+    if (deco == null) {
+      _boardCanonicalView = false;
+      _recenter();
+      return;
+    }
+    final double w = deco.reMax - deco.reMin;
+    final double h = deco.imMax - deco.imMin;
+    final double small = math.min(w, h);
+    final double large = math.max(w, h);
+    final FractalViewport cur = _viewport.viewport;
+
+    // half-extent = half the shorter-axis span. Zoom so the smaller edge hits
+    // its target ratio, but back off if that would push the larger edge past
+    // the overflow cap. Fall back to the current zoom if the island is degenerate.
+    double half = cur.halfExtent;
+    if (large > 0) {
+      final double bySmall =
+          small > 0 ? small / (2 * _kCanonicalSmallEdgeRatio) : 0;
+      final double byLarge = large / (2 * _kCanonicalLargeEdgeCap);
+      half = math.max(bySmall, byLarge);
+    }
+    _viewport.viewport = cur.copyWith(
+      centreRe: (deco.reMin + deco.reMax) / 2.0,
+      centreIm: (deco.imMin + deco.imMax) / 2.0,
+      halfExtent: half,
+    );
+
+    // Brightness solve. The shader lights a cell by
+    //   factor = B / (B + 2^(n - beo) / z^2),   z = kReferenceHalfExtent / half
+    // so factor >= 0.5  <=>  beo >= n - log2(B) - 2*log2(z). Pick the smallest
+    // beo that reaches half brightness, never dimmer than the session default.
+    final double z = kReferenceHalfExtent / half;
+    final double beoForHalf = deco.escapeCount.toDouble() -
+        _log2(kBrightnessFalloffBase) -
+        2 * _log2(z);
+    final double beo = math.max(_brightness.defaultOffset, beoForHalf);
+    _brightness.adjustBySteps((beo - _brightness.offset) / _brightness.step);
+
+    _sounds.play(UiSound.navZoom);
+    setState(() {});
+  }
+
+  static double _log2(double x) => math.log(x) / math.ln2;
 
   /// Arm a manual point placement for the current board slot — the board peer of
   /// [_changePointManual]: the next canvas click sets slot [_slotIndex]'s point.
@@ -1905,8 +1984,9 @@ class _SetupScreenState extends State<SetupScreen> {
       _stage0Derived[slot] = false;
       _recomputeExtraShares();
       // Placing this point (and re-deriving the shares) invalidates the cached
-      // island decorations.
+      // island decorations; the canonical view (if any) referred to the old one.
       _boardDecoCache.clear();
+      _boardCanonicalView = false;
     });
     // Pick the marker mode for the freshly placed point at the current zoom.
     _updateBoardMarkerMode();
@@ -1973,6 +2053,7 @@ class _SetupScreenState extends State<SetupScreen> {
     }
     _boardIslands = const <CanvasIsland>[];
     _boardDecoCache.clear();
+    _boardCanonicalView = false;
   }
 
   /// Informational panel section for the active stage-0 board: the slot's role,
@@ -2016,8 +2097,13 @@ class _SetupScreenState extends State<SetupScreen> {
       const SizedBox(height: 4),
       body,
       const SizedBox(height: 6),
-      Text('Press $slot again to reset the view (position · zoom · brightness).',
-          style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor)),
+      Text(
+        placed
+            ? 'Press $slot again to toggle the canonical view — island centred, '
+                'zoomed and brightened — and back.'
+            : 'Press $slot again to reset the view (position · zoom · brightness).',
+        style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
+      ),
     ];
   }
 
@@ -4723,6 +4809,7 @@ class _BoardDeco {
     required this.reMax,
     required this.imMin,
     required this.imMax,
+    required this.escapeCount,
   });
 
   final CanvasIsland cells;
@@ -4730,6 +4817,11 @@ class _BoardDeco {
   final double reMax;
   final double imMin;
   final double imMax;
+
+  /// The island's (uniform) escape count — every cell of a canonical island
+  /// shares one escape count. Used to compute the brightness offset that lifts
+  /// the island to at least half brightness in the canonical view.
+  final int escapeCount;
 }
 
 /// How imported entropy is entered: BIP39 words, or blind uppercase hex (for
