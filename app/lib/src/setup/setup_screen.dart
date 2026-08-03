@@ -250,6 +250,19 @@ class _SetupScreenState extends State<SetupScreen> {
   final TextEditingController _sigmaCtrl = TextEditingController();
   final TextEditingController _explorerCtrl = TextEditingController();
 
+  /// Required fractal count `r_i` per stage (index `0..`[SetupController.maxPointStages]).
+  /// `r_0 = 2` by design (fixed); deep stages default to the 96-bit standard
+  /// `r_i = 3` and offer the `{2,3}` slider. Slots `1..r_i` are required boards;
+  /// slots beyond are the forgetting-forgiveness Shamir shares (P4). The actual
+  /// per-slot `θ_i_j` board render is wired with the orbit protocol (P5).
+  final List<int> _requiredFractals = List<int>.generate(
+      SetupController.maxPointStages + 1, (int i) => i == 0 ? 2 : 3);
+
+  /// The stage whose slots/`r_i` the secondary row currently reflects.
+  int get _activeStage =>
+      (_hasSession ? _setup.displayStageIndex : 0)
+          .clamp(0, SetupController.maxPointStages);
+
   /// A confirmation awaiting an inline answer in the console (replaces modal
   /// dialogs). Resolved by the console's action buttons.
   _ConsolePrompt? _prompt;
@@ -573,7 +586,8 @@ class _SetupScreenState extends State<SetupScreen> {
                         // Slot #0 is the salt (Namtso σ at stage 0; retirement
                         // placeholder at stage i>0). Other slots show the stage's
                         // fractal (or the legacy salt/pepper panel for stage 0
-                        // until its fractal slots are wired in P3).
+                        // until its per-board θ_0_j fractals are wired with the
+                        // orbit protocol, P5).
                         Positioned.fill(
                           child: _slotIndex == 0
                               ? _saltSlotPanel()
@@ -613,12 +627,14 @@ class _SetupScreenState extends State<SetupScreen> {
                             left: 0,
                             right: 0,
                             // Stage bar (Alt+digit) with the secondary slot bar
-                            // (plain digit) stacked directly beneath it.
+                            // (plain digit) stacked directly beneath it, plus the
+                            // r_i control when a fractal slot is in focus.
                             child: Column(
                               mainAxisSize: MainAxisSize.min,
                               children: <Widget>[
                                 _stageTabs(),
                                 _slotTabs(),
+                                if (_slotIndex >= 1) _riControl(),
                               ],
                             ),
                           ),
@@ -670,6 +686,7 @@ class _SetupScreenState extends State<SetupScreen> {
   /// fractals. Reuses [_StageTab] so it shares the stage bar's stable layout;
   /// per-slot content lands in P2+ (this row is navigation only for now).
   Widget _slotTabs() {
+    final int r = _requiredFractals[_activeStage];
     return Material(
       type: MaterialType.transparency,
       child: SizedBox(
@@ -687,21 +704,72 @@ class _SetupScreenState extends State<SetupScreen> {
                       index: i,
                       inSetup: true,
                       selected: i == _slotIndex,
-                      // Always navigable: the salt slot (#0) is usable even
-                      // before a session (harvest σ first); the fractal slots
-                      // just show the stage's current base view.
-                      available: true,
+                      // Salt (#0) + required fractals (1..r_i) are lit; slots
+                      // beyond r_i are the optional forgetting-forgiveness
+                      // shares, shown faded. Always navigable.
+                      available: i == 0 || i <= r,
                       deriving: false,
                       progress: 0,
                       tooltip: i == 0
                           ? 'Slot 0 — salt (σ / retirement)'
-                          : 'Slot $i — fractal (wired in P3)',
+                          : i <= r
+                              ? 'Slot $i — required fractal (rᵢ=$r)'
+                              : 'Slot $i — extra share (forgetting-forgiveness)',
                       onTap: () => _selectSlot(i),
                     ),
                   ),
                 ),
             ],
           ),
+        ),
+      ),
+    );
+  }
+
+  /// Compact `r_i` control for the active stage: the number of **required**
+  /// fractals, `2` or `3`. Grayed and fixed at `2` for stage 0 (σ-public entry);
+  /// a `{2,3}` slider for deep stages (2 = substandard 64-bit, 3 = standard
+  /// 96-bit). Slots beyond `r_i` become forgetting-forgiveness shares (P4). The
+  /// exact per-stage optionality will ultimately come from the engine's tier
+  /// rules (open item); for now only stage 0 is fixed.
+  Widget _riControl() {
+    final ThemeData theme = Theme.of(context);
+    final int stage = _activeStage;
+    final int r = _requiredFractals[stage];
+    final bool fixed = stage == 0; // r_0 = 2 by design
+    return Material(
+      type: MaterialType.transparency,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 2),
+        child: Row(
+          children: <Widget>[
+            Text('rᵢ = $r', style: theme.textTheme.labelMedium),
+            Expanded(
+              child: Slider(
+                value: r.toDouble(),
+                min: 2,
+                max: 3,
+                divisions: 1,
+                label: '$r',
+                onChanged: fixed
+                    ? null
+                    : (double v) {
+                        final int nv = v.round();
+                        if (nv != _requiredFractals[stage]) {
+                          setState(() => _requiredFractals[stage] = nv);
+                        }
+                      },
+              ),
+            ),
+            Text(
+              fixed
+                  ? 'fixed (stage 0)'
+                  : r == 2
+                      ? 'substandard · 64-bit'
+                      : 'standard · 96-bit',
+              style: theme.textTheme.labelSmall,
+            ),
+          ],
         ),
       ),
     );
