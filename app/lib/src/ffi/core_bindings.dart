@@ -104,6 +104,8 @@ class GreatWallCoreBindings {
             'bs_salt_pepper_canonicalize');
     _chainInput =
         _lib.lookupFunction<_ChainInputC, _ChainInputDart>('bs_chain_input');
+    _orbitRoot =
+        _lib.lookupFunction<_OrbitRootC, _OrbitRootDart>('bs_orbit_root');
     _encodeParams =
         _lib.lookupFunction<_EncodeParamsC, _EncodeParamsDart>('bs_encode_params');
     _encodeArea =
@@ -158,6 +160,7 @@ class GreatWallCoreBindings {
   late final _Argon2idMasterDart _argon2idMaster;
   late final _SaltPepperCanonicalizeDart _saltPepperCanonicalize;
   late final _ChainInputDart _chainInput;
+  late final _OrbitRootDart _orbitRoot;
   late final _EncodeParamsDart _encodeParams;
   late final _EncodeAreaDart _encodeArea;
   late final _BitsPerPointDart _bitsPerPoint;
@@ -622,6 +625,30 @@ class GreatWallCoreBindings {
     }
   }
 
+  /// Derive the orbit root `o_0 = H(sigma)` (SHA-256) from the Namtso salt
+  /// [sigma] (`bs_orbit_root`). This is the sole seam between Namtso and the
+  /// orbit protocol: the app harvests [sigma] from Namtso (the flat submodule
+  /// `namtso-the-sacred-salt`, via its CLI) and the engine consumes it here —
+  /// great-wall-core never depends on Namtso itself (ARCHITECTURE.md
+  /// §"Submodule Rules": no nested submodules; the core takes a pre-harvested
+  /// sigma). Returns the 32-byte root.
+  ///
+  /// SECURITY: [sigma] is public (a precomputation-ruling-out salt), but the
+  /// returned root seeds the coercion-relevant orbit, so callers zero it after
+  /// use. The input/output buffers here are zeroed and freed on every path.
+  Uint8List orbitRoot(Uint8List sigma) {
+    final Pointer<Uint8> inPtr = calloc<Uint8>(sigma.length);
+    final Pointer<Uint8> outPtr = calloc<Uint8>(32);
+    try {
+      inPtr.asTypedList(sigma.length).setAll(0, sigma);
+      _orbitRoot(inPtr, sigma.length, outPtr);
+      return Uint8List.fromList(outPtr.asTypedList(32));
+    } finally {
+      _zeroAndFree(inPtr, sigma.length);
+      _zeroAndFree(outPtr, 32);
+    }
+  }
+
   /// Run the **master-secret export** — one Argon2id pass over the reproducible
   /// setup-transcript [message] (`bs_argon2id_master`). Uses the fixed master
   /// profile (Argon2id, `m = 64 MiB`, `t = 8`, `p = 2`) and the fixed salt
@@ -1046,6 +1073,9 @@ typedef _Argon2SingleC = Void Function(
   Pointer<Uint8>, Uint32, Uint8, Pointer<Uint8>);
 typedef _Argon2SingleDart = void Function(
   Pointer<Uint8>, int, int, Pointer<Uint8>);
+
+typedef _OrbitRootC = Void Function(Pointer<Uint8>, Uint32, Pointer<Uint8>);
+typedef _OrbitRootDart = void Function(Pointer<Uint8>, int, Pointer<Uint8>);
 
 typedef _Argon2idMasterC = Void Function(
   Pointer<Uint8>, Uint32, Pointer<Uint8>, Uint32);
