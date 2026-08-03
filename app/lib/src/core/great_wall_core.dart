@@ -324,6 +324,15 @@ class GreatWallCore {
   List<int> shamirInterp(List<int> xs, List<int> ys) =>
       bindings.shamirInterp(xs, ys);
 
+  /// Evaluate the Shamir polynomial [sh] at abscissa [x] over GF(2^32) (the
+  /// engine's field arithmetic; never re-implemented in the app).
+  int shamirEval(List<int> sh, int x) => bindings.shamirEval(sh, x);
+
+  /// The next [count] forgetting-resistance share **values** from [sh] —
+  /// `Sh` evaluated at the reserved resistance abscissae, entirely engine-side.
+  List<int> generateResistanceShares(List<int> sh, int count) =>
+      bindings.generateResistanceShares(sh, count);
+
   /// Canonical per-stage thresholds `t_i` for a setup [level] (index 0 = stage 0,
   /// `1..N` the deep stages); `[]` for an invalid level.
   List<int> setupTierThresholds(int level) =>

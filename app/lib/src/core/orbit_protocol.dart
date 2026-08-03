@@ -78,6 +78,13 @@ class OrbitProtocol {
     return y;
   }
 
+  /// Unpack a u32 value to a [_bitsPerPoint]-bit list (MSB first) — the exact
+  /// inverse of [bitsToU32]. Trivial bit repacking (no field arithmetic): used to
+  /// turn an engine-computed Shamir share value into the bits to encode onto its
+  /// board.
+  static List<int> u32ToBits(int y) =>
+      <int>[for (int i = _bitsPerPoint - 1; i >= 0; i--) (y >> i) & 1];
+
   /// Encode [stageChunks] onto the orbit's fractals for [setupLevel].
   ///
   /// `stageChunks[i]` is a list of `t_i` bit-lists (each [_bitsPerPoint] long) —
