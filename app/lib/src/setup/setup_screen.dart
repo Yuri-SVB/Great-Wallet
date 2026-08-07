@@ -164,15 +164,11 @@ class _SetupScreenState extends State<SetupScreen> {
   /// gate. (N is reserved for the Argon2 iteration count, below.)
   ///
   /// The stages slider that set this was removed with the deprecated legacy
-  /// chain; the value is now fixed and only feeds the unreachable chain-start
-  /// paths ([_start] / [_beginRecall]) and the Argon2 calibration estimate.
+  /// chain; the value is now fixed and only feeds the Argon2 calibration
+  /// estimate.
   final int _pointStages = 4;
 
-  /// Configuration source: generate a fresh random seed, import an existing
-  /// (possibly sub-standard) BIP39 phrase, or recall an existing setup from its
-  /// salt (cold-start recall — no encode, the points come back from clicks).
-  _SourceMode _source = _SourceMode.fresh;
-  _ImportFormat _importFormat = _ImportFormat.words;
+  final _ImportFormat _importFormat = _ImportFormat.words;
 
   /// Select mode: when on, tapping the canvas decodes the point under the
   /// cursor instead of panning. Toggled by the panel button or the `S` key.
@@ -1230,9 +1226,9 @@ class _SetupScreenState extends State<SetupScreen> {
         if (!_busy) _copyMasterSecret(full: true);
         return KeyEventResult.handled;
       }
-      // Alt+I — the hex counterpart of plain I (BIP39 words): on a live editable
-      // stage it opens the point-import editor in hex; on the config screen it
-      // selects the Import source pre-toggled to hex.
+      // Alt+I — the hex counterpart of plain I (BIP39 words): on an editable
+      // point (a chain stage or an orbit board slot) it opens the point-import
+      // editor in hex.
       if (event.logicalKey == LogicalKeyboardKey.keyI) {
         if (_expandTarget != null) {
           _expandImport(hex: true);
@@ -1240,9 +1236,6 @@ class _SetupScreenState extends State<SetupScreen> {
           _beginBoardImport(_slotIndex, hex: true);
         } else if (_setup.canEditCurrentPoint) {
           _changePointImport(hex: true);
-        } else {
-          _setSource(_SourceMode.import, focusInput: true);
-          setState(() => _importFormat = _ImportFormat.hex);
         }
         return KeyEventResult.handled;
       }
@@ -1315,10 +1308,9 @@ class _SetupScreenState extends State<SetupScreen> {
       _focusField(_hueFocus, 'colour wheel');
       return KeyEventResult.handled;
     }
-    // N / I / R — on the config screen, choose the source and focus its input.
-    // On a live, editable point stage they instead change that stage's point:
-    // N = new random, R = manual click. (I — blind import — lands with the
-    // expansion work, which shares the inline bit editor.)
+    // N / I / R — on an editable point (a chain stage or an orbit board slot)
+    // they change that point: N = new random, R = manual click, I = blind
+    // import (which shares the inline bit editor).
     if (event.logicalKey == LogicalKeyboardKey.keyN) {
       if (_expandTarget != null) {
         _expandNew();
@@ -1326,8 +1318,6 @@ class _SetupScreenState extends State<SetupScreen> {
         _generatePrimary(_slotIndex);
       } else if (_setup.canEditCurrentPoint) {
         _changePointGenerated();
-      } else {
-        _setSource(_SourceMode.fresh, focusInput: true);
       }
       return KeyEventResult.handled;
     }
@@ -1338,9 +1328,6 @@ class _SetupScreenState extends State<SetupScreen> {
         _beginBoardImport(_slotIndex, hex: false);
       } else if (_setup.canEditCurrentPoint) {
         _changePointImport(hex: false);
-      } else {
-        _setSource(_SourceMode.import, focusInput: true);
-        setState(() => _importFormat = _ImportFormat.words);
       }
       return KeyEventResult.handled;
     }
@@ -1355,8 +1342,6 @@ class _SetupScreenState extends State<SetupScreen> {
         _armBoardManual();
       } else if (_setup.canEditCurrentPoint) {
         _changePointManual();
-      } else {
-        _setSource(_SourceMode.recall, focusInput: true);
       }
       return KeyEventResult.handled;
     }
@@ -1741,18 +1726,6 @@ class _SetupScreenState extends State<SetupScreen> {
       halfExtent: half,
     );
     setState(() {});
-  }
-
-  /// Toggle select (recall) mode. Entering it snaps the canvas to the stage the
-  /// recall walk is on, so clicks land on the right fractal in chain order.
-  /// Snap the canvas to the recall stage and turn on point selection. Select
-  /// mode is implicit in a cold-start recall (the points are hidden, so clicking
-  /// is how the seed comes back); a generated/imported setup shows its points,
-  /// so there is nothing to "practise" and the mode is never offered as a
-  /// toggle.
-  void _enterRecallSelect() {
-    setState(() => _selectMode = true);
-    _setup.showRecallStage();
   }
 
   Widget _canvas() {
@@ -2811,7 +2784,7 @@ class _SetupScreenState extends State<SetupScreen> {
     'M  console   9  stage bar   Z  reset (asks first)',
     'Alt+0–4  go to that stage (recenters); press again to zoom to its point',
     '0–6  select the secondary slot (0 = salt · 1–6 = fractals)',
-    'N / I / R  New seed / Import / Recall (config) · on a stage: change its point',
+    'N / I / R  on a point: N new random · I import · R manual click',
     'I import = BIP39 words · Alt+I import = hex (config & point edit alike)',
     'Click/press a ghost slot past the last stage to grow the setup (N/I/R)',
     'S salt / export salt · P profile · D derivation steps · C colour',
@@ -3265,63 +3238,12 @@ class _SetupScreenState extends State<SetupScreen> {
     );
   }
 
-  /// Choose the config source (New seed / Import / Recall) — from the segmented
-  /// button or the N / I / R hotkeys. Only meaningful on the config screen.
-  void _setSource(_SourceMode mode, {bool focusInput = false}) {
-    if (_hasSession) return;
-    _sounds.play(UiSound.click);
-    setState(() => _source = mode);
-    _toast(_sourceBlurb(mode));
-    if (focusInput) {
-      // Jump straight to the mode's primary input (the import field, or the
-      // stages slider for New seed / Recall) once the rebuild has placed it.
-      final FocusNode node =
-          mode == _SourceMode.import ? _mnemonicFocus : _stagesFocus;
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted && node.context != null) node.requestFocus();
-      });
-    }
-  }
-
-  /// Submit the config form from an input field's Enter key: run the action that
-  /// the enabled button would (Generate / Encode phrase / Begin recall), if its
-  /// preconditions hold. Focus returns to the viewer when the action starts.
-  void _submitConfig() {
-    // No legacy-chain start from an orbit board: the source/start controls are
-    // hidden there (see [_configControls]), so Enter in a still-shown shared
-    // field (σ / D) must not silently kick off a chain setup.
-    if (_busy || _hasSession || _isBoardSlot || !_iterationsValid) return;
-    if (_source == _SourceMode.recall) {
-      _beginRecall();
-    } else if (_source == _SourceMode.import) {
-      if (_mnemonic.text.trim().isNotEmpty) _start();
-    } else {
-      _start();
-    }
-  }
-
-  /// One-line description of a source mode, shown in the console when selected
-  /// (instead of an inline paragraph in the panel).
-  String _sourceBlurb(_SourceMode mode) {
-    switch (mode) {
-      case _SourceMode.fresh:
-        return 'New seed: generate fresh entropy and encode it onto the '
-            'fractals to memorise.';
-      case _SourceMode.import:
-        return 'Import: encode an existing BIP39 phrase onto the fractals.';
-      case _SourceMode.recall:
-        return 'Recall: enter the same salt, number of stages and Argon2 '
-            'settings, then click your memorised point on each stage. Nothing '
-            'is encoded — the seed is rebuilt from your clicks.';
-    }
-  }
-
   List<Widget> _configControls() {
     // The legacy 0.3.0 chain is deprecated (a single 32-bit point per stage is
     // too weak), so Setup is orbit-only: this panel shows just the shared
     // configuration — σ (Stage-0 salt/pepper), the Argon2 profile, calibration
     // and D. Points are placed on the boards (R / N / I); there is no chain
-    // source selector or start button any more. See [_legacyChainEnabled].
+    // source selector or start button any more.
     return <Widget>[
       ..._stage0Input(),
       const SizedBox(height: 16),
@@ -3432,9 +3354,7 @@ class _SetupScreenState extends State<SetupScreen> {
             final int? v = int.tryParse(_iterationsField.text.trim());
             if (v != null && v >= 0) _iterations = v;
             setState(() {});
-          },
-          onSubmitted: (_) => _submitConfig(),
-        ),
+          },        ),
       ),
     ];
   }
@@ -3529,9 +3449,7 @@ class _SetupScreenState extends State<SetupScreen> {
           onChanged: (_) {
             _sounds.play(UiSound.tickSoft);
             setState(() {});
-          },
-          onSubmitted: (_) => _submitConfig(),
-        ),
+          },        ),
       ),
       // The formatting warning (when the engine adjusts the text) is conveyed on
       // the console, which expands and pops to the foreground — see
@@ -4932,88 +4850,6 @@ class _SetupScreenState extends State<SetupScreen> {
     if (!p.completer.isCompleted) p.completer.complete(ok);
   }
 
-  /// The legacy 0.3.0 chain setup is **deprecated** — it commits a single
-  /// 32-bit point per stage, too weak a secret — so Setup is orbit-only and the
-  /// chain-start paths ([_start] / [_beginRecall]) refuse to run. This is a
-  /// runtime flag (deliberately not a `const`) so the now-unreachable chain
-  /// bodies stay referenced, keeping the shared fields they touch alive, until
-  /// the chain is removed together with SetupController (a separate pass).
-  bool get _legacyChainEnabled => false;
-
-  Future<void> _start() async {
-    // Deprecated: the chain commits one 32-bit point per stage (too weak). Setup
-    // is orbit-only — refuse to start so no weak "legacy orbit" can be produced.
-    if (!_legacyChainEnabled) return;
-    _sounds.play(UiSound.click);
-    _focusViewer(); // leave the input field; hotkeys act on the viewer now
-    _brightness.reset();
-    setState(() => _selectMode = false);
-    final String text = _stage0.text;
-    if (_source == _SourceMode.import) {
-      if (_importFormat == _ImportFormat.hex) {
-        await _setup.beginFromHex(
-          _mnemonic.text,
-          text: text,
-          argon2Iterations: _iterations,
-          profile: _profile,
-        );
-      } else {
-        await _setup.beginFromMnemonic(
-          _mnemonic.text,
-          text: text,
-          argon2Iterations: _iterations,
-          profile: _profile,
-        );
-      }
-      // Setup is write-only on memory: once the phrase is encoded onto the
-      // fractals, wipe the plaintext from the field (keep it on error so the
-      // user can fix it).
-      if (_setup.phase != SetupPhase.error) _mnemonic.clear();
-    } else {
-      final int n = _pointStages;
-      await _setup.begin(
-        pointStages: n,
-        text: text,
-        argon2Iterations: _iterations,
-        profile: _profile,
-      );
-    }
-    // The salt/pepper now lives in the chain; clear the input field on success
-    // (the controller keeps its own copy for the in-session recall).
-    if (_setup.phase != SetupPhase.error) _stage0.clear();
-    if (mounted) {
-      _sounds.play(
-        _setup.phase == SetupPhase.error ? UiSound.deny : UiSound.confirm,
-      );
-    }
-  }
-
-  /// Start a cold-start recall from the entered salt: derive Stage 1, then drop
-  /// straight into select mode so the user can click their first point.
-  Future<void> _beginRecall() async {
-    if (!_legacyChainEnabled) return; // legacy chain deprecated — see [_start]
-    final int n = _pointStages;
-    _sounds.play(UiSound.click);
-    _focusViewer(); // leave the input field; clicks/hotkeys act on the viewer
-    _brightness.reset();
-    await _setup.beginRecall(
-      pointStages: n,
-      text: _stage0.text,
-      argon2Iterations: _iterations,
-      profile: _profile,
-    );
-    if (!mounted) return;
-    if (_setup.phase == SetupPhase.error) {
-      _sounds.play(UiSound.deny);
-      return;
-    }
-    // The salt now lives in the controller for the in-session walk; clear the
-    // field so it is not left on screen.
-    _stage0.clear();
-    _enterRecallSelect();
-    _sounds.play(UiSound.confirm);
-  }
-
   /// Reset behind an inline console confirmation, so the Z hotkey (or a stray
   /// keypress) cannot discard a setup by accident.
   Future<void> _confirmReset() async {
@@ -5064,10 +4900,6 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 }
 
-/// Where the Setup session's root comes from: a freshly generated seed, an
-/// imported BIP39 phrase, or a cold-start recall of an existing setup (derive
-/// from the salt and reconstruct the seed from the user's clicks).
-enum _SourceMode { fresh, import, recall }
 
 /// A stage-0 board's canonical-island decoration: the island cells plus its
 /// bounding box (fractal coords), used to draw the square frame and to size the
