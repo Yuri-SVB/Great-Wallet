@@ -387,6 +387,49 @@ class GreatWallCore {
     return completer.future;
   }
 
+  /// Encode a batch of 32-bit [chunks] to fractal points — each under its
+  /// matching `[o, p, q]` reservoir in [reservoirs] — in a **worker isolate**.
+  ///
+  /// The island-discovery search behind an encode is CPU-heavy and, on
+  /// sparse-island corner-case values (e.g. all-zeros / all-ones), can take tens
+  /// of seconds per point, so it must never run on the UI isolate. Returns one
+  /// point per chunk, in order. This is **off the correctness path**: callers use
+  /// the points only as display markers for the forgetting-resistance slots
+  /// (`K_i` derives from the primary points alone). Errors surface as a
+  /// [StateError]; the empty batch resolves to `[]` without spawning.
+  Future<List<({int reRaw, int imRaw})>> encodeSharePoints(
+    List<List<int>> chunks,
+    List<List<int>> reservoirs,
+  ) async {
+    if (chunks.isEmpty) return const <({int reRaw, int imRaw})>[];
+    final ReceivePort port = ReceivePort();
+    final Completer<List<({int reRaw, int imRaw})>> completer =
+        Completer<List<({int reRaw, int imRaw})>>();
+    await Isolate.spawn<(SendPort, List<List<int>>, List<List<int>>)>(
+      _encodeSharesIsolateEntry,
+      (port.sendPort, chunks, reservoirs),
+      onError: port.sendPort,
+      errorsAreFatal: true,
+    );
+    port.listen((dynamic msg) {
+      // Success payload is a `List<[reRaw, imRaw]>`; the onError payload is a
+      // `[message, stack]` list of strings. Distinguish by element type rather
+      // than the reified generic, which is not guaranteed across the boundary.
+      if (msg is List && (msg.isEmpty || msg.first is List)) {
+        if (!completer.isCompleted) {
+          completer.complete(<({int reRaw, int imRaw})>[
+            for (final dynamic p in msg)
+              (reRaw: (p as List)[0] as int, imRaw: p[1] as int),
+          ]);
+        }
+      } else if (!completer.isCompleted) {
+        completer.completeError(StateError('Share-point encode failed'));
+      }
+      port.close();
+    });
+    return completer.future;
+  }
+
   /// Start a **cancellable** on-device Argon2 micro-benchmark at [profile] in a
   /// worker isolate (heavy, blocking), returning an [Argon2BenchJob] whose
   /// `result` is the **median** seconds per pass (one pass == one derivation
@@ -494,6 +537,33 @@ void _orbitAdvanceIsolateEntry((SendPort, Uint8List, Uint8List, int, int) args) 
   final ({Uint8List k, Uint8List next}) r =
       bindings.orbitAdvance(oI, sh, steps, profile);
   send.send((r.k, r.next));
+}
+
+/// Worker-isolate entry: open the engine and encode each 32-bit chunk to a
+/// fractal point under its `[o, p, q]` reservoir, sending back a
+/// `List<[reRaw, imRaw]>` in input order. Mirrors [GreatWallCore.encodeStage]
+/// off the UI isolate — see [GreatWallCore.encodeSharePoints].
+void _encodeSharesIsolateEntry(
+    (SendPort, List<List<int>>, List<List<int>>) args) {
+  final (SendPort send, List<List<int>> chunks, List<List<int>> reservoirs) =
+      args;
+  final GreatWallCoreBindings bindings = GreatWallCoreBindings.open();
+  final FixedRect area = bindings.encodeArea();
+  final CoreDiscoveryParams params = bindings.encodeParams();
+  final List<List<int>> out = <List<int>>[];
+  for (int i = 0; i < chunks.length; i++) {
+    final List<int> res = reservoirs[i];
+    final ({int reRaw, int imRaw, FixedRect leafRect}) pt = bindings.encodePoint(
+      bits: chunks[i],
+      area: area,
+      params: params,
+      o: res[0],
+      p: res[1],
+      q: res[2],
+    );
+    out.add(<int>[pt.reRaw, pt.imRaw]);
+  }
+  send.send(out);
 }
 
 /// Worker-isolate entry: open the engine, run the Argon2 loop, and after each

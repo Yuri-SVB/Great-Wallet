@@ -313,6 +313,13 @@ class _SetupScreenState extends State<SetupScreen> {
   final List<List<bool>> _boardDerived = List<List<bool>>.generate(
       _maxStage + 1, (_) => List<bool>.filled(_maxSlot + 1, false));
 
+  // Monotonic per-stage token guarding the deferred, off-isolate encode of a
+  // stage's forgetting-resistance share markers ([_encodeShareMarkers]). Any
+  // change to the stage's shares — a re-placement, a deeper-stage re-root, or a
+  // σ reset — bumps it so a late background result is discarded rather than
+  // written over fresh state. Indexed `[stage]`.
+  final List<int> _shareEncodeGen = List<int>.filled(_maxStage + 1, 0);
+
   /// Per-stage orbit point `o_i`. `o_0` is derived on the fly from σ (see
   /// [_stageOrbit]); `o_i` (`i≥1`) is the memory-hard advance `o_i = H*(K_{i-1})`,
   /// filled when the user advances forward (P5 deep stages). Null until derived.
@@ -2230,6 +2237,7 @@ class _SetupScreenState extends State<SetupScreen> {
   /// inside a [setState].
   void _invalidateDeeperThan(int stage) {
     for (int st = stage + 1; st <= _maxStage; st++) {
+      _shareEncodeGen[st]++; // discard any in-flight share-marker encode for st
       for (int s = 1; s <= _maxSlot; s++) {
         final List<int>? c = _boardChunks[st][s];
         if (c != null) Entropy.wipe(c);
@@ -2260,6 +2268,10 @@ class _SetupScreenState extends State<SetupScreen> {
   /// [setState].
   void _recomputeExtraShares(int stage) {
     final int r = _requiredFractals[stage];
+    // Any recompute supersedes an in-flight background share-marker encode for
+    // this stage (see [_encodeShareMarkers]); bump the token so a late result is
+    // discarded rather than written over the freshly recomputed state.
+    _shareEncodeGen[stage]++;
     // K_i is only valid while the primaries are complete; drop the previous one
     // up front so every incomplete early-return below leaves it null.
     final Uint8List? oldK = _orbitK[stage];
@@ -2295,20 +2307,69 @@ class _SetupScreenState extends State<SetupScreen> {
     Entropy.wipe(shBytes);
     final int extras = _maxSlot - r;
     final List<int> shares = widget.core.generateResistanceShares(sh, extras);
+    // Store each share's BITS synchronously (a cheap GF eval — the actual
+    // coercion-relevant material) and mark the slot derived, but DEFER encoding
+    // its fractal display point. Encoding is a CPU-heavy island-discovery search
+    // that, on the degenerate share values a corner-case stage produces (an
+    // all-ones stage → constant polynomial → all-ones shares), can take tens of
+    // seconds per point at a sparse-island reservoir; running that on the UI
+    // isolate froze the app when the final primary was placed. The point is
+    // display-only (K_i above uses the primaries alone), so a null point simply
+    // renders no marker until the off-isolate encode below lands.
+    final List<List<int>> pendingBits = <List<int>>[];
+    final List<List<int>> pendingRes = <List<int>>[];
+    final List<int> pendingSlots = <int>[];
     for (int i = 0; i < extras; i++) {
       final int s = r + 1 + i;
       final List<int> bits = OrbitProtocol.u32ToBits(shares[i]);
       final ({int o, int p, int q}) prm = orbit.orbitParams(oi, s - 1);
-      final EncodedPoint pt = widget.core
-          .encodeStage(List<int>.of(bits), o: prm.o, p: prm.p, q: prm.q)
-          .first;
       _boardChunks[stage][s] = bits; // owns it
-      _boardPoints[stage][s] = (reRaw: pt.reRaw, imRaw: pt.imRaw);
+      _boardPoints[stage][s] = null; // marker pending until the encode lands
       _boardDerived[stage][s] = true;
+      pendingBits.add(List<int>.of(bits));
+      pendingRes.add(<int>[prm.o, prm.p, prm.q]);
+      pendingSlots.add(s);
     }
     for (int i = 0; i < sh.length; i++) {
       sh[i] = 0; // Sh_i is coercion-relevant — zero it once shares are made.
     }
+    if (pendingSlots.isNotEmpty) {
+      unawaited(_encodeShareMarkers(
+          stage, _shareEncodeGen[stage], pendingSlots, pendingBits, pendingRes));
+    }
+  }
+
+  /// Encode stage [stage]'s deferred forgetting-resistance share markers off the
+  /// UI isolate (see [GreatWallCore.encodeSharePoints]) and, when they land,
+  /// place them on their slots — unless a newer recompute, a deeper-stage
+  /// re-root, or a σ reset has since bumped [_shareEncodeGen] past [gen], in
+  /// which case the stale result is dropped. A failed encode leaves the markers
+  /// pending: they are display-only, so `K_i` and the advance are unaffected.
+  Future<void> _encodeShareMarkers(
+    int stage,
+    int gen,
+    List<int> slots,
+    List<List<int>> chunks,
+    List<List<int>> reservoirs,
+  ) async {
+    List<({int reRaw, int imRaw})> pts;
+    try {
+      pts = await widget.core.encodeSharePoints(chunks, reservoirs);
+    } catch (_) {
+      return;
+    }
+    if (!mounted || gen != _shareEncodeGen[stage]) return;
+    if (pts.length != slots.length) return; // engine returns one point per chunk
+    setState(() {
+      for (int i = 0; i < slots.length; i++) {
+        final int s = slots[i];
+        // Only apply while this is still the derived share we encoded.
+        if (_boardDerived[stage][s]) {
+          _boardPoints[stage][s] = (reRaw: pts[i].reRaw, imRaw: pts[i].imRaw);
+        }
+      }
+      _boardDecoCache.clear();
+    });
   }
 
   /// Drop every orbit placement across all stages (wiping chunks, `o_i` and
@@ -2316,6 +2377,7 @@ class _SetupScreenState extends State<SetupScreen> {
   /// old points no longer decode, and on dispose.
   void _clearOrbitPlacements() {
     for (int st = 0; st <= _maxStage; st++) {
+      _shareEncodeGen[st]++; // discard any in-flight share-marker encode
       for (int s = 1; s <= _maxSlot; s++) {
         final List<int>? c = _boardChunks[st][s];
         if (c != null) Entropy.wipe(c);
