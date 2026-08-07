@@ -3287,7 +3287,10 @@ class _SetupScreenState extends State<SetupScreen> {
   /// the enabled button would (Generate / Encode phrase / Begin recall), if its
   /// preconditions hold. Focus returns to the viewer when the action starts.
   void _submitConfig() {
-    if (_busy || _hasSession || !_iterationsValid) return;
+    // No legacy-chain start from an orbit board: the source/start controls are
+    // hidden there (see [_configControls]), so Enter in a still-shown shared
+    // field (σ / D) must not silently kick off a chain setup.
+    if (_busy || _hasSession || _isBoardSlot || !_iterationsValid) return;
     if (_source == _SourceMode.recall) {
       _beginRecall();
     } else if (_source == _SourceMode.import) {
@@ -3315,31 +3318,41 @@ class _SetupScreenState extends State<SetupScreen> {
 
   List<Widget> _configControls() {
     return <Widget>[
-      SegmentedButton<_SourceMode>(
-        showSelectedIcon: false,
-        segments: const <ButtonSegment<_SourceMode>>[
-          ButtonSegment<_SourceMode>(
-              value: _SourceMode.fresh, label: Text('New seed')),
-          ButtonSegment<_SourceMode>(
-              value: _SourceMode.import, label: Text('Import')),
-          ButtonSegment<_SourceMode>(
-              value: _SourceMode.recall, label: Text('Recall')),
-        ],
-        selected: <_SourceMode>{_source},
-        onSelectionChanged:
-            _busy ? null : (Set<_SourceMode> s) => _setSource(s.first),
-      ),
-      const SizedBox(height: 16),
-      // The source-specific input: the import builder (format toggle + field) or
-      // the stages slider. Each builder returns one or more widgets, laid out in
-      // a column so switching New seed / Import / Recall swaps the whole block.
-      Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: _source == _SourceMode.import
-            ? _mnemonicInput()
-            : _stagesInput(),
-      ),
-      const SizedBox(height: 16),
+      // The legacy 0.3.0-chain source selector (New seed / Import / Recall), its
+      // source-specific input, and the start button below drive the chain flow
+      // only. On an orbit board the point is entered with R / N / I on the slot
+      // and stages are managed by the tab bar + X, so these chain controls are
+      // omitted there — the board panel keeps just the shared σ / Argon2 / D
+      // configuration. (Slot 0, the salt, is not a board slot, so the chain
+      // config still shows there.)
+      if (!_isBoardSlot) ...<Widget>[
+        SegmentedButton<_SourceMode>(
+          showSelectedIcon: false,
+          segments: const <ButtonSegment<_SourceMode>>[
+            ButtonSegment<_SourceMode>(
+                value: _SourceMode.fresh, label: Text('New seed')),
+            ButtonSegment<_SourceMode>(
+                value: _SourceMode.import, label: Text('Import')),
+            ButtonSegment<_SourceMode>(
+                value: _SourceMode.recall, label: Text('Recall')),
+          ],
+          selected: <_SourceMode>{_source},
+          onSelectionChanged:
+              _busy ? null : (Set<_SourceMode> s) => _setSource(s.first),
+        ),
+        const SizedBox(height: 16),
+        // The source-specific input: the import builder (format toggle + field)
+        // or the stages slider. Each builder returns one or more widgets, laid
+        // out in a column so switching New seed / Import / Recall swaps the
+        // whole block.
+        Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: _source == _SourceMode.import
+              ? _mnemonicInput()
+              : _stagesInput(),
+        ),
+        const SizedBox(height: 16),
+      ],
       ..._stage0Input(),
       const SizedBox(height: 16),
       _argon2ProfileSlider(),
@@ -3347,26 +3360,28 @@ class _SetupScreenState extends State<SetupScreen> {
       _calibrateButton(),
       const SizedBox(height: 16),
       ..._iterationsInput(),
-      const SizedBox(height: 16),
-      if (_source == _SourceMode.recall)
-        FilledButton(
-          onPressed: (_busy || !_iterationsValid) ? null : _beginRecall,
-          child: const Text('Begin recall'),
-        )
-      else
-        FilledButton(
-          onPressed: (_busy ||
-                  !_iterationsValid ||
-                  (_source == _SourceMode.import &&
-                      _mnemonic.text.trim().isEmpty))
-              ? null
-              : _start,
-          child: Text(_source == _SourceMode.import
-              ? (_importFormat == _ImportFormat.hex
-                  ? 'Encode hex'
-                  : 'Encode phrase')
-              : 'Generate'),
-        ),
+      if (!_isBoardSlot) ...<Widget>[
+        const SizedBox(height: 16),
+        if (_source == _SourceMode.recall)
+          FilledButton(
+            onPressed: (_busy || !_iterationsValid) ? null : _beginRecall,
+            child: const Text('Begin recall'),
+          )
+        else
+          FilledButton(
+            onPressed: (_busy ||
+                    !_iterationsValid ||
+                    (_source == _SourceMode.import &&
+                        _mnemonic.text.trim().isEmpty))
+                ? null
+                : _start,
+            child: Text(_source == _SourceMode.import
+                ? (_importFormat == _ImportFormat.hex
+                    ? 'Encode hex'
+                    : 'Encode phrase')
+                : 'Generate'),
+          ),
+      ],
       if (_setup.phase == SetupPhase.error && _setup.errorMessage != null) ...<Widget>[
         const SizedBox(height: 12),
         Text(
