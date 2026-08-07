@@ -162,7 +162,11 @@ class _SetupScreenState extends State<SetupScreen> {
   /// adds one 32-bit fractal stage (`32 × count` bits / `3 × count` BIP39
   /// words). Every position is a valid setup, so the count needs no validity
   /// gate. (N is reserved for the Argon2 iteration count, below.)
-  int _pointStages = 4;
+  ///
+  /// The stages slider that set this was removed with the deprecated legacy
+  /// chain; the value is now fixed and only feeds the unreachable chain-start
+  /// paths ([_start] / [_beginRecall]) and the Argon2 calibration estimate.
+  final int _pointStages = 4;
 
   /// Configuration source: generate a fresh random seed, import an existing
   /// (possibly sub-standard) BIP39 phrase, or recall an existing setup from its
@@ -2850,10 +2854,6 @@ class _SetupScreenState extends State<SetupScreen> {
   static const Color _kConsoleFg = Color(0xFFE9EDF2); // cool off-white
   static const Color _kConsoleAccent = Color(0xFFB8C2CC); // brighter, same cast
 
-  /// Shared height of the source-specific input (the Stages slider for New seed
-  /// / Recall, the import field for Import). Pinning both to one value keeps the
-  /// fields below from shifting vertically when the source mode is toggled.
-  static const double _kSourceRowHeight = 48;
   static const TextStyle _termStyle = TextStyle(
     color: _kConsoleFg,
     fontFamily: GreatWallTypography.fontFamily,
@@ -3317,42 +3317,12 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   List<Widget> _configControls() {
+    // The legacy 0.3.0 chain is deprecated (a single 32-bit point per stage is
+    // too weak), so Setup is orbit-only: this panel shows just the shared
+    // configuration — σ (Stage-0 salt/pepper), the Argon2 profile, calibration
+    // and D. Points are placed on the boards (R / N / I); there is no chain
+    // source selector or start button any more. See [_legacyChainEnabled].
     return <Widget>[
-      // The legacy 0.3.0-chain source selector (New seed / Import / Recall), its
-      // source-specific input, and the start button below drive the chain flow
-      // only. On an orbit board the point is entered with R / N / I on the slot
-      // and stages are managed by the tab bar + X, so these chain controls are
-      // omitted there — the board panel keeps just the shared σ / Argon2 / D
-      // configuration. (Slot 0, the salt, is not a board slot, so the chain
-      // config still shows there.)
-      if (!_isBoardSlot) ...<Widget>[
-        SegmentedButton<_SourceMode>(
-          showSelectedIcon: false,
-          segments: const <ButtonSegment<_SourceMode>>[
-            ButtonSegment<_SourceMode>(
-                value: _SourceMode.fresh, label: Text('New seed')),
-            ButtonSegment<_SourceMode>(
-                value: _SourceMode.import, label: Text('Import')),
-            ButtonSegment<_SourceMode>(
-                value: _SourceMode.recall, label: Text('Recall')),
-          ],
-          selected: <_SourceMode>{_source},
-          onSelectionChanged:
-              _busy ? null : (Set<_SourceMode> s) => _setSource(s.first),
-        ),
-        const SizedBox(height: 16),
-        // The source-specific input: the import builder (format toggle + field)
-        // or the stages slider. Each builder returns one or more widgets, laid
-        // out in a column so switching New seed / Import / Recall swaps the
-        // whole block.
-        Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: _source == _SourceMode.import
-              ? _mnemonicInput()
-              : _stagesInput(),
-        ),
-        const SizedBox(height: 16),
-      ],
       ..._stage0Input(),
       const SizedBox(height: 16),
       _argon2ProfileSlider(),
@@ -3360,28 +3330,6 @@ class _SetupScreenState extends State<SetupScreen> {
       _calibrateButton(),
       const SizedBox(height: 16),
       ..._iterationsInput(),
-      if (!_isBoardSlot) ...<Widget>[
-        const SizedBox(height: 16),
-        if (_source == _SourceMode.recall)
-          FilledButton(
-            onPressed: (_busy || !_iterationsValid) ? null : _beginRecall,
-            child: const Text('Begin recall'),
-          )
-        else
-          FilledButton(
-            onPressed: (_busy ||
-                    !_iterationsValid ||
-                    (_source == _SourceMode.import &&
-                        _mnemonic.text.trim().isEmpty))
-                ? null
-                : _start,
-            child: Text(_source == _SourceMode.import
-                ? (_importFormat == _ImportFormat.hex
-                    ? 'Encode hex'
-                    : 'Encode phrase')
-                : 'Generate'),
-          ),
-      ],
       if (_setup.phase == SetupPhase.error && _setup.errorMessage != null) ...<Widget>[
         const SizedBox(height: 12),
         Text(
@@ -3398,53 +3346,6 @@ class _SetupScreenState extends State<SetupScreen> {
           style: const TextStyle(color: Colors.white70),
         ),
       ],
-    ];
-  }
-
-  /// Discrete slider for the number of fractal **point stages**, with five
-  /// positions `0..maxPointStages` (0..4). `divisions` snaps to whole stages so
-  /// there is no ambiguous in-between value. 0 is a Stage-0-text-only setup; each
-  /// higher position adds one 32-bit fractal stage (`32 × count` bits / `3 ×
-  /// count` BIP39 words). Every position is valid, so — unlike the old free-text
-  /// field — there is nothing to flag and the action button stays enabled across
-  /// the range. (N denotes the Argon2 iteration count, set separately.)
-  List<Widget> _stagesInput() {
-    final int n = _pointStages;
-    final int maxN = SetupController.maxPointStages;
-    // Label and value live in the console (focus _Field.stages); the panel keeps
-    // only the slider to save vertical space.
-    return <Widget>[
-      _track(
-        _Field.stages,
-        // Pinned to the same height as the import field so toggling the source
-        // mode never shifts the fields below.
-        SizedBox(
-          height: _kSourceRowHeight,
-          child: Row(
-            children: <Widget>[
-              _sliderLabel('Stages'),
-              Expanded(
-                child: Slider(
-                  focusNode: _stagesFocus,
-                  value: n.toDouble(),
-                  min: 0,
-                  max: maxN.toDouble(),
-                  divisions: maxN,
-                  label: '$n',
-                  onChanged: _busy
-                      ? null
-                      : (double v) {
-                          final int next = v.round();
-                          if (next == _pointStages) return;
-                          _sounds.play(UiSound.tickSoft);
-                          setState(() => _pointStages = next);
-                        },
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
     ];
   }
 
@@ -3586,138 +3487,6 @@ class _SetupScreenState extends State<SetupScreen> {
     );
   }
 
-  /// The obscured BIP39 import field. The phrase is secret, so the field is
-  /// blind (asterisks) by default with an eye toggle; it is never echoed back.
-  /// The instruction and live word-count are shown in the console on focus
-  /// ([_fieldHelp]).
-  List<Widget> _mnemonicInput() {
-    final bool hex = _importFormat == _ImportFormat.hex;
-    // No standalone toggle row: a lightweight "BIP39 · Hex" text-link sits on
-    // the field's top edge as a real (clickable) overlay — straddling the
-    // outline like a caption — with the active format emphasised. Tapping a
-    // side selects it (the I / Alt+I shortcuts do the same). The whole block is
-    // pinned to [_kSourceRowHeight] so it matches the Stages slider and the
-    // fields below never shift when toggling New seed · Import · Recall.
-    return <Widget>[
-      _track(
-        _Field.mnemonic,
-        SizedBox(
-          height: _kSourceRowHeight,
-          child: Stack(
-            clipBehavior: Clip.none,
-            children: <Widget>[
-              // The field is bottom-anchored full-width, leaving the top strip
-              // for the caption to straddle its outline; a compact reveal icon
-              // keeps the field short enough to sit inside the pinned height.
-              Positioned(
-                left: 0,
-                right: 0,
-                bottom: 0,
-                child: TextField(
-                  controller: _mnemonic,
-                  focusNode: _mnemonicFocus,
-                  obscureText: _mnemonicHidden,
-                  enabled: !_busy,
-                  maxLines: 1,
-                  autocorrect: false,
-                  enableSuggestions: false,
-                  // Hex is constrained to grouped uppercase 0-9 A-F; words are
-                  // free text.
-                  inputFormatters: hex
-                      ? <TextInputFormatter>[
-                          FilteringTextInputFormatter.allow(
-                              RegExp(r'[0-9a-fA-F ]')),
-                          TextInputFormatter.withFunction(
-                            (TextEditingValue o, TextEditingValue n) =>
-                                n.copyWith(text: n.text.toUpperCase()),
-                          ),
-                        ]
-                      : null,
-                  decoration: InputDecoration(
-                    isDense: true,
-                    contentPadding:
-                        const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                    border: const OutlineInputBorder(),
-                    hintText: hex ? 'A1B2C3D4 …' : 'word1 word2 …',
-                    suffixIcon: IconButton(
-                      tooltip: _mnemonicHidden ? 'Show' : 'Hide',
-                      iconSize: 18,
-                      padding: EdgeInsets.zero,
-                      constraints:
-                          const BoxConstraints(minWidth: 36, minHeight: 36),
-                      icon: Icon(
-                        _mnemonicHidden ? Icons.visibility : Icons.visibility_off,
-                      ),
-                      onPressed: () =>
-                          setState(() => _mnemonicHidden = !_mnemonicHidden),
-                    ),
-                  ),
-                  onChanged: (_) {
-                    _sounds.play(UiSound.tickSoft);
-                    setState(() {});
-                  },
-                  onSubmitted: (_) => _submitConfig(),
-                ),
-              ),
-              Positioned(top: 0, left: 10, child: _importFormatLabel()),
-            ],
-          ),
-        ),
-      ),
-    ];
-  }
-
-  /// The "BIP39 · Hex" text-link that straddles the import field's top edge in
-  /// place of a bulky toggle. The active format is emphasised; tapping the
-  /// other side switches (clearing the field, since the formats are not
-  /// interchangeable). Mirrors the I / Alt+I shortcuts. Painted over the field
-  /// with the panel background so it notches the outline like a caption, with
-  /// generous padding so each side is an easy tap target.
-  Widget _importFormatLabel() {
-    void select(_ImportFormat fmt) {
-      if (_busy || fmt == _importFormat) return;
-      setState(() {
-        _importFormat = fmt;
-        _mnemonic.clear();
-      });
-    }
-
-    final TextStyle base =
-        Theme.of(context).textTheme.labelMedium ?? const TextStyle();
-    final Color? on = base.color;
-    Widget side(String text, _ImportFormat fmt, String tip) {
-      final bool active = _importFormat == fmt;
-      return Tooltip(
-        message: tip,
-        child: GestureDetector(
-          behavior: HitTestBehavior.opaque,
-          onTap: () => select(fmt),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-            child: Text(
-              text,
-              style: base.copyWith(
-                fontWeight: active ? FontWeight.w700 : FontWeight.w400,
-                color: active ? on : on?.withOpacity(0.45),
-              ),
-            ),
-          ),
-        ),
-      );
-    }
-
-    return Container(
-      color: Theme.of(context).colorScheme.surface,
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: <Widget>[
-          side('BIP39', _ImportFormat.words, 'Import an existing BIP39 phrase'),
-          Text('·', style: base.copyWith(color: on?.withOpacity(0.45))),
-          side('Hex', _ImportFormat.hex, 'Import raw hex (8 digits / stage)'),
-        ],
-      ),
-    );
-  }
 
   /// The Stage-0 salt/pepper field: obscured by default with a reveal toggle,
   /// constrained to a safe ASCII subset (uppercase letters, digits, hyphen).
@@ -5163,7 +4932,18 @@ class _SetupScreenState extends State<SetupScreen> {
     if (!p.completer.isCompleted) p.completer.complete(ok);
   }
 
+  /// The legacy 0.3.0 chain setup is **deprecated** — it commits a single
+  /// 32-bit point per stage, too weak a secret — so Setup is orbit-only and the
+  /// chain-start paths ([_start] / [_beginRecall]) refuse to run. This is a
+  /// runtime flag (deliberately not a `const`) so the now-unreachable chain
+  /// bodies stay referenced, keeping the shared fields they touch alive, until
+  /// the chain is removed together with SetupController (a separate pass).
+  bool get _legacyChainEnabled => false;
+
   Future<void> _start() async {
+    // Deprecated: the chain commits one 32-bit point per stage (too weak). Setup
+    // is orbit-only — refuse to start so no weak "legacy orbit" can be produced.
+    if (!_legacyChainEnabled) return;
     _sounds.play(UiSound.click);
     _focusViewer(); // leave the input field; hotkeys act on the viewer now
     _brightness.reset();
@@ -5211,6 +4991,7 @@ class _SetupScreenState extends State<SetupScreen> {
   /// Start a cold-start recall from the entered salt: derive Stage 1, then drop
   /// straight into select mode so the user can click their first point.
   Future<void> _beginRecall() async {
+    if (!_legacyChainEnabled) return; // legacy chain deprecated — see [_start]
     final int n = _pointStages;
     _sounds.play(UiSound.click);
     _focusViewer(); // leave the input field; clicks/hotkeys act on the viewer
