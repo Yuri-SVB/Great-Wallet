@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
-import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart'
@@ -1761,7 +1760,7 @@ class _SetupScreenState extends State<SetupScreen> {
     return FractalCanvas(
       source: widget.core.source,
       controller: _viewport,
-      palette: Palette.classicWithHue(_hue),
+      palette: Palette.forHue(_hue),
       brightness: _brightness,
       sounds: _sounds,
       stage: stage,
@@ -1796,7 +1795,7 @@ class _SetupScreenState extends State<SetupScreen> {
     return FractalCanvas(
       source: widget.core.source,
       controller: _viewport,
-      palette: Palette.classicWithHue(_hue),
+      palette: Palette.forHue(_hue),
       brightness: _brightness,
       sounds: _sounds,
       stage: Stage.stage2,
@@ -1834,12 +1833,12 @@ class _SetupScreenState extends State<SetupScreen> {
     return CanvasOverlays(
       islands: <CanvasIsland>[
         ..._boardIslands,
-        if (square && deco!.cells.pointsReIm.isNotEmpty) deco.cells,
+        if (square && deco.cells.pointsReIm.isNotEmpty) deco.cells,
       ],
       frames: <SelectionFrame>[
         if (square)
           SelectionFrame(
-            reMin: deco!.reMin,
+            reMin: deco.reMin,
             reMax: deco.reMax,
             imMin: deco.imMin,
             imMax: deco.imMax,
@@ -2901,7 +2900,8 @@ class _SetupScreenState extends State<SetupScreen> {
       color: _kConsoleBg,
       child: DecoratedBox(
         decoration: BoxDecoration(
-          border: Border(top: BorderSide(color: _kConsoleAccent.withOpacity(0.35))),
+          border:
+              Border(top: BorderSide(color: _kConsoleAccent.withValues(alpha: 0.35))),
         ),
         child: SafeArea(
           top: false,
@@ -2970,7 +2970,7 @@ class _SetupScreenState extends State<SetupScreen> {
             ),
           ],
         ),
-        Divider(height: 1, color: _kConsoleAccent.withOpacity(0.25)),
+        Divider(height: 1, color: _kConsoleAccent.withValues(alpha: 0.25)),
         // Live region — pinned above the scroll so a confirmation prompt or the
         // focused-field help is always visible (never scrolled behind the
         // manual).
@@ -3013,13 +3013,13 @@ class _SetupScreenState extends State<SetupScreen> {
             _setup.derivingStageIndex == null &&
             _focusedField == null &&
             _inMemoriseStudy)
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+          const Padding(
+            padding: EdgeInsets.fromLTRB(12, 8, 12, 0),
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: <Widget>[
-                const Icon(Icons.menu_book, size: 14),
-                const SizedBox(width: 6),
+                Icon(Icons.menu_book, size: 14),
+                SizedBox(width: 6),
                 Expanded(child: Text(_memoriseHelp)),
               ],
             ),
@@ -3084,7 +3084,7 @@ class _SetupScreenState extends State<SetupScreen> {
       margin: const EdgeInsets.only(bottom: 8),
       padding: const EdgeInsets.all(8),
       decoration: BoxDecoration(
-        color: _kConsoleFg.withOpacity(0.08),
+        color: _kConsoleFg.withValues(alpha: 0.08),
         borderRadius: BorderRadius.circular(6),
         border: Border.all(color: _kConsoleFg),
       ),
@@ -5000,16 +5000,15 @@ class _HueWheelControl extends StatelessWidget {
     required this.value,
     required this.onChanged,
     required this.focusNode,
-    this.diameter = 84,
   });
 
   final HueOffset value;
   final ValueChanged<HueOffset> onChanged;
   final FocusNode focusNode;
-  final double diameter;
+  final double diameter = 84;
 
   void _step(int dir) {
-    final List<HueOffset> order = HueOffset.values;
+    const List<HueOffset> order = HueOffset.values;
     final int i = (value.index + dir) % order.length;
     onChanged(order[i < 0 ? i + order.length : i]);
   }
@@ -5229,8 +5228,8 @@ class _StageTab extends StatelessWidget {
       // Ghost: a faint hollow slot — an open quest the chain can grow into.
       return _box(
         bg: Colors.transparent,
-        border: scheme.outlineVariant.withOpacity(0.25),
-        fg: scheme.onSurface.withOpacity(0.15),
+        border: scheme.outlineVariant.withValues(alpha: 0.25),
+        fg: scheme.onSurface.withValues(alpha: 0.15),
         bold: false,
       );
     }
@@ -5238,7 +5237,7 @@ class _StageTab extends StatelessWidget {
         ? scheme.onPrimary
         : available
             ? scheme.onSurface
-            : scheme.onSurface.withOpacity(0.35); // pending (requested) grey
+            : scheme.onSurface.withValues(alpha: 0.35); // pending (requested) grey
     return _box(
       bg: selected ? scheme.primary : Colors.transparent,
       border: selected ? scheme.primary : scheme.outlineVariant,

@@ -117,7 +117,7 @@ class MasterSecret {
   /// The conventional default view of an Argon2id master-secret [raw] output:
   /// its first [displayChars] hex characters (mirrors `master_secret_display`).
   static String displayHex(Uint8List raw) {
-    final int nBytes = (displayChars + 1) ~/ 2; // 2 hex chars per byte
+    const int nBytes = (displayChars + 1) ~/ 2; // 2 hex chars per byte
     final StringBuffer sb = StringBuffer();
     for (int i = 0; i < nBytes && i < raw.length; i++) {
       sb.write(raw[i].toRadixString(16).padLeft(2, '0'));

@@ -1,9 +1,7 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
-import 'package:flutter/material.dart' show Color;
 import 'package:great_wall_ux/great_wall_ux.dart';
 
 import '../core/bip39.dart';
