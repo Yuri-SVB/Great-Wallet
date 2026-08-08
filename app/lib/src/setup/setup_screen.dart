@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
-import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart'
@@ -162,13 +161,13 @@ class _SetupScreenState extends State<SetupScreen> {
   /// adds one 32-bit fractal stage (`32 × count` bits / `3 × count` BIP39
   /// words). Every position is a valid setup, so the count needs no validity
   /// gate. (N is reserved for the Argon2 iteration count, below.)
-  int _pointStages = 4;
+  ///
+  /// The stages slider that set this was removed with the deprecated legacy
+  /// chain; the value is now fixed and only feeds the Argon2 calibration
+  /// estimate.
+  final int _pointStages = 4;
 
-  /// Configuration source: generate a fresh random seed, import an existing
-  /// (possibly sub-standard) BIP39 phrase, or recall an existing setup from its
-  /// salt (cold-start recall — no encode, the points come back from clicks).
-  _SourceMode _source = _SourceMode.fresh;
-  _ImportFormat _importFormat = _ImportFormat.words;
+  final _ImportFormat _importFormat = _ImportFormat.words;
 
   /// Select mode: when on, tapping the canvas decodes the point under the
   /// cursor instead of panning. Toggled by the panel button or the `S` key.
@@ -270,9 +269,11 @@ class _SetupScreenState extends State<SetupScreen> {
 
   /// Required fractal count `r_i` per stage (index `0..`[SetupController.maxPointStages]).
   /// `r_0 = 2` by design (fixed); deep stages default to the 96-bit standard
-  /// `r_i = 3` and offer the `{2,3}` slider. Slots `1..r_i` are required boards;
-  /// slots beyond are the forgetting-forgiveness Shamir shares (P4). The actual
-  /// per-slot `θ_i_j` board render is wired with the orbit protocol (P5).
+  /// `r_i = 3` and offer the `{2,3}` slider. `r_i` is the **minimum** number of
+  /// fractals the holder places; every slot is operationally equal, so any `r_i`
+  /// of the `s_i` slots may be placed and the rest derive (slots beyond `r_i`
+  /// are only *faded* as a hint, not disabled). The actual per-slot `θ_i_j`
+  /// board render is wired with the orbit protocol (P5).
   final List<int> _requiredFractals = List<int>.generate(
       SetupController.maxPointStages + 1, (int i) => i == 0 ? 2 : 3);
 
@@ -301,10 +302,12 @@ class _SetupScreenState extends State<SetupScreen> {
   static const int _maxStage = SetupController.maxPointStages;
 
   // Per orbit stage i (0..[_maxStage]) and fractal slot (1..[_maxSlot]): the
-  // placed 32-bit chunk and its encoded board point. Slots 1..r_i are
-  // user-placed (primary); slots r_i+1.. are DERIVED — Sh_i evaluated at the
-  // resistance abscissae (by the engine) — and locked. Slot 0 (salt) is unused.
-  // Session-only; wiped when σ changes. Indexed `[stage][slot]`.
+  // placed 32-bit chunk and its encoded board point. Every slot is equal: the
+  // holder places any r_i of them (each slot's abscissa is its index s), which
+  // fixes Sh_i; the remaining slots are DERIVED — Sh_i evaluated at their slot
+  // index (by the engine) — and locked. `_boardDerived` distinguishes the two.
+  // Slot 0 (salt) is unused. Session-only; wiped when σ changes.
+  // Indexed `[stage][slot]`.
   final List<List<List<int>?>> _boardChunks = List<List<List<int>?>>.generate(
       _maxStage + 1, (_) => List<List<int>?>.filled(_maxSlot + 1, null));
   final List<List<({int reRaw, int imRaw})?>> _boardPoints =
@@ -313,6 +316,13 @@ class _SetupScreenState extends State<SetupScreen> {
   final List<List<bool>> _boardDerived = List<List<bool>>.generate(
       _maxStage + 1, (_) => List<bool>.filled(_maxSlot + 1, false));
 
+  // Monotonic per-stage token guarding the deferred, off-isolate encode of a
+  // stage's forgetting-resistance share markers ([_encodeShareMarkers]). Any
+  // change to the stage's shares — a re-placement, a deeper-stage re-root, or a
+  // σ reset — bumps it so a late background result is discarded rather than
+  // written over fresh state. Indexed `[stage]`.
+  final List<int> _shareEncodeGen = List<int>.filled(_maxStage + 1, 0);
+
   /// Per-stage orbit point `o_i`. `o_0` is derived on the fly from σ (see
   /// [_stageOrbit]); `o_i` (`i≥1`) is the memory-hard advance `o_i = H*(K_{i-1})`,
   /// filled when the user advances forward (P5 deep stages). Null until derived.
@@ -320,14 +330,14 @@ class _SetupScreenState extends State<SetupScreen> {
   final List<Uint8List?> _orbitO = List<Uint8List?>.filled(_maxStage + 1, null);
 
   /// Per-stage master secret `K_i = H(o_i ‖ Sh_i)`, recomputed by
-  /// [_recomputeExtraShares] whenever stage `i`'s `r_i` primaries are complete,
-  /// and null otherwise. Coercion-relevant — wiped and nulled on any placement
+  /// [_recomputeExtraShares] whenever stage `i` has `r_i` fractals placed (in any
+  /// slots), and null otherwise. Coercion-relevant — wiped and nulled on any placement
   /// clear (and hence on dispose, via [_clearOrbitPlacements]). The board export
   /// (`K` / `Alt+K`) copies the active stage's `K_i` (optionally domain-separated
   /// by the export-salt label) through [_copyOrbitMaster].
   final List<Uint8List?> _orbitK = List<Uint8List?>.filled(_maxStage + 1, null);
 
-  /// The active stage's master secret `K_i`, or null until its primaries are in.
+  /// The active stage's master secret `K_i`, or null until `r_i` fractals are placed.
   Uint8List? get _activeK => _orbitK[_activeStage];
 
   /// The stage-0 slot whose point is being imported inline, or null. Reuses the
@@ -371,12 +381,13 @@ class _SetupScreenState extends State<SetupScreen> {
   bool get _isBoardSlot =>
       _slotIndex >= 1 && (!_hasSession || _activeStage == 0);
 
-  /// True when the current slot is a **primary** board that still takes a point
-  /// (slot `1..r_i`, not a derived share) — i.e. placement is allowed.
+  /// True when the current board slot still takes a point — i.e. it is not a
+  /// derived (auto-computed) share. All fractals at a stage are operationally
+  /// equal: any slot may take a point until `r_i` are placed, after which the
+  /// rest derive and lock. (The tab row fades slots beyond `r_i` as a "these are
+  /// extras" hint, not a lock — the holder is free to use them.)
   bool get _placeableBoardSlot =>
-      _isBoardSlot &&
-      _slotIndex <= _requiredFractals[_activeStage] &&
-      !_boardDerived[_activeStage][_slotIndex];
+      _isBoardSlot && !_boardDerived[_activeStage][_slotIndex];
 
   /// A confirmation awaiting an inline answer in the console (replaces modal
   /// dialogs). Resolved by the console's action buttons.
@@ -855,17 +866,20 @@ class _SetupScreenState extends State<SetupScreen> {
                       index: i,
                       inSetup: true,
                       selected: i == _slotIndex,
-                      // Salt (#0) + required fractals (1..r_i) are lit; slots
-                      // beyond r_i are the optional forgetting-forgiveness
-                      // shares, shown faded. Always navigable.
+                      // Every fractal at a stage is operationally equal — any
+                      // slot may take a point until r_i are placed, after which
+                      // the rest derive. The fade on slots beyond r_i is a hint
+                      // ("r_i is the minimum; these are extras"), not a lock:
+                      // salt (#0) + the first r_i are lit, the rest faded, all
+                      // navigable and all placeable.
                       available: i == 0 || i <= r,
                       deriving: false,
                       progress: 0,
                       tooltip: i == 0
                           ? 'Slot 0 — salt (σ / retirement)'
                           : i <= r
-                              ? 'Slot $i — required fractal (rᵢ=$r)'
-                              : 'Slot $i — extra share (forgetting-forgiveness)',
+                              ? 'Slot $i — fractal (rᵢ=$r is the minimum)'
+                              : 'Slot $i — fractal (beyond rᵢ=$r — equally usable)',
                       onTap: () => _selectSlot(i),
                     ),
                   ),
@@ -877,12 +891,13 @@ class _SetupScreenState extends State<SetupScreen> {
     );
   }
 
-  /// Compact `r_i` control for the active stage: the number of **required**
-  /// fractals, `2` or `3`. Grayed and fixed at `2` for stage 0 (σ-public entry);
-  /// a `{2,3}` slider for deep stages (2 = substandard 64-bit, 3 = standard
-  /// 96-bit). Slots beyond `r_i` become forgetting-forgiveness shares (P4). The
-  /// exact per-stage optionality will ultimately come from the engine's tier
-  /// rules (open item); for now only stage 0 is fixed.
+  /// Compact `r_i` control for the active stage: the **minimum** number of
+  /// fractals to place, `2` or `3`. Grayed and fixed at `2` for stage 0
+  /// (σ-public entry); a `{2,3}` slider for deep stages (2 = substandard 64-bit,
+  /// 3 = standard 96-bit). The holder places any `r_i` of the `s_i` fractals;
+  /// the rest derive as forgetting-forgiveness shares. The exact per-stage
+  /// optionality will ultimately come from the engine's tier rules (open item);
+  /// for now only stage 0 is fixed.
   Widget _riControl() {
     final ThemeData theme = Theme.of(context);
     final int stage = _activeStage;
@@ -907,7 +922,18 @@ class _SetupScreenState extends State<SetupScreen> {
                     : (double v) {
                         final int nv = v.round();
                         if (nv != _requiredFractals[stage]) {
-                          setState(() => _requiredFractals[stage] = nv);
+                          setState(() {
+                            _requiredFractals[stage] = nv;
+                            // r_i is the live threshold over equal slots, so a
+                            // change re-settles the stage: raising it un-settles
+                            // (K_i clears until another point is placed), lowering
+                            // it re-derives the now-extra slots. Either way Sh_i
+                            // (hence K_i) changes, which re-roots deeper stages.
+                            _recomputeExtraShares(stage);
+                            _invalidateDeeperThan(stage);
+                            _boardDecoCache.clear();
+                            _boardCanonicalView = false;
+                          });
                         }
                       },
               ),
@@ -1219,9 +1245,9 @@ class _SetupScreenState extends State<SetupScreen> {
         if (!_busy) _copyMasterSecret(full: true);
         return KeyEventResult.handled;
       }
-      // Alt+I — the hex counterpart of plain I (BIP39 words): on a live editable
-      // stage it opens the point-import editor in hex; on the config screen it
-      // selects the Import source pre-toggled to hex.
+      // Alt+I — the hex counterpart of plain I (BIP39 words): on an editable
+      // point (a chain stage or an orbit board slot) it opens the point-import
+      // editor in hex.
       if (event.logicalKey == LogicalKeyboardKey.keyI) {
         if (_expandTarget != null) {
           _expandImport(hex: true);
@@ -1229,9 +1255,6 @@ class _SetupScreenState extends State<SetupScreen> {
           _beginBoardImport(_slotIndex, hex: true);
         } else if (_setup.canEditCurrentPoint) {
           _changePointImport(hex: true);
-        } else {
-          _setSource(_SourceMode.import, focusInput: true);
-          setState(() => _importFormat = _ImportFormat.hex);
         }
         return KeyEventResult.handled;
       }
@@ -1304,10 +1327,9 @@ class _SetupScreenState extends State<SetupScreen> {
       _focusField(_hueFocus, 'colour wheel');
       return KeyEventResult.handled;
     }
-    // N / I / R — on the config screen, choose the source and focus its input.
-    // On a live, editable point stage they instead change that stage's point:
-    // N = new random, R = manual click. (I — blind import — lands with the
-    // expansion work, which shares the inline bit editor.)
+    // N / I / R — on an editable point (a chain stage or an orbit board slot)
+    // they change that point: N = new random, R = manual click, I = blind
+    // import (which shares the inline bit editor).
     if (event.logicalKey == LogicalKeyboardKey.keyN) {
       if (_expandTarget != null) {
         _expandNew();
@@ -1315,8 +1337,6 @@ class _SetupScreenState extends State<SetupScreen> {
         _generatePrimary(_slotIndex);
       } else if (_setup.canEditCurrentPoint) {
         _changePointGenerated();
-      } else {
-        _setSource(_SourceMode.fresh, focusInput: true);
       }
       return KeyEventResult.handled;
     }
@@ -1327,9 +1347,6 @@ class _SetupScreenState extends State<SetupScreen> {
         _beginBoardImport(_slotIndex, hex: false);
       } else if (_setup.canEditCurrentPoint) {
         _changePointImport(hex: false);
-      } else {
-        _setSource(_SourceMode.import, focusInput: true);
-        setState(() => _importFormat = _ImportFormat.words);
       }
       return KeyEventResult.handled;
     }
@@ -1338,14 +1355,13 @@ class _SetupScreenState extends State<SetupScreen> {
         _expandManual();
         return KeyEventResult.handled;
       }
-      // At a primary orbit board slot, R arms a manual point placement (the same
-      // click-to-place mechanism as a chain point edit).
+      // At a placeable orbit board slot (any non-derived fractal), R arms a
+      // manual point placement (the same click-to-place mechanism as a chain
+      // point edit).
       if (_placeableBoardSlot) {
         _armBoardManual();
       } else if (_setup.canEditCurrentPoint) {
         _changePointManual();
-      } else {
-        _setSource(_SourceMode.recall, focusInput: true);
       }
       return KeyEventResult.handled;
     }
@@ -1584,19 +1600,26 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   /// Serialize stage [stage]'s Shamir polynomial `Sh_i` by re-interpolating it
-  /// from the stage's `r_i` primary points, or null if they are not all placed.
-  /// `Sh_i` is coercion-relevant, so the interim coefficients are wiped before
+  /// from the `r_i` points the holder placed — in whichever slots they chose,
+  /// each at abscissa = slot index — or null if fewer than `r_i` are placed.
+  /// This mirrors [_recomputeExtraShares]'s `chosen` set exactly, so `Sh_i` (and
+  /// thus `K_i` and the advance) is identical however it is recomputed. `Sh_i`
+  /// is coercion-relevant, so the interim coefficients are wiped before
   /// returning; the caller owns (and wipes) the returned bytes.
   Uint8List? _stageShBytes(int stage) {
     final int r = _requiredFractals[stage];
-    final List<int> xs = <int>[];
-    final List<int> ys = <int>[];
-    for (int s = 1; s <= r; s++) {
-      final List<int>? c = _boardChunks[stage][s];
-      if (c == null || _boardDerived[stage][s]) return null;
-      xs.add(s);
-      ys.add(OrbitProtocol.bitsToU32(c));
+    final List<int> placed = <int>[];
+    for (int s = 1; s <= _maxSlot; s++) {
+      if (_boardChunks[stage][s] != null && !_boardDerived[stage][s]) {
+        placed.add(s);
+      }
     }
+    if (placed.length < r) return null; // not enough points placed yet
+    final List<int> chosen = placed.length > r ? placed.sublist(0, r) : placed;
+    final List<int> xs = <int>[for (final int s in chosen) s];
+    final List<int> ys = <int>[
+      for (final int s in chosen) OrbitProtocol.bitsToU32(_boardChunks[stage][s]!),
+    ];
     final List<int> sh = widget.core.shamirInterp(xs, ys);
     final Uint8List shBytes = GreatWallCoreBindings.shToBytes(sh);
     for (int i = 0; i < sh.length; i++) {
@@ -1732,24 +1755,12 @@ class _SetupScreenState extends State<SetupScreen> {
     setState(() {});
   }
 
-  /// Toggle select (recall) mode. Entering it snaps the canvas to the stage the
-  /// recall walk is on, so clicks land on the right fractal in chain order.
-  /// Snap the canvas to the recall stage and turn on point selection. Select
-  /// mode is implicit in a cold-start recall (the points are hidden, so clicking
-  /// is how the seed comes back); a generated/imported setup shows its points,
-  /// so there is nothing to "practise" and the mode is never offered as a
-  /// toggle.
-  void _enterRecallSelect() {
-    setState(() => _selectMode = true);
-    _setup.showRecallStage();
-  }
-
   Widget _canvas() {
     final Stage stage = _setup.displayStage;
     return FractalCanvas(
       source: widget.core.source,
       controller: _viewport,
-      palette: Palette.classicWithHue(_hue),
+      palette: Palette.forHue(_hue),
       brightness: _brightness,
       sounds: _sounds,
       stage: stage,
@@ -1772,8 +1783,8 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   /// Stage-0 fractal slot (`#j≥1`): the real orbit board `θ_0_(j-1)` derived
-  /// from σ → o₀. A primary slot (`1..r_0`) carries a placed point shown as a
-  /// white cross; slots beyond `r_0` are the derived (locked) shares. Point
+  /// from σ → o₀. Any slot may carry a placed point (shown as a white cross)
+  /// until `r_0` are placed; the rest then derive and lock. Point
   /// entry uses the *existing* mechanisms — `R` arms a manual click, exactly
   /// like editing a chain point (so the canvas takes a click only in select /
   /// edit mode). When σ is unset/invalid a "set σ first" panel is shown.
@@ -1784,7 +1795,7 @@ class _SetupScreenState extends State<SetupScreen> {
     return FractalCanvas(
       source: widget.core.source,
       controller: _viewport,
-      palette: Palette.classicWithHue(_hue),
+      palette: Palette.forHue(_hue),
       brightness: _brightness,
       sounds: _sounds,
       stage: Stage.stage2,
@@ -1822,12 +1833,12 @@ class _SetupScreenState extends State<SetupScreen> {
     return CanvasOverlays(
       islands: <CanvasIsland>[
         ..._boardIslands,
-        if (square && deco!.cells.pointsReIm.isNotEmpty) deco.cells,
+        if (square && deco.cells.pointsReIm.isNotEmpty) deco.cells,
       ],
       frames: <SelectionFrame>[
         if (square)
           SelectionFrame(
-            reMin: deco!.reMin,
+            reMin: deco.reMin,
             reMax: deco.reMax,
             imMin: deco.imMin,
             imMax: deco.imMax,
@@ -2097,7 +2108,7 @@ class _SetupScreenState extends State<SetupScreen> {
     _toast('Click the point for slot $_slotIndex (Esc to cancel).');
   }
 
-  /// Decode a tapped leaf as slot [slot]'s primary point (under the board's
+  /// Decode a tapped leaf as slot [slot]'s point (under the board's
   /// reservoirs) and record it. Returns true when a point was placed.
   bool _placePrimaryAt(int slot, FractalSelection sel) {
     final ({int o, int p, int q})? prm = _boardPrm(slot);
@@ -2199,9 +2210,10 @@ class _SetupScreenState extends State<SetupScreen> {
     );
   }
 
-  /// Record slot [slot]'s primary chunk + point (copying [bits]) on the active
-  /// stage and re-derive that stage's extra shares from the (possibly now
-  /// complete) primaries.
+  /// Record slot [slot]'s placed chunk + point (copying [bits]) on the active
+  /// stage and re-derive that stage's shares — the placed count may now have
+  /// reached `r_i`, fixing `Sh_i`. Any slot may be the one placed here; all
+  /// fractals at a stage are operationally equal.
   void _setPrimary(int slot, List<int> bits, ({int reRaw, int imRaw}) point) {
     final int stage = _activeStage;
     setState(() {
@@ -2230,6 +2242,7 @@ class _SetupScreenState extends State<SetupScreen> {
   /// inside a [setState].
   void _invalidateDeeperThan(int stage) {
     for (int st = stage + 1; st <= _maxStage; st++) {
+      _shareEncodeGen[st]++; // discard any in-flight share-marker encode for st
       for (int s = 1; s <= _maxSlot; s++) {
         final List<int>? c = _boardChunks[st][s];
         if (c != null) Entropy.wipe(c);
@@ -2250,16 +2263,21 @@ class _SetupScreenState extends State<SetupScreen> {
     }
   }
 
-  /// Derive [stage]'s forgetting-resistance shares (slots `r_i+1..`[_maxSlot])
-  /// from its `r_i` primary points, and (re)compute `K_i = H(o_i ‖ Sh_i)` into
-  /// [_orbitK]. `Sh_i = shamirInterp(primaries)`; the engine evaluates it at the
-  /// reserved resistance abscissae ([GreatWallCore.generateResistanceShares]);
-  /// each value is encoded onto its board `θ_i_(s-1)` for display. Missing a
-  /// primary (or `o_i`) simply clears them and `K_i`. Any `r_i` of the boards
-  /// reconstruct the identical `Sh_i` (orbit_protocol_test). Must run inside a
-  /// [setState].
+  /// Derive [stage]'s non-placed fractal shares from the `r_i` points the holder
+  /// placed (in whichever slots), and (re)compute `K_i = H(o_i ‖ Sh_i)` into
+  /// [_orbitK]. `Sh_i = shamirInterp(placed, abscissa = slot index)`; the engine
+  /// then evaluates it at each non-placed slot's index
+  /// ([GreatWallCore.shamirEval]) and that value is encoded onto its board
+  /// `θ_i_(s-1)` for display. Fewer than `r_i` placed (or a missing `o_i`) simply
+  /// clears the derived slots and `K_i`. All fractals are equal, so any `r_i` of
+  /// the `s_i` boards reconstruct the identical `Sh_i` (orbit_protocol_test).
+  /// Must run inside a [setState].
   void _recomputeExtraShares(int stage) {
     final int r = _requiredFractals[stage];
+    // Any recompute supersedes an in-flight background share-marker encode for
+    // this stage (see [_encodeShareMarkers]); bump the token so a late result is
+    // discarded rather than written over the freshly recomputed state.
+    _shareEncodeGen[stage]++;
     // K_i is only valid while the primaries are complete; drop the previous one
     // up front so every incomplete early-return below leaves it null.
     final Uint8List? oldK = _orbitK[stage];
@@ -2267,7 +2285,21 @@ class _SetupScreenState extends State<SetupScreen> {
       Entropy.wipe(oldK);
       _orbitK[stage] = null;
     }
-    for (int s = r + 1; s <= _maxSlot; s++) {
+    // All fractals at a stage are operationally equal: each slot's abscissa is
+    // its index, so ANY r_i user-placed points fix the identical degree-(r_i-1)
+    // polynomial Sh_i and the remaining slots derive on it (Shamir subset-
+    // invariance). The placed set is whichever slots the holder chose — not
+    // necessarily 1..r_i — which is what lets recovery use a *different* r_i of
+    // the s_i points (forgetting-resistance).
+    final List<int> placed = <int>[];
+    for (int s = 1; s <= _maxSlot; s++) {
+      if (_boardChunks[stage][s] != null && !_boardDerived[stage][s]) {
+        placed.add(s);
+      }
+    }
+    // Drop any previously-derived slots; they are recomputed below, or left
+    // clear while the placed count is still under threshold.
+    for (int s = 1; s <= _maxSlot; s++) {
       if (_boardDerived[stage][s]) {
         final List<int>? c = _boardChunks[stage][s];
         if (c != null) Entropy.wipe(c);
@@ -2276,39 +2308,91 @@ class _SetupScreenState extends State<SetupScreen> {
         _boardDerived[stage][s] = false;
       }
     }
-    final List<int> xs = <int>[];
-    final List<int> ys = <int>[];
-    for (int s = 1; s <= r; s++) {
-      final List<int>? c = _boardChunks[stage][s];
-      if (c == null || _boardDerived[stage][s]) return; // primaries incomplete
-      xs.add(s); // primary abscissa = slot number
-      ys.add(OrbitProtocol.bitsToU32(c));
-    }
+    if (placed.length < r) return; // under threshold — Sh_i not yet determined
+    // Exactly r_i points fix the polynomial. Placement never lets more than r_i
+    // accumulate, but lowering r_i (the slider) can leave extra placed slots; the
+    // lowest-indexed r_i then win and the surplus re-derive below.
+    final List<int> chosen =
+        placed.length > r ? placed.sublist(0, r) : placed;
     final Uint8List? oi = _stageOrbit(stage);
     if (oi == null) return;
     final OrbitProtocol orbit = OrbitProtocol(widget.core);
+    // Interpolate Sh_i over the chosen slots at abscissa = slot index.
+    final List<int> xs = <int>[for (final int s in chosen) s];
+    final List<int> ys = <int>[
+      for (final int s in chosen)
+        OrbitProtocol.bitsToU32(_boardChunks[stage][s]!),
+    ];
     final List<int> sh = widget.core.shamirInterp(xs, ys);
     // K_i = H(o_i ‖ Sh_i): the per-stage master secret, exported (optionally
     // domain-separated) by K / Alt+K. Computed here while Sh_i is in hand.
     final Uint8List shBytes = GreatWallCoreBindings.shToBytes(sh);
     _orbitK[stage] = widget.core.masterSecret(oi, shBytes);
     Entropy.wipe(shBytes);
-    final int extras = _maxSlot - r;
-    final List<int> shares = widget.core.generateResistanceShares(sh, extras);
-    for (int i = 0; i < extras; i++) {
-      final int s = r + 1 + i;
-      final List<int> bits = OrbitProtocol.u32ToBits(shares[i]);
+    // Derive every NON-chosen slot at abscissa = slot index (display-only; K_i
+    // above uses the chosen points alone). Encoding the fractal point is a
+    // CPU-heavy island-discovery search that, on the degenerate share values a
+    // corner-case stage produces (an all-ones stage → constant polynomial →
+    // all-ones shares), can take tens of seconds per point at a sparse-island
+    // reservoir — running it on the UI isolate froze the app — so it is deferred
+    // off-isolate ([_encodeShareMarkers]); a null point renders no marker until
+    // it lands.
+    final Set<int> chosenSet = chosen.toSet();
+    final List<List<int>> pendingBits = <List<int>>[];
+    final List<List<int>> pendingRes = <List<int>>[];
+    final List<int> pendingSlots = <int>[];
+    for (int s = 1; s <= _maxSlot; s++) {
+      if (chosenSet.contains(s)) continue;
+      final List<int> bits =
+          OrbitProtocol.u32ToBits(widget.core.shamirEval(sh, s));
       final ({int o, int p, int q}) prm = orbit.orbitParams(oi, s - 1);
-      final EncodedPoint pt = widget.core
-          .encodeStage(List<int>.of(bits), o: prm.o, p: prm.p, q: prm.q)
-          .first;
       _boardChunks[stage][s] = bits; // owns it
-      _boardPoints[stage][s] = (reRaw: pt.reRaw, imRaw: pt.imRaw);
+      _boardPoints[stage][s] = null; // marker pending until the encode lands
       _boardDerived[stage][s] = true;
+      pendingBits.add(List<int>.of(bits));
+      pendingRes.add(<int>[prm.o, prm.p, prm.q]);
+      pendingSlots.add(s);
     }
     for (int i = 0; i < sh.length; i++) {
       sh[i] = 0; // Sh_i is coercion-relevant — zero it once shares are made.
     }
+    if (pendingSlots.isNotEmpty) {
+      unawaited(_encodeShareMarkers(
+          stage, _shareEncodeGen[stage], pendingSlots, pendingBits, pendingRes));
+    }
+  }
+
+  /// Encode stage [stage]'s deferred forgetting-resistance share markers off the
+  /// UI isolate (see [GreatWallCore.encodeSharePoints]) and, when they land,
+  /// place them on their slots — unless a newer recompute, a deeper-stage
+  /// re-root, or a σ reset has since bumped [_shareEncodeGen] past [gen], in
+  /// which case the stale result is dropped. A failed encode leaves the markers
+  /// pending: they are display-only, so `K_i` and the advance are unaffected.
+  Future<void> _encodeShareMarkers(
+    int stage,
+    int gen,
+    List<int> slots,
+    List<List<int>> chunks,
+    List<List<int>> reservoirs,
+  ) async {
+    List<({int reRaw, int imRaw})> pts;
+    try {
+      pts = await widget.core.encodeSharePoints(chunks, reservoirs);
+    } catch (_) {
+      return;
+    }
+    if (!mounted || gen != _shareEncodeGen[stage]) return;
+    if (pts.length != slots.length) return; // engine returns one point per chunk
+    setState(() {
+      for (int i = 0; i < slots.length; i++) {
+        final int s = slots[i];
+        // Only apply while this is still the derived share we encoded.
+        if (_boardDerived[stage][s]) {
+          _boardPoints[stage][s] = (reRaw: pts[i].reRaw, imRaw: pts[i].imRaw);
+        }
+      }
+      _boardDecoCache.clear();
+    });
   }
 
   /// Drop every orbit placement across all stages (wiping chunks, `o_i` and
@@ -2316,6 +2400,7 @@ class _SetupScreenState extends State<SetupScreen> {
   /// old points no longer decode, and on dispose.
   void _clearOrbitPlacements() {
     for (int st = 0; st <= _maxStage; st++) {
+      _shareEncodeGen[st]++; // discard any in-flight share-marker encode
       for (int s = 1; s <= _maxSlot; s++) {
         final List<int>? c = _boardChunks[st][s];
         if (c != null) Entropy.wipe(c);
@@ -2350,7 +2435,6 @@ class _SetupScreenState extends State<SetupScreen> {
     final int stage = _activeStage;
     final int r = _requiredFractals[stage];
     final bool derived = _boardDerived[stage][slot];
-    final bool primary = slot <= r;
     final bool placed = _boardPoints[stage][slot] != null;
     final bool hasRoot = stage == 0
         ? _parseHex(_sigmaCtrl.text.trim()) != null
@@ -2359,14 +2443,10 @@ class _SetupScreenState extends State<SetupScreen> {
     final Widget body;
     if (derived) {
       body = Text(
-        'Derived share (locked): the stage’s Shamir polynomial extrapolated '
-        'onto this board’s forgetting-resistance point.',
-        style: theme.textTheme.bodySmall,
-      );
-    } else if (!primary) {
-      body = Text(
-        'Extra share — fills automatically once the $r required points '
-        '(slots 1–$r) are placed.',
+        'Derived share (locked): the stage’s Shamir polynomial — fixed by the '
+        '$r points you placed — extrapolated onto this fractal. It is a real, '
+        'usable point: recovery accepts any $r of the stage’s fractals, not '
+        'only the ones you placed here.',
         style: theme.textTheme.bodySmall,
       );
     } else if (!hasRoot) {
@@ -2380,12 +2460,16 @@ class _SetupScreenState extends State<SetupScreen> {
       body = Text(
         placed
             ? 'Point placed. R new click · N regenerate · I import (words/hex).'
-            : 'R to place (click a leaf) · N random · I import (words/hex).',
+            : 'R to place (click a leaf) · N random · I import (words/hex). '
+                'rᵢ=$r is the minimum — place any $r fractals; the rest derive.',
         style: theme.textTheme.bodySmall,
       );
     }
     return <Widget>[
-      Text('Slot $slot — ${primary ? 'required point' : 'extra share'}',
+      Text(
+          derived
+              ? 'Slot $slot — derived share (locked)'
+              : 'Slot $slot — fractal${slot > r ? ' (beyond rᵢ=$r)' : ''}',
           style: theme.textTheme.titleMedium),
       const SizedBox(height: 4),
       body,
@@ -2745,7 +2829,9 @@ class _SetupScreenState extends State<SetupScreen> {
     'M  console   9  stage bar   Z  reset (asks first)',
     'Alt+0–4  go to that stage (recenters); press again to zoom to its point',
     '0–6  select the secondary slot (0 = salt · 1–6 = fractals)',
-    'N / I / R  New seed / Import / Recall (config) · on a stage: change its point',
+    'Fractals are equal: rᵢ is the minimum — place any rᵢ, the rest derive',
+    'Simplest: fill fractals in order & remember which ones you learn',
+    'N / I / R  on a point: N new random · I import · R manual click',
     'I import = BIP39 words · Alt+I import = hex (config & point edit alike)',
     'Click/press a ghost slot past the last stage to grow the setup (N/I/R)',
     'S salt / export salt · P profile · D derivation steps · C colour',
@@ -2788,10 +2874,6 @@ class _SetupScreenState extends State<SetupScreen> {
   static const Color _kConsoleFg = Color(0xFFE9EDF2); // cool off-white
   static const Color _kConsoleAccent = Color(0xFFB8C2CC); // brighter, same cast
 
-  /// Shared height of the source-specific input (the Stages slider for New seed
-  /// / Recall, the import field for Import). Pinning both to one value keeps the
-  /// fields below from shifting vertically when the source mode is toggled.
-  static const double _kSourceRowHeight = 48;
   static const TextStyle _termStyle = TextStyle(
     color: _kConsoleFg,
     fontFamily: GreatWallTypography.fontFamily,
@@ -2818,7 +2900,8 @@ class _SetupScreenState extends State<SetupScreen> {
       color: _kConsoleBg,
       child: DecoratedBox(
         decoration: BoxDecoration(
-          border: Border(top: BorderSide(color: _kConsoleAccent.withOpacity(0.35))),
+          border:
+              Border(top: BorderSide(color: _kConsoleAccent.withValues(alpha: 0.35))),
         ),
         child: SafeArea(
           top: false,
@@ -2887,7 +2970,7 @@ class _SetupScreenState extends State<SetupScreen> {
             ),
           ],
         ),
-        Divider(height: 1, color: _kConsoleAccent.withOpacity(0.25)),
+        Divider(height: 1, color: _kConsoleAccent.withValues(alpha: 0.25)),
         // Live region — pinned above the scroll so a confirmation prompt or the
         // focused-field help is always visible (never scrolled behind the
         // manual).
@@ -2930,13 +3013,13 @@ class _SetupScreenState extends State<SetupScreen> {
             _setup.derivingStageIndex == null &&
             _focusedField == null &&
             _inMemoriseStudy)
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+          const Padding(
+            padding: EdgeInsets.fromLTRB(12, 8, 12, 0),
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: <Widget>[
-                const Icon(Icons.menu_book, size: 14),
-                const SizedBox(width: 6),
+                Icon(Icons.menu_book, size: 14),
+                SizedBox(width: 6),
                 Expanded(child: Text(_memoriseHelp)),
               ],
             ),
@@ -3001,7 +3084,7 @@ class _SetupScreenState extends State<SetupScreen> {
       margin: const EdgeInsets.only(bottom: 8),
       padding: const EdgeInsets.all(8),
       decoration: BoxDecoration(
-        color: _kConsoleFg.withOpacity(0.08),
+        color: _kConsoleFg.withValues(alpha: 0.08),
         borderRadius: BorderRadius.circular(6),
         border: Border.all(color: _kConsoleFg),
       ),
@@ -3045,8 +3128,8 @@ class _SetupScreenState extends State<SetupScreen> {
           // bespoke buttons here.
           if (_isBoardSlot) ...<Widget>[
             ..._boardStatus(),
-            // Master-secret (K_i) export — offered once the active stage's r_i
-            // primaries are complete (K_i derived). Reuses the export-salt field
+            // Master-secret (K_i) export — offered once the active stage has r_i
+            // fractals placed (K_i derived). Reuses the export-salt field
             // + Copy button.
             if (_activeK != null) ...<Widget>[
               const Divider(height: 32),
@@ -3203,81 +3286,13 @@ class _SetupScreenState extends State<SetupScreen> {
     );
   }
 
-  /// Choose the config source (New seed / Import / Recall) — from the segmented
-  /// button or the N / I / R hotkeys. Only meaningful on the config screen.
-  void _setSource(_SourceMode mode, {bool focusInput = false}) {
-    if (_hasSession) return;
-    _sounds.play(UiSound.click);
-    setState(() => _source = mode);
-    _toast(_sourceBlurb(mode));
-    if (focusInput) {
-      // Jump straight to the mode's primary input (the import field, or the
-      // stages slider for New seed / Recall) once the rebuild has placed it.
-      final FocusNode node =
-          mode == _SourceMode.import ? _mnemonicFocus : _stagesFocus;
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted && node.context != null) node.requestFocus();
-      });
-    }
-  }
-
-  /// Submit the config form from an input field's Enter key: run the action that
-  /// the enabled button would (Generate / Encode phrase / Begin recall), if its
-  /// preconditions hold. Focus returns to the viewer when the action starts.
-  void _submitConfig() {
-    if (_busy || _hasSession || !_iterationsValid) return;
-    if (_source == _SourceMode.recall) {
-      _beginRecall();
-    } else if (_source == _SourceMode.import) {
-      if (_mnemonic.text.trim().isNotEmpty) _start();
-    } else {
-      _start();
-    }
-  }
-
-  /// One-line description of a source mode, shown in the console when selected
-  /// (instead of an inline paragraph in the panel).
-  String _sourceBlurb(_SourceMode mode) {
-    switch (mode) {
-      case _SourceMode.fresh:
-        return 'New seed: generate fresh entropy and encode it onto the '
-            'fractals to memorise.';
-      case _SourceMode.import:
-        return 'Import: encode an existing BIP39 phrase onto the fractals.';
-      case _SourceMode.recall:
-        return 'Recall: enter the same salt, number of stages and Argon2 '
-            'settings, then click your memorised point on each stage. Nothing '
-            'is encoded — the seed is rebuilt from your clicks.';
-    }
-  }
-
   List<Widget> _configControls() {
+    // The legacy 0.3.0 chain is deprecated (a single 32-bit point per stage is
+    // too weak), so Setup is orbit-only: this panel shows just the shared
+    // configuration — σ (Stage-0 salt/pepper), the Argon2 profile, calibration
+    // and D. Points are placed on the boards (R / N / I); there is no chain
+    // source selector or start button any more.
     return <Widget>[
-      SegmentedButton<_SourceMode>(
-        showSelectedIcon: false,
-        segments: const <ButtonSegment<_SourceMode>>[
-          ButtonSegment<_SourceMode>(
-              value: _SourceMode.fresh, label: Text('New seed')),
-          ButtonSegment<_SourceMode>(
-              value: _SourceMode.import, label: Text('Import')),
-          ButtonSegment<_SourceMode>(
-              value: _SourceMode.recall, label: Text('Recall')),
-        ],
-        selected: <_SourceMode>{_source},
-        onSelectionChanged:
-            _busy ? null : (Set<_SourceMode> s) => _setSource(s.first),
-      ),
-      const SizedBox(height: 16),
-      // The source-specific input: the import builder (format toggle + field) or
-      // the stages slider. Each builder returns one or more widgets, laid out in
-      // a column so switching New seed / Import / Recall swaps the whole block.
-      Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: _source == _SourceMode.import
-            ? _mnemonicInput()
-            : _stagesInput(),
-      ),
-      const SizedBox(height: 16),
       ..._stage0Input(),
       const SizedBox(height: 16),
       _argon2ProfileSlider(),
@@ -3285,26 +3300,6 @@ class _SetupScreenState extends State<SetupScreen> {
       _calibrateButton(),
       const SizedBox(height: 16),
       ..._iterationsInput(),
-      const SizedBox(height: 16),
-      if (_source == _SourceMode.recall)
-        FilledButton(
-          onPressed: (_busy || !_iterationsValid) ? null : _beginRecall,
-          child: const Text('Begin recall'),
-        )
-      else
-        FilledButton(
-          onPressed: (_busy ||
-                  !_iterationsValid ||
-                  (_source == _SourceMode.import &&
-                      _mnemonic.text.trim().isEmpty))
-              ? null
-              : _start,
-          child: Text(_source == _SourceMode.import
-              ? (_importFormat == _ImportFormat.hex
-                  ? 'Encode hex'
-                  : 'Encode phrase')
-              : 'Generate'),
-        ),
       if (_setup.phase == SetupPhase.error && _setup.errorMessage != null) ...<Widget>[
         const SizedBox(height: 12),
         Text(
@@ -3321,53 +3316,6 @@ class _SetupScreenState extends State<SetupScreen> {
           style: const TextStyle(color: Colors.white70),
         ),
       ],
-    ];
-  }
-
-  /// Discrete slider for the number of fractal **point stages**, with five
-  /// positions `0..maxPointStages` (0..4). `divisions` snaps to whole stages so
-  /// there is no ambiguous in-between value. 0 is a Stage-0-text-only setup; each
-  /// higher position adds one 32-bit fractal stage (`32 × count` bits / `3 ×
-  /// count` BIP39 words). Every position is valid, so — unlike the old free-text
-  /// field — there is nothing to flag and the action button stays enabled across
-  /// the range. (N denotes the Argon2 iteration count, set separately.)
-  List<Widget> _stagesInput() {
-    final int n = _pointStages;
-    final int maxN = SetupController.maxPointStages;
-    // Label and value live in the console (focus _Field.stages); the panel keeps
-    // only the slider to save vertical space.
-    return <Widget>[
-      _track(
-        _Field.stages,
-        // Pinned to the same height as the import field so toggling the source
-        // mode never shifts the fields below.
-        SizedBox(
-          height: _kSourceRowHeight,
-          child: Row(
-            children: <Widget>[
-              _sliderLabel('Stages'),
-              Expanded(
-                child: Slider(
-                  focusNode: _stagesFocus,
-                  value: n.toDouble(),
-                  min: 0,
-                  max: maxN.toDouble(),
-                  divisions: maxN,
-                  label: '$n',
-                  onChanged: _busy
-                      ? null
-                      : (double v) {
-                          final int next = v.round();
-                          if (next == _pointStages) return;
-                          _sounds.play(UiSound.tickSoft);
-                          setState(() => _pointStages = next);
-                        },
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
     ];
   }
 
@@ -3454,9 +3402,7 @@ class _SetupScreenState extends State<SetupScreen> {
             final int? v = int.tryParse(_iterationsField.text.trim());
             if (v != null && v >= 0) _iterations = v;
             setState(() {});
-          },
-          onSubmitted: (_) => _submitConfig(),
-        ),
+          },        ),
       ),
     ];
   }
@@ -3509,138 +3455,6 @@ class _SetupScreenState extends State<SetupScreen> {
     );
   }
 
-  /// The obscured BIP39 import field. The phrase is secret, so the field is
-  /// blind (asterisks) by default with an eye toggle; it is never echoed back.
-  /// The instruction and live word-count are shown in the console on focus
-  /// ([_fieldHelp]).
-  List<Widget> _mnemonicInput() {
-    final bool hex = _importFormat == _ImportFormat.hex;
-    // No standalone toggle row: a lightweight "BIP39 · Hex" text-link sits on
-    // the field's top edge as a real (clickable) overlay — straddling the
-    // outline like a caption — with the active format emphasised. Tapping a
-    // side selects it (the I / Alt+I shortcuts do the same). The whole block is
-    // pinned to [_kSourceRowHeight] so it matches the Stages slider and the
-    // fields below never shift when toggling New seed · Import · Recall.
-    return <Widget>[
-      _track(
-        _Field.mnemonic,
-        SizedBox(
-          height: _kSourceRowHeight,
-          child: Stack(
-            clipBehavior: Clip.none,
-            children: <Widget>[
-              // The field is bottom-anchored full-width, leaving the top strip
-              // for the caption to straddle its outline; a compact reveal icon
-              // keeps the field short enough to sit inside the pinned height.
-              Positioned(
-                left: 0,
-                right: 0,
-                bottom: 0,
-                child: TextField(
-                  controller: _mnemonic,
-                  focusNode: _mnemonicFocus,
-                  obscureText: _mnemonicHidden,
-                  enabled: !_busy,
-                  maxLines: 1,
-                  autocorrect: false,
-                  enableSuggestions: false,
-                  // Hex is constrained to grouped uppercase 0-9 A-F; words are
-                  // free text.
-                  inputFormatters: hex
-                      ? <TextInputFormatter>[
-                          FilteringTextInputFormatter.allow(
-                              RegExp(r'[0-9a-fA-F ]')),
-                          TextInputFormatter.withFunction(
-                            (TextEditingValue o, TextEditingValue n) =>
-                                n.copyWith(text: n.text.toUpperCase()),
-                          ),
-                        ]
-                      : null,
-                  decoration: InputDecoration(
-                    isDense: true,
-                    contentPadding:
-                        const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                    border: const OutlineInputBorder(),
-                    hintText: hex ? 'A1B2C3D4 …' : 'word1 word2 …',
-                    suffixIcon: IconButton(
-                      tooltip: _mnemonicHidden ? 'Show' : 'Hide',
-                      iconSize: 18,
-                      padding: EdgeInsets.zero,
-                      constraints:
-                          const BoxConstraints(minWidth: 36, minHeight: 36),
-                      icon: Icon(
-                        _mnemonicHidden ? Icons.visibility : Icons.visibility_off,
-                      ),
-                      onPressed: () =>
-                          setState(() => _mnemonicHidden = !_mnemonicHidden),
-                    ),
-                  ),
-                  onChanged: (_) {
-                    _sounds.play(UiSound.tickSoft);
-                    setState(() {});
-                  },
-                  onSubmitted: (_) => _submitConfig(),
-                ),
-              ),
-              Positioned(top: 0, left: 10, child: _importFormatLabel()),
-            ],
-          ),
-        ),
-      ),
-    ];
-  }
-
-  /// The "BIP39 · Hex" text-link that straddles the import field's top edge in
-  /// place of a bulky toggle. The active format is emphasised; tapping the
-  /// other side switches (clearing the field, since the formats are not
-  /// interchangeable). Mirrors the I / Alt+I shortcuts. Painted over the field
-  /// with the panel background so it notches the outline like a caption, with
-  /// generous padding so each side is an easy tap target.
-  Widget _importFormatLabel() {
-    void select(_ImportFormat fmt) {
-      if (_busy || fmt == _importFormat) return;
-      setState(() {
-        _importFormat = fmt;
-        _mnemonic.clear();
-      });
-    }
-
-    final TextStyle base =
-        Theme.of(context).textTheme.labelMedium ?? const TextStyle();
-    final Color? on = base.color;
-    Widget side(String text, _ImportFormat fmt, String tip) {
-      final bool active = _importFormat == fmt;
-      return Tooltip(
-        message: tip,
-        child: GestureDetector(
-          behavior: HitTestBehavior.opaque,
-          onTap: () => select(fmt),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-            child: Text(
-              text,
-              style: base.copyWith(
-                fontWeight: active ? FontWeight.w700 : FontWeight.w400,
-                color: active ? on : on?.withOpacity(0.45),
-              ),
-            ),
-          ),
-        ),
-      );
-    }
-
-    return Container(
-      color: Theme.of(context).colorScheme.surface,
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: <Widget>[
-          side('BIP39', _ImportFormat.words, 'Import an existing BIP39 phrase'),
-          Text('·', style: base.copyWith(color: on?.withOpacity(0.45))),
-          side('Hex', _ImportFormat.hex, 'Import raw hex (8 digits / stage)'),
-        ],
-      ),
-    );
-  }
 
   /// The Stage-0 salt/pepper field: obscured by default with a reveal toggle,
   /// constrained to a safe ASCII subset (uppercase letters, digits, hyphen).
@@ -3683,9 +3497,7 @@ class _SetupScreenState extends State<SetupScreen> {
           onChanged: (_) {
             _sounds.play(UiSound.tickSoft);
             setState(() {});
-          },
-          onSubmitted: (_) => _submitConfig(),
-        ),
+          },        ),
       ),
       // The formatting warning (when the engine adjusts the text) is conveyed on
       // the console, which expands and pops to the foreground — see
@@ -5048,7 +4860,7 @@ class _SetupScreenState extends State<SetupScreen> {
       case _Field.exportLabel:
         if (_isBoardSlot) {
           return 'Key (master-secret export): this stage’s orbit key '
-              'Kᵢ = H(oᵢ ‖ Shᵢ), fixed once its primary points are placed. '
+              'Kᵢ = H(oᵢ ‖ Shᵢ), fixed once rᵢ fractals are placed. '
               'Paste into another wallet or use as a downstream pepper. This '
               'optional salt versions the key (e.g. SIGNING-1, '
               'uppercase/digits/hyphen). Press K to copy — blind, never shown.';
@@ -5084,76 +4896,6 @@ class _SetupScreenState extends State<SetupScreen> {
     if (p == null) return;
     setState(() => _prompt = null);
     if (!p.completer.isCompleted) p.completer.complete(ok);
-  }
-
-  Future<void> _start() async {
-    _sounds.play(UiSound.click);
-    _focusViewer(); // leave the input field; hotkeys act on the viewer now
-    _brightness.reset();
-    setState(() => _selectMode = false);
-    final String text = _stage0.text;
-    if (_source == _SourceMode.import) {
-      if (_importFormat == _ImportFormat.hex) {
-        await _setup.beginFromHex(
-          _mnemonic.text,
-          text: text,
-          argon2Iterations: _iterations,
-          profile: _profile,
-        );
-      } else {
-        await _setup.beginFromMnemonic(
-          _mnemonic.text,
-          text: text,
-          argon2Iterations: _iterations,
-          profile: _profile,
-        );
-      }
-      // Setup is write-only on memory: once the phrase is encoded onto the
-      // fractals, wipe the plaintext from the field (keep it on error so the
-      // user can fix it).
-      if (_setup.phase != SetupPhase.error) _mnemonic.clear();
-    } else {
-      final int n = _pointStages;
-      await _setup.begin(
-        pointStages: n,
-        text: text,
-        argon2Iterations: _iterations,
-        profile: _profile,
-      );
-    }
-    // The salt/pepper now lives in the chain; clear the input field on success
-    // (the controller keeps its own copy for the in-session recall).
-    if (_setup.phase != SetupPhase.error) _stage0.clear();
-    if (mounted) {
-      _sounds.play(
-        _setup.phase == SetupPhase.error ? UiSound.deny : UiSound.confirm,
-      );
-    }
-  }
-
-  /// Start a cold-start recall from the entered salt: derive Stage 1, then drop
-  /// straight into select mode so the user can click their first point.
-  Future<void> _beginRecall() async {
-    final int n = _pointStages;
-    _sounds.play(UiSound.click);
-    _focusViewer(); // leave the input field; clicks/hotkeys act on the viewer
-    _brightness.reset();
-    await _setup.beginRecall(
-      pointStages: n,
-      text: _stage0.text,
-      argon2Iterations: _iterations,
-      profile: _profile,
-    );
-    if (!mounted) return;
-    if (_setup.phase == SetupPhase.error) {
-      _sounds.play(UiSound.deny);
-      return;
-    }
-    // The salt now lives in the controller for the in-session walk; clear the
-    // field so it is not left on screen.
-    _stage0.clear();
-    _enterRecallSelect();
-    _sounds.play(UiSound.confirm);
   }
 
   /// Reset behind an inline console confirmation, so the Z hotkey (or a stray
@@ -5206,10 +4948,6 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 }
 
-/// Where the Setup session's root comes from: a freshly generated seed, an
-/// imported BIP39 phrase, or a cold-start recall of an existing setup (derive
-/// from the salt and reconstruct the seed from the user's clicks).
-enum _SourceMode { fresh, import, recall }
 
 /// A stage-0 board's canonical-island decoration: the island cells plus its
 /// bounding box (fractal coords), used to draw the square frame and to size the
@@ -5262,16 +5000,15 @@ class _HueWheelControl extends StatelessWidget {
     required this.value,
     required this.onChanged,
     required this.focusNode,
-    this.diameter = 84,
   });
 
   final HueOffset value;
   final ValueChanged<HueOffset> onChanged;
   final FocusNode focusNode;
-  final double diameter;
+  final double diameter = 84;
 
   void _step(int dir) {
-    final List<HueOffset> order = HueOffset.values;
+    const List<HueOffset> order = HueOffset.values;
     final int i = (value.index + dir) % order.length;
     onChanged(order[i < 0 ? i + order.length : i]);
   }
@@ -5491,8 +5228,8 @@ class _StageTab extends StatelessWidget {
       // Ghost: a faint hollow slot — an open quest the chain can grow into.
       return _box(
         bg: Colors.transparent,
-        border: scheme.outlineVariant.withOpacity(0.25),
-        fg: scheme.onSurface.withOpacity(0.15),
+        border: scheme.outlineVariant.withValues(alpha: 0.25),
+        fg: scheme.onSurface.withValues(alpha: 0.15),
         bold: false,
       );
     }
@@ -5500,7 +5237,7 @@ class _StageTab extends StatelessWidget {
         ? scheme.onPrimary
         : available
             ? scheme.onSurface
-            : scheme.onSurface.withOpacity(0.35); // pending (requested) grey
+            : scheme.onSurface.withValues(alpha: 0.35); // pending (requested) grey
     return _box(
       bg: selected ? scheme.primary : Colors.transparent,
       border: selected ? scheme.primary : scheme.outlineVariant,

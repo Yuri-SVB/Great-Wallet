@@ -83,7 +83,7 @@ class CoreLeafAreaSource implements LeafAreaSource {
     // cap, regardless of canvas size (the grid is pixels / step). The decode
     // budget is the hard cost cap; this just keeps the loop itself bounded.
     final int maxAxis = w > h ? w : h;
-    final int axisCap = EncodingConstants.leafEnumMaxAxisSamples;
+    const int axisCap = EncodingConstants.leafEnumMaxAxisSamples;
     final int minScan = (maxAxis + axisCap - 1) ~/ axisCap; // ceil(maxAxis/cap)
     final int scanStep =
         request.scanStep > minScan ? request.scanStep : minScan;
