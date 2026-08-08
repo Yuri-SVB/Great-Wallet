@@ -270,9 +270,11 @@ class _SetupScreenState extends State<SetupScreen> {
 
   /// Required fractal count `r_i` per stage (index `0..`[SetupController.maxPointStages]).
   /// `r_0 = 2` by design (fixed); deep stages default to the 96-bit standard
-  /// `r_i = 3` and offer the `{2,3}` slider. Slots `1..r_i` are required boards;
-  /// slots beyond are the forgetting-forgiveness Shamir shares (P4). The actual
-  /// per-slot `θ_i_j` board render is wired with the orbit protocol (P5).
+  /// `r_i = 3` and offer the `{2,3}` slider. `r_i` is the **minimum** number of
+  /// fractals the holder places; every slot is operationally equal, so any `r_i`
+  /// of the `s_i` slots may be placed and the rest derive (slots beyond `r_i`
+  /// are only *faded* as a hint, not disabled). The actual per-slot `θ_i_j`
+  /// board render is wired with the orbit protocol (P5).
   final List<int> _requiredFractals = List<int>.generate(
       SetupController.maxPointStages + 1, (int i) => i == 0 ? 2 : 3);
 
@@ -301,10 +303,12 @@ class _SetupScreenState extends State<SetupScreen> {
   static const int _maxStage = SetupController.maxPointStages;
 
   // Per orbit stage i (0..[_maxStage]) and fractal slot (1..[_maxSlot]): the
-  // placed 32-bit chunk and its encoded board point. Slots 1..r_i are
-  // user-placed (primary); slots r_i+1.. are DERIVED — Sh_i evaluated at the
-  // resistance abscissae (by the engine) — and locked. Slot 0 (salt) is unused.
-  // Session-only; wiped when σ changes. Indexed `[stage][slot]`.
+  // placed 32-bit chunk and its encoded board point. Every slot is equal: the
+  // holder places any r_i of them (each slot's abscissa is its index s), which
+  // fixes Sh_i; the remaining slots are DERIVED — Sh_i evaluated at their slot
+  // index (by the engine) — and locked. `_boardDerived` distinguishes the two.
+  // Slot 0 (salt) is unused. Session-only; wiped when σ changes.
+  // Indexed `[stage][slot]`.
   final List<List<List<int>?>> _boardChunks = List<List<List<int>?>>.generate(
       _maxStage + 1, (_) => List<List<int>?>.filled(_maxSlot + 1, null));
   final List<List<({int reRaw, int imRaw})?>> _boardPoints =
@@ -327,14 +331,14 @@ class _SetupScreenState extends State<SetupScreen> {
   final List<Uint8List?> _orbitO = List<Uint8List?>.filled(_maxStage + 1, null);
 
   /// Per-stage master secret `K_i = H(o_i ‖ Sh_i)`, recomputed by
-  /// [_recomputeExtraShares] whenever stage `i`'s `r_i` primaries are complete,
-  /// and null otherwise. Coercion-relevant — wiped and nulled on any placement
+  /// [_recomputeExtraShares] whenever stage `i` has `r_i` fractals placed (in any
+  /// slots), and null otherwise. Coercion-relevant — wiped and nulled on any placement
   /// clear (and hence on dispose, via [_clearOrbitPlacements]). The board export
   /// (`K` / `Alt+K`) copies the active stage's `K_i` (optionally domain-separated
   /// by the export-salt label) through [_copyOrbitMaster].
   final List<Uint8List?> _orbitK = List<Uint8List?>.filled(_maxStage + 1, null);
 
-  /// The active stage's master secret `K_i`, or null until its primaries are in.
+  /// The active stage's master secret `K_i`, or null until `r_i` fractals are placed.
   Uint8List? get _activeK => _orbitK[_activeStage];
 
   /// The stage-0 slot whose point is being imported inline, or null. Reuses the
@@ -378,12 +382,13 @@ class _SetupScreenState extends State<SetupScreen> {
   bool get _isBoardSlot =>
       _slotIndex >= 1 && (!_hasSession || _activeStage == 0);
 
-  /// True when the current slot is a **primary** board that still takes a point
-  /// (slot `1..r_i`, not a derived share) — i.e. placement is allowed.
+  /// True when the current board slot still takes a point — i.e. it is not a
+  /// derived (auto-computed) share. All fractals at a stage are operationally
+  /// equal: any slot may take a point until `r_i` are placed, after which the
+  /// rest derive and lock. (The tab row fades slots beyond `r_i` as a "these are
+  /// extras" hint, not a lock — the holder is free to use them.)
   bool get _placeableBoardSlot =>
-      _isBoardSlot &&
-      _slotIndex <= _requiredFractals[_activeStage] &&
-      !_boardDerived[_activeStage][_slotIndex];
+      _isBoardSlot && !_boardDerived[_activeStage][_slotIndex];
 
   /// A confirmation awaiting an inline answer in the console (replaces modal
   /// dialogs). Resolved by the console's action buttons.
@@ -862,17 +867,20 @@ class _SetupScreenState extends State<SetupScreen> {
                       index: i,
                       inSetup: true,
                       selected: i == _slotIndex,
-                      // Salt (#0) + required fractals (1..r_i) are lit; slots
-                      // beyond r_i are the optional forgetting-forgiveness
-                      // shares, shown faded. Always navigable.
+                      // Every fractal at a stage is operationally equal — any
+                      // slot may take a point until r_i are placed, after which
+                      // the rest derive. The fade on slots beyond r_i is a hint
+                      // ("r_i is the minimum; these are extras"), not a lock:
+                      // salt (#0) + the first r_i are lit, the rest faded, all
+                      // navigable and all placeable.
                       available: i == 0 || i <= r,
                       deriving: false,
                       progress: 0,
                       tooltip: i == 0
                           ? 'Slot 0 — salt (σ / retirement)'
                           : i <= r
-                              ? 'Slot $i — required fractal (rᵢ=$r)'
-                              : 'Slot $i — extra share (forgetting-forgiveness)',
+                              ? 'Slot $i — fractal (rᵢ=$r is the minimum)'
+                              : 'Slot $i — fractal (beyond rᵢ=$r — equally usable)',
                       onTap: () => _selectSlot(i),
                     ),
                   ),
@@ -884,12 +892,13 @@ class _SetupScreenState extends State<SetupScreen> {
     );
   }
 
-  /// Compact `r_i` control for the active stage: the number of **required**
-  /// fractals, `2` or `3`. Grayed and fixed at `2` for stage 0 (σ-public entry);
-  /// a `{2,3}` slider for deep stages (2 = substandard 64-bit, 3 = standard
-  /// 96-bit). Slots beyond `r_i` become forgetting-forgiveness shares (P4). The
-  /// exact per-stage optionality will ultimately come from the engine's tier
-  /// rules (open item); for now only stage 0 is fixed.
+  /// Compact `r_i` control for the active stage: the **minimum** number of
+  /// fractals to place, `2` or `3`. Grayed and fixed at `2` for stage 0
+  /// (σ-public entry); a `{2,3}` slider for deep stages (2 = substandard 64-bit,
+  /// 3 = standard 96-bit). The holder places any `r_i` of the `s_i` fractals;
+  /// the rest derive as forgetting-forgiveness shares. The exact per-stage
+  /// optionality will ultimately come from the engine's tier rules (open item);
+  /// for now only stage 0 is fixed.
   Widget _riControl() {
     final ThemeData theme = Theme.of(context);
     final int stage = _activeStage;
@@ -914,7 +923,18 @@ class _SetupScreenState extends State<SetupScreen> {
                     : (double v) {
                         final int nv = v.round();
                         if (nv != _requiredFractals[stage]) {
-                          setState(() => _requiredFractals[stage] = nv);
+                          setState(() {
+                            _requiredFractals[stage] = nv;
+                            // r_i is the live threshold over equal slots, so a
+                            // change re-settles the stage: raising it un-settles
+                            // (K_i clears until another point is placed), lowering
+                            // it re-derives the now-extra slots. Either way Sh_i
+                            // (hence K_i) changes, which re-roots deeper stages.
+                            _recomputeExtraShares(stage);
+                            _invalidateDeeperThan(stage);
+                            _boardDecoCache.clear();
+                            _boardCanonicalView = false;
+                          });
                         }
                       },
               ),
@@ -1336,8 +1356,9 @@ class _SetupScreenState extends State<SetupScreen> {
         _expandManual();
         return KeyEventResult.handled;
       }
-      // At a primary orbit board slot, R arms a manual point placement (the same
-      // click-to-place mechanism as a chain point edit).
+      // At a placeable orbit board slot (any non-derived fractal), R arms a
+      // manual point placement (the same click-to-place mechanism as a chain
+      // point edit).
       if (_placeableBoardSlot) {
         _armBoardManual();
       } else if (_setup.canEditCurrentPoint) {
@@ -1580,19 +1601,26 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   /// Serialize stage [stage]'s Shamir polynomial `Sh_i` by re-interpolating it
-  /// from the stage's `r_i` primary points, or null if they are not all placed.
-  /// `Sh_i` is coercion-relevant, so the interim coefficients are wiped before
+  /// from the `r_i` points the holder placed — in whichever slots they chose,
+  /// each at abscissa = slot index — or null if fewer than `r_i` are placed.
+  /// This mirrors [_recomputeExtraShares]'s `chosen` set exactly, so `Sh_i` (and
+  /// thus `K_i` and the advance) is identical however it is recomputed. `Sh_i`
+  /// is coercion-relevant, so the interim coefficients are wiped before
   /// returning; the caller owns (and wipes) the returned bytes.
   Uint8List? _stageShBytes(int stage) {
     final int r = _requiredFractals[stage];
-    final List<int> xs = <int>[];
-    final List<int> ys = <int>[];
-    for (int s = 1; s <= r; s++) {
-      final List<int>? c = _boardChunks[stage][s];
-      if (c == null || _boardDerived[stage][s]) return null;
-      xs.add(s);
-      ys.add(OrbitProtocol.bitsToU32(c));
+    final List<int> placed = <int>[];
+    for (int s = 1; s <= _maxSlot; s++) {
+      if (_boardChunks[stage][s] != null && !_boardDerived[stage][s]) {
+        placed.add(s);
+      }
     }
+    if (placed.length < r) return null; // not enough points placed yet
+    final List<int> chosen = placed.length > r ? placed.sublist(0, r) : placed;
+    final List<int> xs = <int>[for (final int s in chosen) s];
+    final List<int> ys = <int>[
+      for (final int s in chosen) OrbitProtocol.bitsToU32(_boardChunks[stage][s]!),
+    ];
     final List<int> sh = widget.core.shamirInterp(xs, ys);
     final Uint8List shBytes = GreatWallCoreBindings.shToBytes(sh);
     for (int i = 0; i < sh.length; i++) {
@@ -1756,8 +1784,8 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   /// Stage-0 fractal slot (`#j≥1`): the real orbit board `θ_0_(j-1)` derived
-  /// from σ → o₀. A primary slot (`1..r_0`) carries a placed point shown as a
-  /// white cross; slots beyond `r_0` are the derived (locked) shares. Point
+  /// from σ → o₀. Any slot may carry a placed point (shown as a white cross)
+  /// until `r_0` are placed; the rest then derive and lock. Point
   /// entry uses the *existing* mechanisms — `R` arms a manual click, exactly
   /// like editing a chain point (so the canvas takes a click only in select /
   /// edit mode). When σ is unset/invalid a "set σ first" panel is shown.
@@ -2081,7 +2109,7 @@ class _SetupScreenState extends State<SetupScreen> {
     _toast('Click the point for slot $_slotIndex (Esc to cancel).');
   }
 
-  /// Decode a tapped leaf as slot [slot]'s primary point (under the board's
+  /// Decode a tapped leaf as slot [slot]'s point (under the board's
   /// reservoirs) and record it. Returns true when a point was placed.
   bool _placePrimaryAt(int slot, FractalSelection sel) {
     final ({int o, int p, int q})? prm = _boardPrm(slot);
@@ -2183,9 +2211,10 @@ class _SetupScreenState extends State<SetupScreen> {
     );
   }
 
-  /// Record slot [slot]'s primary chunk + point (copying [bits]) on the active
-  /// stage and re-derive that stage's extra shares from the (possibly now
-  /// complete) primaries.
+  /// Record slot [slot]'s placed chunk + point (copying [bits]) on the active
+  /// stage and re-derive that stage's shares — the placed count may now have
+  /// reached `r_i`, fixing `Sh_i`. Any slot may be the one placed here; all
+  /// fractals at a stage are operationally equal.
   void _setPrimary(int slot, List<int> bits, ({int reRaw, int imRaw}) point) {
     final int stage = _activeStage;
     setState(() {
@@ -2235,14 +2264,15 @@ class _SetupScreenState extends State<SetupScreen> {
     }
   }
 
-  /// Derive [stage]'s forgetting-resistance shares (slots `r_i+1..`[_maxSlot])
-  /// from its `r_i` primary points, and (re)compute `K_i = H(o_i ‖ Sh_i)` into
-  /// [_orbitK]. `Sh_i = shamirInterp(primaries)`; the engine evaluates it at the
-  /// reserved resistance abscissae ([GreatWallCore.generateResistanceShares]);
-  /// each value is encoded onto its board `θ_i_(s-1)` for display. Missing a
-  /// primary (or `o_i`) simply clears them and `K_i`. Any `r_i` of the boards
-  /// reconstruct the identical `Sh_i` (orbit_protocol_test). Must run inside a
-  /// [setState].
+  /// Derive [stage]'s non-placed fractal shares from the `r_i` points the holder
+  /// placed (in whichever slots), and (re)compute `K_i = H(o_i ‖ Sh_i)` into
+  /// [_orbitK]. `Sh_i = shamirInterp(placed, abscissa = slot index)`; the engine
+  /// then evaluates it at each non-placed slot's index
+  /// ([GreatWallCore.shamirEval]) and that value is encoded onto its board
+  /// `θ_i_(s-1)` for display. Fewer than `r_i` placed (or a missing `o_i`) simply
+  /// clears the derived slots and `K_i`. All fractals are equal, so any `r_i` of
+  /// the `s_i` boards reconstruct the identical `Sh_i` (orbit_protocol_test).
+  /// Must run inside a [setState].
   void _recomputeExtraShares(int stage) {
     final int r = _requiredFractals[stage];
     // Any recompute supersedes an in-flight background share-marker encode for
@@ -2256,7 +2286,21 @@ class _SetupScreenState extends State<SetupScreen> {
       Entropy.wipe(oldK);
       _orbitK[stage] = null;
     }
-    for (int s = r + 1; s <= _maxSlot; s++) {
+    // All fractals at a stage are operationally equal: each slot's abscissa is
+    // its index, so ANY r_i user-placed points fix the identical degree-(r_i-1)
+    // polynomial Sh_i and the remaining slots derive on it (Shamir subset-
+    // invariance). The placed set is whichever slots the holder chose — not
+    // necessarily 1..r_i — which is what lets recovery use a *different* r_i of
+    // the s_i points (forgetting-resistance).
+    final List<int> placed = <int>[];
+    for (int s = 1; s <= _maxSlot; s++) {
+      if (_boardChunks[stage][s] != null && !_boardDerived[stage][s]) {
+        placed.add(s);
+      }
+    }
+    // Drop any previously-derived slots; they are recomputed below, or left
+    // clear while the placed count is still under threshold.
+    for (int s = 1; s <= _maxSlot; s++) {
       if (_boardDerived[stage][s]) {
         final List<int>? c = _boardChunks[stage][s];
         if (c != null) Entropy.wipe(c);
@@ -2265,40 +2309,43 @@ class _SetupScreenState extends State<SetupScreen> {
         _boardDerived[stage][s] = false;
       }
     }
-    final List<int> xs = <int>[];
-    final List<int> ys = <int>[];
-    for (int s = 1; s <= r; s++) {
-      final List<int>? c = _boardChunks[stage][s];
-      if (c == null || _boardDerived[stage][s]) return; // primaries incomplete
-      xs.add(s); // primary abscissa = slot number
-      ys.add(OrbitProtocol.bitsToU32(c));
-    }
+    if (placed.length < r) return; // under threshold — Sh_i not yet determined
+    // Exactly r_i points fix the polynomial. Placement never lets more than r_i
+    // accumulate, but lowering r_i (the slider) can leave extra placed slots; the
+    // lowest-indexed r_i then win and the surplus re-derive below.
+    final List<int> chosen =
+        placed.length > r ? placed.sublist(0, r) : placed;
     final Uint8List? oi = _stageOrbit(stage);
     if (oi == null) return;
     final OrbitProtocol orbit = OrbitProtocol(widget.core);
+    // Interpolate Sh_i over the chosen slots at abscissa = slot index.
+    final List<int> xs = <int>[for (final int s in chosen) s];
+    final List<int> ys = <int>[
+      for (final int s in chosen)
+        OrbitProtocol.bitsToU32(_boardChunks[stage][s]!),
+    ];
     final List<int> sh = widget.core.shamirInterp(xs, ys);
     // K_i = H(o_i ‖ Sh_i): the per-stage master secret, exported (optionally
     // domain-separated) by K / Alt+K. Computed here while Sh_i is in hand.
     final Uint8List shBytes = GreatWallCoreBindings.shToBytes(sh);
     _orbitK[stage] = widget.core.masterSecret(oi, shBytes);
     Entropy.wipe(shBytes);
-    final int extras = _maxSlot - r;
-    final List<int> shares = widget.core.generateResistanceShares(sh, extras);
-    // Store each share's BITS synchronously (a cheap GF eval — the actual
-    // coercion-relevant material) and mark the slot derived, but DEFER encoding
-    // its fractal display point. Encoding is a CPU-heavy island-discovery search
-    // that, on the degenerate share values a corner-case stage produces (an
-    // all-ones stage → constant polynomial → all-ones shares), can take tens of
-    // seconds per point at a sparse-island reservoir; running that on the UI
-    // isolate froze the app when the final primary was placed. The point is
-    // display-only (K_i above uses the primaries alone), so a null point simply
-    // renders no marker until the off-isolate encode below lands.
+    // Derive every NON-chosen slot at abscissa = slot index (display-only; K_i
+    // above uses the chosen points alone). Encoding the fractal point is a
+    // CPU-heavy island-discovery search that, on the degenerate share values a
+    // corner-case stage produces (an all-ones stage → constant polynomial →
+    // all-ones shares), can take tens of seconds per point at a sparse-island
+    // reservoir — running it on the UI isolate froze the app — so it is deferred
+    // off-isolate ([_encodeShareMarkers]); a null point renders no marker until
+    // it lands.
+    final Set<int> chosenSet = chosen.toSet();
     final List<List<int>> pendingBits = <List<int>>[];
     final List<List<int>> pendingRes = <List<int>>[];
     final List<int> pendingSlots = <int>[];
-    for (int i = 0; i < extras; i++) {
-      final int s = r + 1 + i;
-      final List<int> bits = OrbitProtocol.u32ToBits(shares[i]);
+    for (int s = 1; s <= _maxSlot; s++) {
+      if (chosenSet.contains(s)) continue;
+      final List<int> bits =
+          OrbitProtocol.u32ToBits(widget.core.shamirEval(sh, s));
       final ({int o, int p, int q}) prm = orbit.orbitParams(oi, s - 1);
       _boardChunks[stage][s] = bits; // owns it
       _boardPoints[stage][s] = null; // marker pending until the encode lands
@@ -2389,7 +2436,6 @@ class _SetupScreenState extends State<SetupScreen> {
     final int stage = _activeStage;
     final int r = _requiredFractals[stage];
     final bool derived = _boardDerived[stage][slot];
-    final bool primary = slot <= r;
     final bool placed = _boardPoints[stage][slot] != null;
     final bool hasRoot = stage == 0
         ? _parseHex(_sigmaCtrl.text.trim()) != null
@@ -2398,14 +2444,10 @@ class _SetupScreenState extends State<SetupScreen> {
     final Widget body;
     if (derived) {
       body = Text(
-        'Derived share (locked): the stage’s Shamir polynomial extrapolated '
-        'onto this board’s forgetting-resistance point.',
-        style: theme.textTheme.bodySmall,
-      );
-    } else if (!primary) {
-      body = Text(
-        'Extra share — fills automatically once the $r required points '
-        '(slots 1–$r) are placed.',
+        'Derived share (locked): the stage’s Shamir polynomial — fixed by the '
+        '$r points you placed — extrapolated onto this fractal. It is a real, '
+        'usable point: recovery accepts any $r of the stage’s fractals, not '
+        'only the ones you placed here.',
         style: theme.textTheme.bodySmall,
       );
     } else if (!hasRoot) {
@@ -2419,12 +2461,16 @@ class _SetupScreenState extends State<SetupScreen> {
       body = Text(
         placed
             ? 'Point placed. R new click · N regenerate · I import (words/hex).'
-            : 'R to place (click a leaf) · N random · I import (words/hex).',
+            : 'R to place (click a leaf) · N random · I import (words/hex). '
+                'rᵢ=$r is the minimum — place any $r fractals; the rest derive.',
         style: theme.textTheme.bodySmall,
       );
     }
     return <Widget>[
-      Text('Slot $slot — ${primary ? 'required point' : 'extra share'}',
+      Text(
+          derived
+              ? 'Slot $slot — derived share (locked)'
+              : 'Slot $slot — fractal${slot > r ? ' (beyond rᵢ=$r)' : ''}',
           style: theme.textTheme.titleMedium),
       const SizedBox(height: 4),
       body,
@@ -2784,6 +2830,8 @@ class _SetupScreenState extends State<SetupScreen> {
     'M  console   9  stage bar   Z  reset (asks first)',
     'Alt+0–4  go to that stage (recenters); press again to zoom to its point',
     '0–6  select the secondary slot (0 = salt · 1–6 = fractals)',
+    'Fractals are equal: rᵢ is the minimum — place any rᵢ, the rest derive',
+    'Simplest: fill fractals in order & remember which ones you learn',
     'N / I / R  on a point: N new random · I import · R manual click',
     'I import = BIP39 words · Alt+I import = hex (config & point edit alike)',
     'Click/press a ghost slot past the last stage to grow the setup (N/I/R)',
@@ -3080,8 +3128,8 @@ class _SetupScreenState extends State<SetupScreen> {
           // bespoke buttons here.
           if (_isBoardSlot) ...<Widget>[
             ..._boardStatus(),
-            // Master-secret (K_i) export — offered once the active stage's r_i
-            // primaries are complete (K_i derived). Reuses the export-salt field
+            // Master-secret (K_i) export — offered once the active stage has r_i
+            // fractals placed (K_i derived). Reuses the export-salt field
             // + Copy button.
             if (_activeK != null) ...<Widget>[
               const Divider(height: 32),
@@ -4812,7 +4860,7 @@ class _SetupScreenState extends State<SetupScreen> {
       case _Field.exportLabel:
         if (_isBoardSlot) {
           return 'Key (master-secret export): this stage’s orbit key '
-              'Kᵢ = H(oᵢ ‖ Shᵢ), fixed once its primary points are placed. '
+              'Kᵢ = H(oᵢ ‖ Shᵢ), fixed once rᵢ fractals are placed. '
               'Paste into another wallet or use as a downstream pepper. This '
               'optional salt versions the key (e.g. SIGNING-1, '
               'uppercase/digits/hyphen). Press K to copy — blind, never shown.';
