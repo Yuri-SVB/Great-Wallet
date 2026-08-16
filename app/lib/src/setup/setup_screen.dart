@@ -22,8 +22,10 @@ import '../core/stage_params.dart';
 import '../ffi/core_bindings.dart';
 import '../ffi/fixed.dart';
 import 'desktop_qr_scanner.dart';
+import 'orbit_vault.dart';
 import 'setup_controller.dart';
 import 'setup_crypto.dart';
+import 'setup_vault.dart';
 
 /// Setup mode screen: encode a fresh seed onto the chained fractals (one
 /// 32-bit point per stage) and let the user memorise the points.
@@ -3245,12 +3247,10 @@ class _SetupScreenState extends State<SetupScreen> {
           ],
 
           // Provisional-key save / load: an encrypted on-disk copy of the setup
-          // for the consolidation window. Save needs a settled setup, or a
-          // halted one (saved as resumable); Load is offered on the config
-          // screen too (to restore one).
-          if (_setup.phase == SetupPhase.idle ||
-              _setup.canExportVault ||
-              _setup.canExportResumable) ...<Widget>[
+          // for the consolidation window. Save needs a settled setup — an orbit
+          // one, or a legacy chain one (halted chains save as resumable); Load
+          // is offered on the config screen too (to restore one).
+          if (_vaultPanelShown) ...<Widget>[
             const Divider(height: 32),
             _vaultControls(),
           ],
@@ -3622,10 +3622,243 @@ class _SetupScreenState extends State<SetupScreen> {
     _setup.resumeDerivation();
   }
 
+  // --- Orbit provisional key: capture / write / restore ----------------------
+  // The orbit peer of SetupController's chain vault. It lives on the screen
+  // because the orbit state does: σ, D, P, r_i, o_i and the placed points are
+  // all screen-owned fields (none of them go through the controller), so an
+  // orbit save/load that routed through SetupController would have to mirror
+  // them first. See next-steps/orbit-save-load-and-cpnf-rederivation-plan.md §3.
+
+  /// The single failure message every vault open reports. A wrong key, a corrupt
+  /// file, a chain/orbit mix-up and a doctored payload MUST be indistinguishable
+  /// — otherwise someone holding the file learns from probing it whether a
+  /// candidate key was right. (GCM authentication already makes the first two
+  /// identical; this keeps the parse failures from breaking that.)
+  static const String _vaultOpaqueError =
+      'Could not open — wrong key, or not a setup file.';
+
+  /// The deepest orbit stage the forward advance has actually reached: stage 0
+  /// (always rooted by σ) until an advance produces `o_1`, then the highest
+  /// contiguous `o_i`. This is the last stage a save has to carry.
+  int get _orbitDeepestStage => _orbitReachableCeiling;
+
+  /// Whether the screen-owned orbit setup is **settled**, and so can be written
+  /// as an [OrbitVault]: σ parses, and the deepest reached stage has its `r_i`
+  /// fractals placed (`K_i` derived — which, since re-placing a point
+  /// cascade-invalidates the deeper `o_i`, implies every shallower stage is
+  /// settled too). Deliberately cheap: it parses σ but never runs `orbitRoot`,
+  /// so it is safe in `build` and in the hotkey gate.
+  ///
+  /// Settled-only by design. A halted, mid-advance orbit needs a checkpointable
+  /// engine advance and is deferred (Role 1 of
+  /// `next-steps/orbit-persistence-and-provisional-key-roles.md`).
+  bool get _orbitSettled {
+    final Uint8List? sigma = _parseHex(_sigmaCtrl.text.trim());
+    if (sigma == null || sigma.isEmpty) return false;
+    return _orbitK[_orbitDeepestStage] != null;
+  }
+
+  /// Capture the settled orbit setup as an [OrbitVault] — pure, synchronous and
+  /// read straight off the screen-owned state, with no [SetupController] call.
+  ///
+  /// Stage 0's `o₀` is omitted (it re-derives from σ) and the derived slots are
+  /// omitted (they re-derive from the placed ones), so the file carries only
+  /// what a restore cannot recompute cheaply: the `o_i` that would otherwise
+  /// cost a memory-hard advance each, and the points only the holder knows.
+  ///
+  /// The result **is the secret** — the caller MUST [OrbitVault.wipe] it.
+  OrbitVault _exportOrbitVault() {
+    final int deepest = _orbitDeepestStage;
+    return OrbitVault(
+      sigma: _sigmaCtrl.text.trim().replaceAll(RegExp(r'\s'), ''),
+      iterations: _iterations,
+      profile: _profile,
+      stages: <OrbitVaultStage>[
+        for (int i = 0; i <= deepest; i++)
+          OrbitVaultStage(
+            required: _requiredFractals[i],
+            orbit: i == 0 ? null : List<int>.of(_orbitO[i]!),
+            points: <OrbitVaultPoint>[
+              for (int s = 1; s <= _maxSlot; s++)
+                if (_boardPoints[i][s] != null && !_boardDerived[i][s])
+                  OrbitVaultPoint(
+                    slot: s,
+                    reRaw: _boardPoints[i][s]!.reRaw,
+                    imRaw: _boardPoints[i][s]!.imRaw,
+                  ),
+            ],
+          ),
+      ],
+    );
+  }
+
+  /// Write the settled orbit setup to [path], encrypted under the provisional
+  /// key — the orbit peer of `SetupController.saveVaultToFile`, and the reason
+  /// the screen does its own file I/O: it is the screen that owns the state.
+  ///
+  /// The write is **atomic** (temp file + rename). Phase 2 re-writes this same
+  /// file on every graded card, and a half-written vault is an unopenable one.
+  /// Uses [providedKey] (the user's own entropy) if given, else a fresh
+  /// [genLenBytes]-byte key. The captured vault is wiped on every path.
+  Future<({String? error, Uint8List? key})> _saveOrbitVaultToFile(
+    String path, {
+    Uint8List? providedKey,
+    int genLenBytes = SetupCrypto.keyLenBytes,
+  }) async {
+    if (!_orbitSettled) {
+      return (error: 'This setup cannot be saved yet.', key: null);
+    }
+    final OrbitVault vault = _exportOrbitVault();
+    final File tmp = File('$path.tmp');
+    try {
+      final SealedVault sealed = await SetupCrypto.sealPayload(
+        vault.toJson(),
+        providedKey: providedKey,
+        genLenBytes: genLenBytes,
+      );
+      await tmp.writeAsBytes(sealed.fileBytes, flush: true);
+      await tmp.rename(path);
+      return (error: null, key: sealed.key);
+    } catch (e) {
+      // Best effort: never leave the partial temp behind. It is ciphertext, but
+      // a stale `.tmp` beside the vault is confusing at best.
+      try {
+        if (tmp.existsSync()) tmp.deleteSync();
+      } catch (_) {
+        // Nothing more to do — the save has already failed.
+      }
+      return (error: 'Could not save the file (${e.runtimeType}).', key: null);
+    } finally {
+      vault.wipe();
+    }
+  }
+
+  /// Restore a settled orbit setup from [vault] **into orbit mode** — never into
+  /// the legacy chain `memorise` session, so no [SetupController] state is
+  /// touched and the deprecated recall walk stays unreachable from a load.
+  ///
+  /// The mirror of [_exportOrbitVault]: each `o_i` comes straight out of the
+  /// file (stage 0's from σ), each stored point is cheap-decoded back to its
+  /// 32-bit chunk under `(o,p,q) = orbitParams(o_i, slot-1)`, and
+  /// [_recomputeExtraShares] then re-interpolates `Sh_i`, recomputes
+  /// `K_i = H(o_i ‖ Sh_i)` and re-derives the unplaced slots — exactly what a
+  /// live placement does, so a restored setup and a freshly built one are the
+  /// same state. **No Argon2 pass runs.**
+  ///
+  /// Integrity is the envelope's job, not re-derivation's: the AEAD tag
+  /// authenticates the whole payload, so a stored `o_i` cannot have been
+  /// tampered with independently of the points. There is deliberately **no**
+  /// cheap `o_i == H*(K_{i-1})` check — that check *is* the memory-hard advance
+  /// this file exists to skip. (Phase 2's re-derivation walk performs it as a
+  /// side effect; that is where it becomes an error locator.)
+  ///
+  /// Returns null on success, else a message. Nothing is applied unless every
+  /// stage validated and every stored point decoded, so a failed restore leaves
+  /// the current setup untouched. The caller owns and wipes [vault].
+  Future<String?> _restoreOrbitVault(OrbitVault vault) async {
+    final Uint8List? sigma = _parseHex(vault.sigma);
+    if (sigma == null || sigma.isEmpty) return _vaultOpaqueError;
+    final int deepest = vault.stages.length - 1;
+    if (deepest < 0 || deepest > _maxStage) return _vaultOpaqueError;
+
+    // Validate the whole file and resolve every stage's o_i and board
+    // reservoirs first — the decode below is the expensive part, and a partial
+    // restore of a bad file must never reach the screen state.
+    final List<Uint8List> orbits = <Uint8List>[];
+    final List<List<int>> pointsRaw = <List<int>>[];
+    final List<List<int>> reservoirs = <List<int>>[];
+    final List<({int stage, int slot})> targets = <({int stage, int slot})>[];
+    final OrbitProtocol protocol = OrbitProtocol(widget.core);
+    for (int i = 0; i <= deepest; i++) {
+      final OrbitVaultStage stage = vault.stages[i];
+      if (stage.required < 1 || stage.required > _maxSlot) {
+        return _vaultOpaqueError;
+      }
+      final List<int>? oI = stage.orbit;
+      if (i == 0) {
+        // σ is o₀'s only source; a file that also carries one disagrees with
+        // itself about the root and is rejected rather than silently preferred.
+        if (oI != null) return _vaultOpaqueError;
+        orbits.add(widget.core.orbitRoot(sigma));
+      } else {
+        if (oI == null || oI.isEmpty) return _vaultOpaqueError;
+        orbits.add(Uint8List.fromList(oI));
+      }
+      // Under r_i placed points Sh_i is not fixed, so the stage would restore
+      // unsettled — and any deeper stage's o_i would then have no derivation.
+      if (stage.points.length < stage.required) return _vaultOpaqueError;
+      final Set<int> seenSlots = <int>{};
+      for (final OrbitVaultPoint point in stage.points) {
+        if (point.slot < 1 ||
+            point.slot > _maxSlot ||
+            !seenSlots.add(point.slot)) {
+          return _vaultOpaqueError;
+        }
+        final ({int o, int p, int q}) prm =
+            protocol.orbitParams(orbits[i], point.slot - 1);
+        pointsRaw.add(<int>[point.reRaw, point.imRaw]);
+        reservoirs.add(<int>[prm.o, prm.p, prm.q]);
+        targets.add((stage: i, slot: point.slot));
+      }
+    }
+
+    // One decodeFull per placed point, over every stage, is seconds of CPU — it
+    // runs in a worker isolate behind the _vaultBusy spinner, or opening a file
+    // freezes the app.
+    List<List<int>?> decoded;
+    try {
+      decoded = await widget.core.decodePoints(pointsRaw, reservoirs);
+    } catch (_) {
+      return _vaultOpaqueError;
+    }
+    // A point that does not decode under its own stage's reservoirs means the
+    // file and the engine disagree — a wrong-protocol or doctored file. Nothing
+    // is applied then, and the chunks decoded so far are wiped rather than left
+    // to the collector; the same holds if the screen went away mid-decode.
+    if (!mounted ||
+        decoded.length != targets.length ||
+        decoded.contains(null)) {
+      for (final List<int>? bits in decoded) {
+        if (bits != null) Entropy.wipe(bits);
+      }
+      return _vaultOpaqueError;
+    }
+
+    setState(() {
+      // Drop whatever is on the boards now: a restore replaces the orbit, and a
+      // leftover placement from another σ would neither decode nor be visible.
+      _clearOrbitPlacements();
+      _sigmaCtrl.text = vault.sigma;
+      _iterations = vault.iterations;
+      _iterationsField.text = '${vault.iterations}';
+      _profile = vault.profile;
+      for (int i = 0; i <= deepest; i++) {
+        _requiredFractals[i] = vault.stages[i].required;
+        // o₀ is never stored: [_stageOrbit] re-derives it from σ on demand.
+        if (i >= 1) _orbitO[i] = orbits[i];
+      }
+      for (int k = 0; k < targets.length; k++) {
+        final ({int stage, int slot}) t = targets[k];
+        _boardChunks[t.stage][t.slot] = decoded[k]!; // owns the bits
+        _boardPoints[t.stage][t.slot] =
+            (reRaw: pointsRaw[k][0], imRaw: pointsRaw[k][1]);
+        _boardDerived[t.stage][t.slot] = false;
+      }
+      // Every o_i is in place above, so each stage can now re-interpolate its
+      // own Sh_i, recompute K_i and kick off the derived slots' marker encode.
+      for (int i = 0; i <= deepest; i++) {
+        _recomputeExtraShares(i);
+      }
+    });
+    _setOrbitStage(deepest);
+    return null;
+  }
+
   /// Provisional-key save / load: an encrypted on-disk copy of the setup, kept
   /// only across the memorisation window and destroyed at graduation.
   Widget _vaultControls() {
-    final bool canSave = _setup.canExportVault || _setup.canExportResumable;
+    final bool canSave =
+        _orbitSettled || _setup.canExportVault || _setup.canExportResumable;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: <Widget>[
@@ -3691,8 +3924,10 @@ class _SetupScreenState extends State<SetupScreen> {
   void _focusVaultPath() => _focusField(_vaultPathFocus, 'vault file path');
 
   /// Whether the provisional-key panel is on screen — the config screen (to open
-  /// a saved setup) or a settled setup (to write one). Gates the F/W/O/T keys.
+  /// a saved setup) or a settled setup, orbit or legacy chain (to write one).
+  /// Gates the F/W/O/T keys.
   bool get _vaultPanelShown =>
+      _orbitSettled ||
       _setup.phase == SetupPhase.idle ||
       _setup.canExportVault ||
       _setup.canExportResumable;
@@ -3700,8 +3935,14 @@ class _SetupScreenState extends State<SetupScreen> {
   /// Write (save) the settled setup to the file path, encrypted under a fresh
   /// app-generated 128-bit key, then open the key dialog (W). The key can be
   /// overridden with the user's own entropy from inside that dialog.
+  ///
+  /// A settled **orbit** setup writes an [OrbitVault] off the screen state; the
+  /// legacy chain path stays on [SetupController] while it survives as the
+  /// porting reference. The orbit takes precedence — the two cannot both be
+  /// settled, since orbit placement never enters a chain session.
   Future<void> _writeSetup() async {
-    if (!_setup.canExportVault && !_setup.canExportResumable) {
+    final bool orbit = _orbitSettled;
+    if (!orbit && !_setup.canExportVault && !_setup.canExportResumable) {
       _sounds.play(UiSound.denyInput);
       _toast('Finish a setup first — there is nothing to write yet.');
       return;
@@ -3713,8 +3954,9 @@ class _SetupScreenState extends State<SetupScreen> {
       return;
     }
     setState(() => _vaultBusy = true);
-    final ({String? error, Uint8List? key}) result =
-        await _setup.saveVaultToFile(path);
+    final ({String? error, Uint8List? key}) result = orbit
+        ? await _saveOrbitVaultToFile(path)
+        : await _setup.saveVaultToFile(path);
     if (!mounted) return;
     setState(() => _vaultBusy = false);
     if (result.error != null || result.key == null) {
@@ -3723,7 +3965,7 @@ class _SetupScreenState extends State<SetupScreen> {
       return;
     }
     _sounds.play(UiSound.exportOk);
-    await _showKeyDialog(path, result.key!);
+    await _showKeyDialog(path, result.key!, orbit: orbit);
   }
 
   /// Open (load) a saved setup from the file path (O): scan the QR (Q) or type
@@ -3873,10 +4115,12 @@ class _SetupScreenState extends State<SetupScreen> {
     return keyBytes;
   }
 
-  /// Shared decrypt+restore from a file path and 16-byte key, wiping the key.
+  /// Shared decrypt+restore from a file path and 16- or 32-byte key, wiping the
+  /// key. The heavy part (the Argon2 key derivation, and an orbit restore's
+  /// per-point decode) runs behind the [_vaultBusy] spinner.
   Future<void> _loadWithBytes(String path, Uint8List keyBytes) async {
     setState(() => _vaultBusy = true);
-    final String? err = await _setup.loadVaultFromFile(path, keyBytes);
+    final String? err = await _openVaultFile(path, keyBytes);
     _wipeBytes(keyBytes);
     if (!mounted) return;
     setState(() => _vaultBusy = false);
@@ -3889,13 +4133,77 @@ class _SetupScreenState extends State<SetupScreen> {
     _toast('Setup loaded.');
   }
 
+  /// Decrypt the file at [path] with [keyBytes] and restore whichever setup it
+  /// holds, returning null on success or a message on failure.
+  ///
+  /// The payload's `kind` picks the branch: `'orbit'` restores the screen-owned
+  /// orbit setup ([_restoreOrbitVault]); an absent `kind` is a legacy 0.3.0
+  /// chain [SetupVault] and takes the unchanged [SetupController] path. Every
+  /// failure after the file is read reports the same [_vaultOpaqueError], so a
+  /// wrong key, a corrupt file and a chain/orbit mix-up are indistinguishable.
+  /// The caller owns and wipes [keyBytes].
+  Future<String?> _openVaultFile(String path, Uint8List keyBytes) async {
+    if (!SetupCrypto.isValidKeyLen(keyBytes.length)) return _vaultOpaqueError;
+    Uint8List bytes;
+    try {
+      bytes = await File(path).readAsBytes();
+    } catch (_) {
+      // Not a secret-bearing distinction: whether the path exists is knowable
+      // without the key, and saying so is the difference between a typo the user
+      // can fix and one they cannot.
+      return 'Could not read that file.';
+    }
+    Map<String, dynamic> payload;
+    try {
+      payload = await SetupCrypto.openPayload(bytes, keyBytes);
+    } catch (_) {
+      return _vaultOpaqueError;
+    }
+    if (payload[OrbitVault.kindKey] == OrbitVault.kind) {
+      OrbitVault vault;
+      try {
+        vault = OrbitVault.fromJson(payload);
+      } catch (_) {
+        return _vaultOpaqueError;
+      }
+      try {
+        return await _restoreOrbitVault(vault);
+      } finally {
+        vault.wipe();
+      }
+    }
+    SetupVault chain;
+    try {
+      chain = SetupVault.fromJson(payload);
+    } catch (_) {
+      return _vaultOpaqueError;
+    }
+    try {
+      if (chain.resume != null) {
+        _setup.restoreResumableVault(chain); // halted — restore + offer Resume
+      } else {
+        _setup.restoreVault(chain);
+      }
+      return null;
+    } catch (_) {
+      return _vaultOpaqueError;
+    } finally {
+      chain.wipe();
+    }
+  }
+
   /// After a write, present the provisional [keyBytes] for the file at [path]:
   /// reveal the byte-mode v1 QR to hand-copy (Q), copy the 32-hex key blind to
   /// the clipboard for a password manager (Alt+Q), or overwrite the key with the
   /// user's own 32-hex entropy (I focuses the field, Enter applies). Esc closes.
   /// The key is never shown as text — only as a QR or copied blind — and the
   /// in-memory copy is wiped when the dialog closes.
-  Future<void> _showKeyDialog(String path, Uint8List keyBytes) async {
+  ///
+  /// [orbit] says which writer the dialog's re-seals go back through, so the
+  /// 128↔256 toggle and the own-key/scanned-key paths rewrite the same kind of
+  /// vault the initial write produced.
+  Future<void> _showKeyDialog(String path, Uint8List keyBytes,
+      {required bool orbit}) async {
     Uint8List key = keyBytes;
     int keyLen = key.length; // 16 (128-bit) or 32 (256-bit)
     qr.QrImage matrix = _keyMatrix(key);
@@ -3921,8 +4229,11 @@ class _SetupScreenState extends State<SetupScreen> {
           // and redraw. Shared by the 128↔256 toggle and the own-key path.
           Future<bool> reseal({Uint8List? ownKey, required int newLen}) async {
             setLocal(() => busy = true);
-            final ({String? error, Uint8List? key}) r = await _setup
-                .saveVaultToFile(path, providedKey: ownKey, genLenBytes: newLen);
+            final ({String? error, Uint8List? key}) r = orbit
+                ? await _saveOrbitVaultToFile(path,
+                    providedKey: ownKey, genLenBytes: newLen)
+                : await _setup.saveVaultToFile(path,
+                    providedKey: ownKey, genLenBytes: newLen);
             if (ownKey != null) _wipeBytes(ownKey);
             if (!ctx.mounted) return false;
             if (r.error != null || r.key == null) {

@@ -430,6 +430,57 @@ class GreatWallCore {
     return completer.future;
   }
 
+  /// Decode a batch of fractal [points] (`[reRaw, imRaw]` each) back to their
+  /// 32-bit chunks — each under its matching `[o, p, q]` reservoir in
+  /// [reservoirs] — in a **worker isolate**. An entry is null where the point
+  /// did not decode to a valid leaf under those reservoirs.
+  ///
+  /// A decode walks the same island-discovery machinery as an encode, so a
+  /// whole restored orbit's worth of them (`N` stages × `r_i` points) is
+  /// seconds of CPU and must not run on the UI isolate — this is the restore
+  /// peer of [encodeSharePoints]. Unlike that one, this **is** on the
+  /// correctness path: the decoded chunks are the placed points a settled orbit
+  /// vault reconstructs `Sh_i` (hence `K_i`) from, which is why an invalid
+  /// decode is reported as null rather than silently dropped. Errors surface as
+  /// a [StateError]; the empty batch resolves to `[]` without spawning.
+  Future<List<List<int>?>> decodePoints(
+    List<List<int>> points,
+    List<List<int>> reservoirs,
+  ) async {
+    if (points.isEmpty) return const <List<int>?>[];
+    final ReceivePort port = ReceivePort();
+    final Completer<List<List<int>?>> completer = Completer<List<List<int>?>>();
+    await Isolate.spawn<(SendPort, List<List<int>>, List<List<int>>)>(
+      _decodePointsIsolateEntry,
+      (port.sendPort, points, reservoirs),
+      onError: port.sendPort,
+      errorsAreFatal: true,
+    );
+    port.listen((dynamic msg) {
+      // Success payload is a `List<List<int>?>` (null = invalid decode); the
+      // onError payload is a `[message, stack]` list of strings. Distinguish by
+      // element type rather than the reified generic, which is not guaranteed
+      // across the boundary.
+      final bool decoded =
+          msg is List && (msg.isEmpty || msg.first == null || msg.first is List);
+      if (decoded) {
+        if (!completer.isCompleted) {
+          completer.complete(<List<int>?>[
+            for (final dynamic b in msg as List)
+              if (b == null)
+                null
+              else
+                <int>[for (final dynamic v in b as List) v as int],
+          ]);
+        }
+      } else if (!completer.isCompleted) {
+        completer.completeError(StateError('Point decode failed'));
+      }
+      port.close();
+    });
+    return completer.future;
+  }
+
   /// Start a **cancellable** on-device Argon2 micro-benchmark at [profile] in a
   /// worker isolate (heavy, blocking), returning an [Argon2BenchJob] whose
   /// `result` is the **median** seconds per pass (one pass == one derivation
@@ -562,6 +613,36 @@ void _encodeSharesIsolateEntry(
       q: res[2],
     );
     out.add(<int>[pt.reRaw, pt.imRaw]);
+  }
+  send.send(out);
+}
+
+/// Worker-isolate entry: open the engine and decode each `[reRaw, imRaw]` point
+/// under its `[o, p, q]` reservoir, sending back a `List<List<int>?>` of 32-bit
+/// chunks in input order (null where the point is not a valid leaf). Mirrors
+/// [GreatWallCore.decodePoint] off the UI isolate — see
+/// [GreatWallCore.decodePoints].
+void _decodePointsIsolateEntry(
+    (SendPort, List<List<int>>, List<List<int>>) args) {
+  final (SendPort send, List<List<int>> points, List<List<int>> reservoirs) =
+      args;
+  final GreatWallCoreBindings bindings = GreatWallCoreBindings.open();
+  final FixedRect area = bindings.encodeArea();
+  final CoreDiscoveryParams params = bindings.encodeParams();
+  final List<List<int>?> out = <List<int>?>[];
+  for (int i = 0; i < points.length; i++) {
+    final List<int> res = reservoirs[i];
+    final CoreDecodeResult d = bindings.decodeFull(
+      pointReRaw: points[i][0],
+      pointImRaw: points[i][1],
+      numBits: EncodingConstants.bitsPerPoint,
+      area: area,
+      params: params,
+      o: res[0],
+      p: res[1],
+      q: res[2],
+    );
+    out.add(d.valid ? d.bits : null);
   }
   send.send(out);
 }

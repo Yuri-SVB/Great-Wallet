@@ -47,6 +47,11 @@ class OrbitVault {
   /// [SetupVault] payloads carry no `kind`.
   static const String kind = 'orbit';
 
+  /// The JSON key [kind] rides under — named so the load path can branch on the
+  /// discriminator before committing to a payload type, without re-spelling the
+  /// literal.
+  static const String kindKey = 'kind';
+
   /// The canonical Stage-0 salt `σ` as hex (`o₀ = H(σ)`). Public — the Namtso
   /// salt — so it is not wiped.
   final String sigma;
@@ -62,7 +67,7 @@ class OrbitVault {
 
   Map<String, dynamic> toJson() => <String, dynamic>{
         'v': formatVersion,
-        'kind': kind,
+        kindKey: kind,
         'sigma': sigma,
         'iterations': iterations,
         'profile': profile.value,
@@ -76,7 +81,7 @@ class OrbitVault {
   /// never echoes values (a wrong-key decrypt that yields garbage, or a chain
   /// vault opened as orbit, must fail opaquely).
   factory OrbitVault.fromJson(Map<String, dynamic> json) {
-    if (_int(json, 'v') != formatVersion || json['kind'] != kind) {
+    if (_int(json, 'v') != formatVersion || json[kindKey] != kind) {
       throw const FormatException('unsupported vault version');
     }
     final Object? sigma = json['sigma'];
