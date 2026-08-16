@@ -37,6 +37,10 @@ class GreatWallCoreBindings {
         _lib.lookupFunction<_RenderViewportGenericC, _RenderViewportGenericDart>(
       'bs_render_viewport_generic',
     );
+    _renderViewportGenericU32 = _lib.lookupFunction<_RenderViewportGenericU32C,
+        _RenderViewportGenericU32Dart>(
+      'bs_render_viewport_generic_u32',
+    );
     _encode = _lib.lookupFunction<_EncodeC, _EncodeDart>('bs_encode');
     _encodeResultPoint =
         _lib.lookupFunction<_EncodeResultPointC, _EncodeResultPointDart>(
@@ -165,6 +169,7 @@ class GreatWallCoreBindings {
 
   late final _RenderViewportDart _renderViewport;
   late final _RenderViewportGenericDart _renderViewportGeneric;
+  late final _RenderViewportGenericU32Dart _renderViewportGenericU32;
   late final _EncodeDart _encode;
   late final _EncodeResultPointDart _encodeResultPoint;
   late final _EncodeResultFinalRectDart _encodeResultFinalRect;
@@ -272,6 +277,41 @@ class GreatWallCoreBindings {
     required Pointer<Uint8> out,
   }) {
     _renderViewportGeneric(
+      originRe,
+      originIm,
+      step,
+      width,
+      height,
+      maxIter,
+      o,
+      p,
+      q,
+      out,
+    );
+  }
+
+  /// Render the perturbed Burning Ship with **exact** escape counts
+  /// (`bs_render_viewport_generic_u32`): one `u32` per pixel carrying the true
+  /// count, with [maxIter] written for a non-escaping point.
+  ///
+  /// The `u8` sibling folds counts as `(e % 255) + 1`, which is fine for
+  /// colouring but merges level sets 255 apart — and at the encode cap of 1024
+  /// that aliases four ways. The canvas needs the unfolded value to flood fill
+  /// a canonical island, whose shape is the connected region whose count equals
+  /// the island's, so this is the path the renderer uses.
+  void renderViewportGenericU32({
+    required double originRe,
+    required double originIm,
+    required double step,
+    required int width,
+    required int height,
+    required int maxIter,
+    required int o,
+    required int p,
+    required int q,
+    required Pointer<Uint32> out,
+  }) {
+    _renderViewportGenericU32(
       originRe,
       originIm,
       step,
@@ -1176,6 +1216,13 @@ typedef _RenderViewportGenericC = Void Function(
 typedef _RenderViewportGenericDart = void Function(
   double, double, double, int, int, int,
   int, int, int, Pointer<Uint8>);
+
+typedef _RenderViewportGenericU32C = Void Function(
+  Double, Double, Double, Int32, Int32, Uint32,
+  Uint64, Uint64, Uint64, Pointer<Uint32>);
+typedef _RenderViewportGenericU32Dart = void Function(
+  double, double, double, int, int, int,
+  int, int, int, Pointer<Uint32>);
 
 typedef _EncodeC = Pointer<Void> Function(
   Pointer<Uint8>, Uint32,

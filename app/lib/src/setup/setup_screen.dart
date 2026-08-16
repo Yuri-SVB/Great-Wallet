@@ -1908,7 +1908,13 @@ class _SetupScreenState extends State<SetupScreen> {
     }
     return _BoardDeco(
       cells: CanvasIsland(
-          cellSize: fixedToDouble(isl.pixelDeltaRaw), pointsReIm: pts),
+        cellSize: fixedToDouble(isl.pixelDeltaRaw),
+        pointsReIm: pts,
+        // The level set the canvas re-floods to draw this island at whatever
+        // resolution is on screen; the points are its seeds, the cells only a
+        // fallback. See great-wall-ux `island_fill.dart`.
+        escapeCount: isl.escapeCount,
+      ),
       reMin: fixedToDouble(isl.bbox.reMin),
       reMax: fixedToDouble(isl.bbox.reMax),
       imMin: fixedToDouble(isl.bbox.imMin),
