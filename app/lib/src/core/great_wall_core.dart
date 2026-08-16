@@ -430,6 +430,167 @@ class GreatWallCore {
     return completer.future;
   }
 
+  /// One orbit step, **streamed pass by pass** — the checkpointable peer of
+  /// [advanceOrbit], and the orbit peer of [startStageDerivation].
+  ///
+  /// `bs_orbit_advance` runs `K_i = H(o_i ‖ Sh_i)` and all `D` memory-hard
+  /// passes inside a single uninterruptible FFI call, so a deep orbit advance is
+  /// a multi-minute black box: no progress, no checkpoint, and a halt loses the
+  /// whole stage. This decomposes it into the engine primitives it is built
+  /// from — `bs_master_secret` then `D` × `bs_argon2_single` — which is
+  /// byte-identical to the one-shot call (verified against the engine at
+  /// `D = 1, 2`) while making every pass observable:
+  ///
+  /// - [onProgress] `(completed, total)` after each pass, for a determinate bar;
+  /// - [onCheckpoint] `(completed, digest)` with that pass's intermediary
+  ///   digest, so a halt keeps the work already done — pass it back to
+  ///   [resumeOrbitAdvance];
+  /// - [OrbitAdvanceJob.cancel] kills the worker isolate, costing at most the
+  ///   single pass in flight.
+  ///
+  /// The wipe discipline of `orbit.rs`'s `orbit_step_with` is preserved: the
+  /// commitment is taken first and the isolate's copies of `{o_i, Sh_i}` are
+  /// zeroed **before** the memory-hard phase begins, so the raw inputs are gone
+  /// for the whole long window. In the one-shot call Rust ownership enforces
+  /// that; here it is explicit in [_orbitAdvanceStreamIsolateEntry].
+  ///
+  /// [steps] `== 0` is the pass-through case (`o_{i+1} = K_i`), computed inline
+  /// exactly as [advanceOrbit] does.
+  Future<OrbitAdvanceJob> startOrbitAdvance(
+    Uint8List oI,
+    Uint8List sh, {
+    required int steps,
+    Argon2Profile profile = Argon2Profile.basic,
+    void Function(int completed, int total)? onProgress,
+    void Function(int completed, Uint8List digest)? onCheckpoint,
+  }) async {
+    if (steps <= 0) {
+      final Uint8List k = masterSecret(oI, sh);
+      onProgress?.call(1, 1);
+      // Same contract as the streamed path: the callback copies what it keeps,
+      // and this hand-off copy is wiped straight after — never the `k` returned.
+      final Uint8List cp = Uint8List.fromList(k);
+      onCheckpoint?.call(1, cp);
+      cp.fillRange(0, cp.length, 0);
+      return OrbitAdvanceJob(
+        Future<({Uint8List k, Uint8List next})>.value(
+            (k: k, next: Uint8List.fromList(k))),
+        () {},
+      );
+    }
+    final ReceivePort port = ReceivePort();
+    final Isolate isolate =
+        await Isolate.spawn<(SendPort, Uint8List, Uint8List, int, int)>(
+      _orbitAdvanceStreamIsolateEntry,
+      (port.sendPort, oI, sh, steps, profile.value),
+      onError: port.sendPort,
+      errorsAreFatal: true,
+    );
+    return _listenOrbit(port, isolate, steps, null, onProgress, onCheckpoint);
+  }
+
+  /// Resume a halted orbit advance from a preserved checkpoint: [fromDigest] is
+  /// the intermediary after [fromPass] passes (as handed to `onCheckpoint`), and
+  /// [k] is the `K_i` the original [startOrbitAdvance] produced, carried through
+  /// so the completed result is identical to an uninterrupted run.
+  ///
+  /// The commitment is **not** recomputed — `{o_i, Sh_i}` were wiped before the
+  /// memory-hard phase and are deliberately not required again. Same streaming,
+  /// checkpoint and cancel semantics as [startOrbitAdvance].
+  Future<OrbitAdvanceJob> resumeOrbitAdvance(
+    Uint8List k,
+    Uint8List fromDigest, {
+    required int fromPass,
+    required int steps,
+    Argon2Profile profile = Argon2Profile.basic,
+    void Function(int completed, int total)? onProgress,
+    void Function(int completed, Uint8List digest)? onCheckpoint,
+  }) async {
+    if (fromPass >= steps) {
+      // Nothing left — the checkpoint already holds o_{i+1}.
+      onProgress?.call(steps, steps);
+      final Uint8List cp = Uint8List.fromList(fromDigest);
+      onCheckpoint?.call(steps, cp);
+      cp.fillRange(0, cp.length, 0);
+      return OrbitAdvanceJob(
+        Future<({Uint8List k, Uint8List next})>.value(
+            (k: Uint8List.fromList(k), next: Uint8List.fromList(fromDigest))),
+        () {},
+      );
+    }
+    final ReceivePort port = ReceivePort();
+    final Isolate isolate =
+        await Isolate.spawn<(SendPort, Uint8List, int, int, int)>(
+      _orbitAdvanceResumeIsolateEntry,
+      (port.sendPort, fromDigest, fromPass, steps, profile.value),
+      onError: port.sendPort,
+      errorsAreFatal: true,
+    );
+    return _listenOrbit(
+        port, isolate, steps, Uint8List.fromList(k), onProgress, onCheckpoint);
+  }
+
+  /// Wire a streamed orbit isolate's `(pass, digest)` messages to an
+  /// [OrbitAdvanceJob]. Pass `0` carries `K_i` (the commitment, not a
+  /// memory-hard pass, so it is not reported as progress); passes `1..steps`
+  /// are the advance. [seedK] pre-supplies `K_i` on the resume path, where the
+  /// isolate never recomputes it.
+  OrbitAdvanceJob _listenOrbit(
+    ReceivePort port,
+    Isolate isolate,
+    int total,
+    Uint8List? seedK,
+    void Function(int completed, int total)? onProgress,
+    void Function(int completed, Uint8List digest)? onCheckpoint,
+  ) {
+    final Completer<({Uint8List k, Uint8List next})> completer =
+        Completer<({Uint8List k, Uint8List next})>();
+    Uint8List? k = seedK;
+    void cleanup() => port.close();
+
+    port.listen((dynamic msg) {
+      if (msg is (int, Uint8List)) {
+        final (int completed, Uint8List digest) = msg;
+        if (completed == 0) {
+          // The commitment. Keep it for the result; it is not a pass.
+          k = Uint8List.fromList(digest);
+          digest.fillRange(0, digest.length, 0);
+          return;
+        }
+        onProgress?.call(completed, total);
+        onCheckpoint?.call(completed, digest);
+        if (completed >= total) {
+          final Uint8List? ki = k;
+          if (!completer.isCompleted) {
+            if (ki == null) {
+              // The commitment never arrived — refuse rather than invent a K_i.
+              completer.completeError(StateError('Orbit advance failed'));
+            } else {
+              completer.complete((k: ki, next: Uint8List.fromList(digest)));
+            }
+          }
+          cleanup();
+        }
+        digest.fillRange(0, digest.length, 0);
+      } else {
+        // Error payload (from the isolate body or onError): [message, stack].
+        if (!completer.isCompleted) {
+          completer.completeError(StateError('Orbit advance failed'));
+        }
+        cleanup();
+      }
+    });
+
+    void cancel() {
+      if (completer.isCompleted) return;
+      isolate.kill(priority: Isolate.immediate);
+      cleanup();
+      completer.completeError(const Argon2Cancelled());
+    }
+
+    return OrbitAdvanceJob(completer.future, cancel);
+  }
+
   /// Decode a batch of fractal [points] (`[reRaw, imRaw]` each) back to their
   /// 32-bit chunks — each under its matching `[o, p, q]` reservoir in
   /// [reservoirs] — in a **worker isolate**. An entry is null where the point
@@ -617,6 +778,48 @@ void _encodeSharesIsolateEntry(
   send.send(out);
 }
 
+/// Worker-isolate entry: open the engine and run one orbit step **streamed**,
+/// sending `(0, K_i)` for the commitment and then `(pass, digest)` after each of
+/// the `steps` memory-hard passes. Mirrors `orbit.rs`'s `orbit_step_with`:
+/// commit, wipe the raw `{o_i, Sh_i}`, then run `H*` on `K_i` alone — so the
+/// inputs are gone before the long window rather than living through it.
+/// See [GreatWallCore.startOrbitAdvance].
+void _orbitAdvanceStreamIsolateEntry(
+    (SendPort, Uint8List, Uint8List, int, int) args) {
+  final (SendPort send, Uint8List oI, Uint8List sh, int steps, int profileValue) =
+      args;
+  final Argon2Profile profile = Argon2Profile.values[profileValue];
+  final GreatWallCoreBindings bindings = GreatWallCoreBindings.open();
+  final Uint8List k = bindings.masterSecret(oI, sh); // K_i = H(o_i ‖ Sh_i)
+  oI.fillRange(0, oI.length, 0); // this isolate's copies — zeroed before H*
+  sh.fillRange(0, sh.length, 0);
+  send.send((0, k));
+  Uint8List digest = k;
+  for (int i = 0; i < steps; i++) {
+    digest = bindings.argon2Single(digest, profile);
+    send.send((i + 1, digest));
+  }
+  k.fillRange(0, k.length, 0);
+}
+
+/// Worker-isolate entry for a resumed orbit advance: continue from [fromDigest]
+/// (the result after [fromPass] passes) for the remaining passes, streaming
+/// `(pass, digest)` with indices continuous with what the halt had counted.
+/// `K_i` is not recomputed — the caller carries it (see
+/// [GreatWallCore.resumeOrbitAdvance]).
+void _orbitAdvanceResumeIsolateEntry(
+    (SendPort, Uint8List, int, int, int) args) {
+  final (SendPort send, Uint8List fromDigest, int fromPass, int steps,
+      int profileValue) = args;
+  final Argon2Profile profile = Argon2Profile.values[profileValue];
+  final GreatWallCoreBindings bindings = GreatWallCoreBindings.open();
+  Uint8List digest = fromDigest;
+  for (int i = fromPass; i < steps; i++) {
+    digest = bindings.argon2Single(digest, profile);
+    send.send((i + 1, digest));
+  }
+}
+
 /// Worker-isolate entry: open the engine and decode each `[reRaw, imRaw]` point
 /// under its `[o, p, q]` reservoir, sending back a `List<List<int>?>` of 32-bit
 /// chunks in input order (null where the point is not a valid leaf). Mirrors
@@ -687,6 +890,19 @@ class Argon2Job {
   Argon2Job(this.result, this._cancel);
 
   final Future<StageReservoirs> result;
+  final void Function() _cancel;
+
+  void cancel() => _cancel();
+}
+
+/// A running **orbit advance**: its [result] — `(K_i, o_{i+1})` — and a [cancel]
+/// that kills the worker isolate and fails [result] with [Argon2Cancelled],
+/// costing at most the single pass in flight. The orbit peer of [Argon2Job];
+/// see [GreatWallCore.startOrbitAdvance].
+class OrbitAdvanceJob {
+  OrbitAdvanceJob(this.result, this._cancel);
+
+  final Future<({Uint8List k, Uint8List next})> result;
   final void Function() _cancel;
 
   void cancel() => _cancel();

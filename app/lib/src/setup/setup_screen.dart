@@ -219,6 +219,26 @@ class _SetupScreenState extends State<SetupScreen> {
   /// progress scrim shows and other hotkeys/navigation are blocked meanwhile.
   bool _advancing = false;
 
+  /// The stage the advance in flight is deriving *into*, or null. Screen-owned,
+  /// because the orbit never goes through [SetupController] — which is exactly
+  /// why the stage bar could not show this before: it reads the controller's
+  /// `derivingStageIndex` / `stageProgress`, and an orbit advance sets neither.
+  int? _advanceTarget;
+
+  /// Completed / total memory-hard passes of the advance in flight, streamed
+  /// per pass out of [GreatWallCore.startOrbitAdvance].
+  int _advanceDone = 0;
+  int _advanceTotal = 0;
+
+  /// The advance in flight, so Halt can cancel it — killing the worker isolate
+  /// costs at most the single pass currently running.
+  OrbitAdvanceJob? _advanceJob;
+
+  /// Fraction of the advance completed, for the stage tab's determinate bar.
+  double get _advanceProgress => _advanceTotal <= 0
+      ? 0
+      : (_advanceDone / _advanceTotal).clamp(0.0, 1.0);
+
   // --- Bottom console ---------------------------------------------------------
   // The console at the foot of the screen is the app's single message surface:
   // toasts, the help text of whatever control is under focus, and confirmation
@@ -1155,8 +1175,12 @@ class _SetupScreenState extends State<SetupScreen> {
     // advance into it.
     final int ceiling = session ? 0 : _orbitReachableCeiling;
     final int current = session ? _setup.displayStageIndex : _orbitStage;
-    final int? deriving = _setup.derivingStageIndex;
-    final double progress = _setup.stageProgress;
+    // A legacy chain session reads its derivation state off the controller; an
+    // orbit advance is screen-owned, so the stage bar takes it from
+    // [_advanceTarget] / [_advanceProgress]. Only one can be live at a time.
+    final int? deriving = _advanceTarget ?? _setup.derivingStageIndex;
+    final double progress =
+        _advanceTarget != null ? _advanceProgress : _setup.stageProgress;
     // Transparent so the tabs hover over the fractal (no opaque bar).
     return Material(
       type: MaterialType.transparency,
@@ -1631,9 +1655,11 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   /// Advance the orbit forward into stage [target]: run the memory-hard step
-  /// `o_target = H*(K_{target-1})` (via [GreatWallCore.advanceOrbit] in a worker
-  /// isolate, at the current `P`/`D` profile + derivation steps) and, on success,
-  /// store `o_target` and land on it. The preceding stage must be complete
+  /// `o_target = H*(K_{target-1})` (via [GreatWallCore.startOrbitAdvance] in a
+  /// worker isolate, at the current `P`/`D` profile + derivation steps),
+  /// streaming each completed pass to the stage bar and letting Halt cancel it;
+  /// on success, store `o_target` and land on it. The preceding stage must be
+  /// complete
   /// (`K_{target-1}` derived); otherwise this reports what is missing. Re-placing
   /// a point in an earlier stage cascade-invalidates the deeper `o_i`/`K_i` (see
   /// [_setPrimary]), so a forward advance always rebuilds from a settled prefix.
@@ -1658,23 +1684,59 @@ class _SetupScreenState extends State<SetupScreen> {
     // convenience, so it skips the "advancing" scrim; D >= 1 shows it.
     final int steps = _iterations;
     final bool memoryHard = steps >= 1;
-    if (memoryHard) setState(() => _advancing = true);
+    if (memoryHard) {
+      setState(() {
+        _advancing = true;
+        _advanceTarget = target;
+        _advanceDone = 0;
+        _advanceTotal = steps;
+      });
+    }
     _sounds.play(UiSound.focus);
     ({Uint8List k, Uint8List next})? adv;
+    bool cancelled = false;
     try {
-      adv = await widget.core.advanceOrbit(
+      // Streamed rather than one opaque call, so each completed pass moves the
+      // stage bar and Halt can stop it. `oFrom` is NOT wiped here — for stage 0
+      // it is a fresh derivation from σ, but for a deep stage it *is*
+      // `_orbitO[from]`, which the setup still needs.
+      final OrbitAdvanceJob job = await widget.core.startOrbitAdvance(
         oFrom,
         shBytes,
         steps: steps,
         profile: _profile,
+        onProgress: (int done, int total) {
+          if (!mounted) return;
+          setState(() {
+            _advanceDone = done;
+            _advanceTotal = total;
+          });
+        },
       );
+      _advanceJob = job;
+      adv = await job.result;
+    } on Argon2Cancelled {
+      cancelled = true;
     } catch (_) {
       adv = null;
     } finally {
       Entropy.wipe(shBytes);
-      if (memoryHard && mounted) setState(() => _advancing = false);
+      _advanceJob = null;
+      if (memoryHard && mounted) {
+        setState(() {
+          _advancing = false;
+          _advanceTarget = null;
+          _advanceDone = 0;
+          _advanceTotal = 0;
+        });
+      }
     }
     if (!mounted) return;
+    if (cancelled) {
+      _sounds.play(UiSound.navStage);
+      _toast('Advance halted — stage $from is unchanged.');
+      return;
+    }
     if (adv == null) {
       _sounds.play(UiSound.warn);
       _toast('Orbit advance failed — try again.');
@@ -2815,14 +2877,39 @@ class _SetupScreenState extends State<SetupScreen> {
                 onPressed: _setup.halt,
                 child: const Text('Halt'),
               )
-            : Text(
-                _advancing
-                    ? 'Advancing the orbit (memory-hard)…'
-                    : _setup.phase == SetupPhase.encoding
+            : _advancing
+                // The orbit advance now streams pass by pass, so it gets the
+                // same Halt the chain derivation has: cancelling kills the
+                // worker isolate, costing at most the pass in flight. The stage
+                // tab above carries the bar; this states the cost in passes.
+                ? Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: <Widget>[
+                      Text(
+                        _advanceTotal > 0
+                            ? 'Advancing the orbit (memory-hard) — pass '
+                                '$_advanceDone/$_advanceTotal…'
+                            : 'Advancing the orbit (memory-hard)…',
+                        style: const TextStyle(color: Colors.white),
+                      ),
+                      const SizedBox(height: 8),
+                      TextButton(
+                        onPressed: _advanceJob == null
+                            ? null
+                            : () {
+                                _sounds.play(UiSound.select);
+                                _advanceJob?.cancel();
+                              },
+                        child: const Text('Halt'),
+                      ),
+                    ],
+                  )
+                : Text(
+                    _setup.phase == SetupPhase.encoding
                         ? 'Encoding…'
                         : 'Working…',
-                style: const TextStyle(color: Colors.white),
-              ),
+                    style: const TextStyle(color: Colors.white),
+                  ),
       ),
     );
   }
