@@ -67,6 +67,73 @@ void main() {
     });
   });
 
+  group('halted-advance resume section (v2)', () {
+    OrbitVault halted() => OrbitVault(
+          sigma: 'DEADBEEF',
+          iterations: 8,
+          profile: Argon2Profile.basic,
+          stages: <OrbitVaultStage>[
+            OrbitVaultStage(
+              required: 2,
+              orbit: null,
+              points: <OrbitVaultPoint>[point(1, 10), point(2, 20)],
+            ),
+          ],
+          resume: OrbitVaultResume(
+            stage: 1,
+            pass: 3,
+            digest: <int>[for (int i = 0; i < 32; i++) 0x80 + i],
+          ),
+        );
+
+    test('round-trips the checkpoint and writes version 2', () {
+      final Map<String, dynamic> json = halted().toJson();
+      expect(json['v'], 2);
+      final OrbitVault back = OrbitVault.fromJson(json);
+      expect(back.resume, isNotNull);
+      expect(back.resume!.stage, 1);
+      expect(back.resume!.pass, 3);
+      expect(back.resume!.digest, hasLength(32));
+    });
+
+    test('a settled setup omits the section entirely', () {
+      expect(sample().toJson().containsKey('resume'), isFalse);
+      expect(OrbitVault.fromJson(sample().toJson()).resume, isNull);
+    });
+
+    test('a v1 file still loads, with no checkpoint', () {
+      // Exactly what the previous build wrote: version 1, no `resume` key.
+      final Map<String, dynamic> v1 = sample().toJson()..['v'] = 1;
+      final OrbitVault back = OrbitVault.fromJson(v1);
+      expect(back.resume, isNull);
+      expect(back.stages, hasLength(2));
+    });
+
+    test('a version newer than this build is refused', () {
+      final Map<String, dynamic> v3 = sample().toJson()..['v'] = 3;
+      expect(() => OrbitVault.fromJson(v3), throwsFormatException);
+    });
+
+    test('an ill-formed checkpoint is refused, not ignored', () {
+      for (final Object? bad in <Object?>[
+        <String, dynamic>{'stage': 1, 'pass': 3}, // no digest
+        <String, dynamic>{'stage': 1, 'pass': 3, 'digest': <int>[]}, // empty
+        <String, dynamic>{'pass': 3, 'digest': <int>[1]}, // no stage
+        'not-an-object',
+      ]) {
+        final Map<String, dynamic> json = sample().toJson()..['resume'] = bad;
+        expect(() => OrbitVault.fromJson(json), throwsFormatException,
+            reason: 'resume = $bad');
+      }
+    });
+
+    test('wipe zeroes the checkpoint digest too', () {
+      final OrbitVault v = halted();
+      v.wipe();
+      expect(v.resume!.digest.every((int b) => b == 0), isTrue);
+    });
+  });
+
   group('discrimination', () {
     test('rejects a payload missing the orbit kind (e.g. a chain vault)', () {
       // A legacy chain SetupVault payload shape — no `kind`, has `text`.

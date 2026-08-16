@@ -35,12 +35,19 @@ class OrbitVault {
     required this.iterations,
     required this.profile,
     required this.stages,
+    this.resume,
   });
 
-  /// On-disk format version of a **settled** orbit provisional key, so a future
-  /// change can be detected and rejected rather than silently misread. Distinct
-  /// namespace from [SetupVault]'s versions via the [kind] discriminator below.
-  static const int formatVersion = 1;
+  /// On-disk format version written by this build. Version 2 adds **optional
+  /// sections** alongside the settled orbit: [resume] (a halted advance's
+  /// checkpoint) and, when CPNF lands, the review deck. Because the sections are
+  /// optional and additive, a later one does **not** need another bump — only a
+  /// change to the existing fields would.
+  static const int formatVersion = 2;
+
+  /// Oldest version still readable. A v1 file is a settled orbit with no
+  /// optional sections; it loads with [resume] null.
+  static const int minSupportedVersion = 1;
 
   /// Payload discriminator so an orbit open of a legacy *chain* vault (or vice
   /// versa) fails cleanly on parse rather than misreading fields. Chain
@@ -65,6 +72,11 @@ class OrbitVault {
   /// One entry per orbit stage, in stage order (index `0..N`).
   final List<OrbitVaultStage> stages;
 
+  /// A **halted** memory-hard advance's checkpoint, or null for a fully settled
+  /// setup. Lets a reopened file continue the advance from the pass it reached
+  /// instead of restarting it — the orbit peer of [SetupVault]'s `resume`.
+  OrbitVaultResume? resume;
+
   Map<String, dynamic> toJson() => <String, dynamic>{
         'v': formatVersion,
         kindKey: kind,
@@ -74,6 +86,7 @@ class OrbitVault {
         'stages': <Map<String, dynamic>>[
           for (final OrbitVaultStage s in stages) s.toJson()
         ],
+        if (resume != null) 'resume': resume!.toJson(),
       };
 
   /// Rebuild a vault from decoded JSON. Throws a generic [FormatException] on any
@@ -81,7 +94,10 @@ class OrbitVault {
   /// never echoes values (a wrong-key decrypt that yields garbage, or a chain
   /// vault opened as orbit, must fail opaquely).
   factory OrbitVault.fromJson(Map<String, dynamic> json) {
-    if (_int(json, 'v') != formatVersion || json[kindKey] != kind) {
+    final int version = _int(json, 'v');
+    if (version < minSupportedVersion ||
+        version > formatVersion ||
+        json[kindKey] != kind) {
       throw const FormatException('unsupported vault version');
     }
     final Object? sigma = json['sigma'];
@@ -95,6 +111,7 @@ class OrbitVault {
     if (rawStages is! List || rawStages.isEmpty) {
       throw const FormatException('bad vault');
     }
+    final Object? rawResume = json['resume'];
     return OrbitVault(
       sigma: sigma,
       iterations: _int(json, 'iterations'),
@@ -105,6 +122,11 @@ class OrbitVault {
               ? s
               : throw const FormatException('bad vault')),
       ],
+      resume: rawResume == null
+          ? null
+          : OrbitVaultResume.fromJson(rawResume is Map<String, dynamic>
+              ? rawResume
+              : throw const FormatException('bad vault')),
     );
   }
 
@@ -115,11 +137,66 @@ class OrbitVault {
     for (final OrbitVaultStage s in stages) {
       s.wipe();
     }
+    resume?.wipe();
   }
 
   @override
   String toString() =>
       'OrbitVault(<redacted>, ${stages.length} stages)';
+}
+
+/// A halted memory-hard advance, captured mid-flight: the stage being derived
+/// **into**, how many of the `D` passes finished, and the intermediary digest
+/// after that many passes.
+///
+/// `K_{stage-1}` is deliberately **not** stored — it is recomputed on restore
+/// from the stage's placed points (the same `H(o_i ‖ Sh_i)` the setup already
+/// does), so the file carries no key it does not have to.
+///
+/// SECURITY — [digest] is an intermediary of `H*(K_{stage-1})`. Continuing the
+/// remaining passes from it yields `o_stage`, so it is exactly as
+/// coercion-relevant as a stored `o_i`, and lives under the same encryption.
+class OrbitVaultResume {
+  OrbitVaultResume({
+    required this.stage,
+    required this.pass,
+    required this.digest,
+  });
+
+  /// The stage the advance is deriving into (`i+1`, never 0).
+  final int stage;
+
+  /// Passes completed so far — `1 .. D-1`. Zero would carry no work, and `D`
+  /// would mean the advance had finished.
+  final int pass;
+
+  /// The intermediary digest after [pass] passes. Coercion-relevant.
+  final List<int> digest;
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+        'stage': stage,
+        'pass': pass,
+        'digest': digest,
+      };
+
+  factory OrbitVaultResume.fromJson(Map<String, dynamic> json) {
+    final List<int> digest = _intList(json, 'digest');
+    if (digest.isEmpty) throw const FormatException('bad vault');
+    return OrbitVaultResume(
+      stage: _int(json, 'stage'),
+      pass: _int(json, 'pass'),
+      digest: digest,
+    );
+  }
+
+  void wipe() {
+    for (int i = 0; i < digest.length; i++) {
+      digest[i] = 0;
+    }
+  }
+
+  @override
+  String toString() => 'OrbitVaultResume(<redacted>)';
 }
 
 /// One orbit stage's reconstruction data: its `r_i`, the memory-hard orbit point

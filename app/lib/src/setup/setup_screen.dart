@@ -239,6 +239,36 @@ class _SetupScreenState extends State<SetupScreen> {
       ? 0
       : (_advanceDone / _advanceTotal).clamp(0.0, 1.0);
 
+  /// A **halted** advance's preserved work: the stage it was deriving into, the
+  /// passes completed, and the intermediary digest after them. Kept so Halt
+  /// costs one pass rather than the whole stage, saved into the vault, and
+  /// restored from it — the orbit peer of `SetupController`'s `_halted`.
+  ///
+  /// Dropped whenever it could no longer apply: a successful advance, a
+  /// re-rooted prefix ([_invalidateDeeperThan] / [_clearOrbitPlacements]), or a
+  /// change to `D` (the pass count it is relative to).
+  ({int stage, int pass, Uint8List digest})? _advanceCheckpoint;
+
+  /// Whether a halted advance can be resumed right now: its checkpoint is for
+  /// the next stage to derive, its prefix is still settled, and `D` still agrees
+  /// with the pass it stopped at.
+  bool get _canResumeAdvance {
+    final ({int stage, int pass, Uint8List digest})? cp = _advanceCheckpoint;
+    if (cp == null || _advancing) return false;
+    return cp.stage == _orbitReachableCeiling + 1 &&
+        cp.pass >= 1 &&
+        cp.pass < _iterations &&
+        _orbitK[cp.stage - 1] != null;
+  }
+
+  /// Drop a preserved checkpoint, wiping the digest. Must run inside a
+  /// [setState] when it changes what is on screen.
+  void _clearAdvanceCheckpoint() {
+    final ({int stage, int pass, Uint8List digest})? cp = _advanceCheckpoint;
+    if (cp != null) Entropy.wipe(cp.digest);
+    _advanceCheckpoint = null;
+  }
+
   // --- Bottom console ---------------------------------------------------------
   // The console at the foot of the screen is the app's single message surface:
   // toasts, the help text of whatever control is under focus, and confirmation
@@ -1712,6 +1742,18 @@ class _SetupScreenState extends State<SetupScreen> {
             _advanceTotal = total;
           });
         },
+        onCheckpoint: (int done, Uint8List digest) {
+          // Keep the latest intermediary so a halt costs at most this pass. The
+          // callback's buffer is wiped by the facade once it returns, so copy.
+          final ({int stage, int pass, Uint8List digest})? old =
+              _advanceCheckpoint;
+          if (old != null) Entropy.wipe(old.digest);
+          _advanceCheckpoint = (
+            stage: target,
+            pass: done,
+            digest: Uint8List.fromList(digest),
+          );
+        },
       );
       _advanceJob = job;
       adv = await job.result;
@@ -1733,8 +1775,14 @@ class _SetupScreenState extends State<SetupScreen> {
     }
     if (!mounted) return;
     if (cancelled) {
+      // The checkpoint survives the halt — that is the whole point of it.
+      final int done = _advanceCheckpoint?.pass ?? 0;
       _sounds.play(UiSound.navStage);
-      _toast('Advance halted — stage $from is unchanged.');
+      setState(() {});
+      _toast(done > 0
+          ? 'Advance halted after $done/$steps passes — kept. Save to keep it '
+              'across sessions, or Resume to continue.'
+          : 'Advance halted before the first pass finished — nothing to keep.');
       return;
     }
     if (adv == null) {
@@ -1748,6 +1796,103 @@ class _SetupScreenState extends State<SetupScreen> {
     final Uint8List? oldNext = _orbitO[target];
     if (oldNext != null) Entropy.wipe(oldNext);
     _orbitO[target] = adv.next;
+    _clearAdvanceCheckpoint(); // the advance landed; the checkpoint is spent
+    _setOrbitStage(target);
+    _sounds.play(UiSound.stageReady);
+    _toast('Advanced to stage $target — place its points.');
+  }
+
+  /// Continue a halted advance from its preserved checkpoint, running only the
+  /// passes that remain. The orbit peer of [_resumeDerivation].
+  ///
+  /// `K_{stage-1}` is not stored anywhere — it is read back from [_orbitK],
+  /// which the setup recomputes from the stage's placed points on restore. So a
+  /// resume after reopening a file needs nothing from the file but the digest
+  /// and the pass count.
+  Future<void> _resumeOrbitAdvance() async {
+    final ({int stage, int pass, Uint8List digest})? cp = _advanceCheckpoint;
+    if (cp == null || !_canResumeAdvance) {
+      _sounds.play(UiSound.denyBlocked);
+      _toast('Nothing to resume.');
+      return;
+    }
+    final int target = cp.stage;
+    final Uint8List? k = _orbitK[target - 1];
+    if (k == null) {
+      _sounds.play(UiSound.denyBlocked);
+      _toast('Place stage ${target - 1}’s points first.');
+      return;
+    }
+    final int steps = _iterations;
+    setState(() {
+      _advancing = true;
+      _advanceTarget = target;
+      _advanceDone = cp.pass;
+      _advanceTotal = steps;
+    });
+    _sounds.play(UiSound.focus);
+    ({Uint8List k, Uint8List next})? adv;
+    bool cancelled = false;
+    try {
+      final OrbitAdvanceJob job = await widget.core.resumeOrbitAdvance(
+        k,
+        cp.digest,
+        fromPass: cp.pass,
+        steps: steps,
+        profile: _profile,
+        onProgress: (int done, int total) {
+          if (!mounted) return;
+          setState(() {
+            _advanceDone = done;
+            _advanceTotal = total;
+          });
+        },
+        onCheckpoint: (int done, Uint8List digest) {
+          final ({int stage, int pass, Uint8List digest})? old =
+              _advanceCheckpoint;
+          if (old != null) Entropy.wipe(old.digest);
+          _advanceCheckpoint = (
+            stage: target,
+            pass: done,
+            digest: Uint8List.fromList(digest),
+          );
+        },
+      );
+      _advanceJob = job;
+      adv = await job.result;
+    } on Argon2Cancelled {
+      cancelled = true;
+    } catch (_) {
+      adv = null;
+    } finally {
+      _advanceJob = null;
+      if (mounted) {
+        setState(() {
+          _advancing = false;
+          _advanceTarget = null;
+          _advanceDone = 0;
+          _advanceTotal = 0;
+        });
+      }
+    }
+    if (!mounted) return;
+    if (cancelled) {
+      final int done = _advanceCheckpoint?.pass ?? 0;
+      _sounds.play(UiSound.navStage);
+      setState(() {});
+      _toast('Advance halted again after $done/$steps passes — kept.');
+      return;
+    }
+    if (adv == null) {
+      _sounds.play(UiSound.warn);
+      _toast('Orbit advance failed — try again.');
+      return;
+    }
+    Entropy.wipe(adv.k);
+    final Uint8List? oldNext = _orbitO[target];
+    if (oldNext != null) Entropy.wipe(oldNext);
+    _orbitO[target] = adv.next;
+    _clearAdvanceCheckpoint();
     _setOrbitStage(target);
     _sounds.play(UiSound.stageReady);
     _toast('Advanced to stage $target — place its points.');
@@ -2311,6 +2456,10 @@ class _SetupScreenState extends State<SetupScreen> {
   /// prefix invalidates the whole memory-hard advance chain below it. Must run
   /// inside a [setState].
   void _invalidateDeeperThan(int stage) {
+    // A halted advance into any deeper stage was derived from the prefix that
+    // just changed, so its checkpoint no longer leads anywhere.
+    final ({int stage, int pass, Uint8List digest})? cp = _advanceCheckpoint;
+    if (cp != null && cp.stage > stage) _clearAdvanceCheckpoint();
     for (int st = stage + 1; st <= _maxStage; st++) {
       _shareEncodeGen[st]++; // discard any in-flight share-marker encode for st
       for (int s = 1; s <= _maxSlot; s++) {
@@ -2469,6 +2618,7 @@ class _SetupScreenState extends State<SetupScreen> {
   /// `K_i`) — called when σ changes, since a new σ re-roots the whole orbit and
   /// old points no longer decode, and on dispose.
   void _clearOrbitPlacements() {
+    _clearAdvanceCheckpoint(); // a re-rooted orbit invalidates a halted advance
     for (int st = 0; st <= _maxStage; st++) {
       _shareEncodeGen[st]++; // discard any in-flight share-marker encode
       for (int s = 1; s <= _maxSlot; s++) {
@@ -3257,6 +3407,12 @@ class _SetupScreenState extends State<SetupScreen> {
             _haltedNotice(),
           ],
 
+          // A halted orbit advance: same deal, screen-owned.
+          if (_canResumeAdvance) ...<Widget>[
+            const Divider(height: 32),
+            _haltedAdvanceNotice(),
+          ],
+
           // Inline editor for importing a stage-0 orbit board's point.
           if (_boardImportSlot != null) ...<Widget>[
             const Divider(height: 32),
@@ -3492,7 +3648,11 @@ class _SetupScreenState extends State<SetupScreen> {
           onChanged: (_) {
             _sounds.play(UiSound.tickSoft);
             final int? v = int.tryParse(_iterationsField.text.trim());
-            if (v != null && v >= 0) _iterations = v;
+            if (v != null && v >= 0 && v != _iterations) {
+              _iterations = v;
+              // The checkpoint's `pass` is relative to D; a new D orphans it.
+              _clearAdvanceCheckpoint();
+            }
             setState(() {});
           },        ),
       ),
@@ -3709,6 +3869,34 @@ class _SetupScreenState extends State<SetupScreen> {
     _setup.resumeDerivation();
   }
 
+  /// The orbit peer of [_haltedNotice]: a halted advance's preserved passes, and
+  /// the button that continues from them.
+  Widget _haltedAdvanceNotice() {
+    final ({int stage, int pass, Uint8List digest})? cp = _advanceCheckpoint;
+    if (cp == null) return const SizedBox.shrink();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Text(
+          'Advance into Stage ${cp.stage} halted — pass ${cp.pass}/$_iterations '
+          'kept. Resume continues from there; Write (W) saves it so a later '
+          'session can (the file then holds the partial derivation — guard it). '
+          'Changing D, or re-placing a point below Stage ${cp.stage}, discards it.',
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
+        const SizedBox(height: 8),
+        FilledButton.icon(
+          onPressed: () {
+            _sounds.play(UiSound.select);
+            unawaited(_resumeOrbitAdvance());
+          },
+          icon: const Icon(Icons.play_arrow),
+          label: Text('Resume Stage ${cp.stage}'),
+        ),
+      ],
+    );
+  }
+
   // --- Orbit provisional key: capture / write / restore ----------------------
   // The orbit peer of SetupController's chain vault. It lives on the screen
   // because the orbit state does: σ, D, P, r_i, o_i and the placed points are
@@ -3756,10 +3944,21 @@ class _SetupScreenState extends State<SetupScreen> {
   /// The result **is the secret** — the caller MUST [OrbitVault.wipe] it.
   OrbitVault _exportOrbitVault() {
     final int deepest = _orbitDeepestStage;
+    final ({int stage, int pass, Uint8List digest})? cp = _advanceCheckpoint;
     return OrbitVault(
       sigma: _sigmaCtrl.text.trim().replaceAll(RegExp(r'\s'), ''),
       iterations: _iterations,
       profile: _profile,
+      // A halted advance rides along, so reopening the file continues from the
+      // pass it reached instead of restarting the stage. Only carried while it
+      // still applies (see [_canResumeAdvance]).
+      resume: cp != null && _canResumeAdvance
+          ? OrbitVaultResume(
+              stage: cp.stage,
+              pass: cp.pass,
+              digest: List<int>.of(cp.digest),
+            )
+          : null,
       stages: <OrbitVaultStage>[
         for (int i = 0; i <= deepest; i++)
           OrbitVaultStage(
@@ -3935,6 +4134,23 @@ class _SetupScreenState extends State<SetupScreen> {
       // own Sh_i, recompute K_i and kick off the derived slots' marker encode.
       for (int i = 0; i <= deepest; i++) {
         _recomputeExtraShares(i);
+      }
+      // A halted advance, if the file carried one. Accepted only when it still
+      // fits the restored setup: deriving into the next stage, stopped
+      // part-way through this file's own D. K_{stage-1} is not read from the
+      // file — [_recomputeExtraShares] above has just rebuilt it from the
+      // placed points, which is why the checkpoint need not carry a key.
+      final OrbitVaultResume? r = vault.resume;
+      if (r != null &&
+          r.stage == deepest + 1 &&
+          r.pass >= 1 &&
+          r.pass < vault.iterations &&
+          _orbitK[deepest] != null) {
+        _advanceCheckpoint = (
+          stage: r.stage,
+          pass: r.pass,
+          digest: Uint8List.fromList(r.digest),
+        );
       }
     });
     _setOrbitStage(deepest);
