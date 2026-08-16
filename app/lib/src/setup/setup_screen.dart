@@ -2836,7 +2836,6 @@ class _SetupScreenState extends State<SetupScreen> {
     'Click/press a ghost slot past the last stage to grow the setup (N/I/R)',
     'S salt / export salt · P profile · D derivation steps · C colour',
     'Alt+D  calibrate derivation time (dialog: target time → steps N)',
-    'Enter  start (Generate / Encode / Begin recall) from a field',
     'K  copy the master secret ("the key")    H  halt derivation (keeps progress)',
     'X  exclude this stage & above (shorten the setup)',
     'E  highlight canonical islands in view (white) · zoom in if too many',
