@@ -83,6 +83,33 @@ Great Wallet has four modes that flow naturally into one another:
 Setup and Train are the core flow. Accelerate and Inherit are opt-in
 and can be added later.
 
+### Choosing which fractals to use is free
+
+At each stage you place `r_i` points, one per fractal, on a board of
+`s_i` fractals. Every fractal at a stage is **operationally equal**:
+any `r_i` of the `s_i` reconstruct the identical `Sh_i` (Shamir
+subset-invariance), and the remaining ones are then derived from it.
+
+So *which* fractals you use carries no security weight. The entropy is
+the `r_i × 32` true random bits you place, and that is the same whether
+you place on fractals 1 and 2 or on 1 and 5. If a fractal is awkward to
+work with at setup time — it renders poorly, its canonical island is
+hard to see, you simply dislike it — **skip it and place on the next
+one**. Nothing is weakened by doing so.
+
+The only cost is memorisation: you now have to remember *which*
+fractals you chose, in addition to the points themselves. That is a
+real cost, so skip deliberately rather than casually — but it is a
+memory cost, never a security one.
+
+One case where skipping is currently the practical answer: rarely (on
+the order of a few percent of randomly generated points) a fractal's
+canonical island is too small to be resolved at the rendering
+resolution, and the zoom-to-island view cannot frame it usefully. The
+point itself is perfectly sound — this is a display limit, not a
+protocol event — but it is easier to work with a different fractal than
+to squint at that one.
+
 ---
 
 ## Running the app
